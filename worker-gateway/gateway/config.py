@@ -2,6 +2,24 @@
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+_WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
+_ENV_FILE = _WORKSPACE_ROOT / ".env"
+
+
+def _load_env_file() -> None:
+    if _ENV_FILE.exists():
+        load_dotenv(_ENV_FILE, override=False)
+
+
+def _get_control_secret() -> str:
+    return (
+        os.environ.get("GATEWAY_CONTROL_SECRET", "").strip()
+        or os.environ.get("WORKER_GATEWAY_CONTROL_SECRET", "").strip()
+    )
 
 
 @dataclass(frozen=True)
@@ -15,9 +33,13 @@ class GatewaySettings:
 
     @classmethod
     def from_env(cls) -> "GatewaySettings":
-        secret = os.environ.get("GATEWAY_CONTROL_SECRET", "").strip()
+        _load_env_file()
+
+        secret = _get_control_secret()
         if not secret:
-            raise ValueError("GATEWAY_CONTROL_SECRET is required")
+            raise ValueError(
+                "GATEWAY_CONTROL_SECRET or WORKER_GATEWAY_CONTROL_SECRET is required"
+            )
 
         return cls(
             host=os.environ.get("GATEWAY_HOST", "0.0.0.0"),

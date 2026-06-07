@@ -21,7 +21,7 @@ class OrchestratorSettings(BaseSettings):
     # API Settings
     # ==========================================================================
     api_host: str = Field(default="0.0.0.0", env="ORCHESTRATOR_HOST")
-    api_port: int = Field(default=8000, env="API_PORT")  # Also accepts ORCHESTRATOR_PORT
+    api_port: int = Field(default=9000, env="API_PORT")  # Also accepts ORCHESTRATOR_PORT
     log_level: str = Field(default="INFO", env="LOG_LEVEL")
 
     # Local mode - skip Bittensor wallet/subtensor initialization for development

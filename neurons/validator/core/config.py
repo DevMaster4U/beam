@@ -115,7 +115,7 @@ class Settings(BaseSettings):
     proof_lookback_epochs: int = 10  # How many epochs to consider for compliance
 
     # Local-mode only fallback URL used by the standalone validator/orchestrator harness.
-    orchestrator_url: str = "http://localhost:8000"
+    orchestrator_url: str = "http://localhost:9000"
 
     # ==========================================================================
     # Sync & Timing

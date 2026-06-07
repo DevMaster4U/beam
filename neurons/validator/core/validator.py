@@ -372,7 +372,7 @@ class Validator:
             "uid": 1,
             "hotkey": "local-orchestrator",
             "ip": "127.0.0.1",
-            "port": 8000,
+            "port": 9000,
             "url": self.settings.orchestrator_url,
             "last_seen": datetime.utcnow(),
             "is_local": True,

@@ -40,6 +40,7 @@ import signal
 import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 
@@ -66,6 +67,21 @@ except ImportError:
     print("Error: bittensor library not installed.")
     print("Install with: pip install bittensor")
     sys.exit(1)
+
+
+def _load_workspace_env() -> None:
+    """Load sn105/.env so worker shares the workspace environment file."""
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+
+    env_file = Path(__file__).resolve().parents[2] / ".env"
+    if env_file.exists():
+        load_dotenv(env_file, override=False)
+
+
+_load_workspace_env()
 
 # =============================================================================
 # Configuration
@@ -1050,11 +1066,13 @@ async def execute_transfer(
 
 def get_ws_url(worker_id: str, api_key: str, gateway_url: str) -> str:
     """Convert worker-gateway URL to the worker WebSocket URL."""
-    base = gateway_url.rstrip("/")
+    base = gateway_url.rstrip("/") 
     if base.startswith("https://"):
         ws_base = "wss://" + base[8:]
     elif base.startswith("http://"):
         ws_base = "ws://" + base[7:]
+    elif base.startswith("ws://"):
+        ws_base = "ws://" + base[5:]
     else:
         ws_base = "ws://" + base
     url = f"{ws_base}/ws/{worker_id}"
@@ -1602,8 +1620,45 @@ async def run_worker(state: WorkerState):
     print("[Worker] Stopped")
 
 
+def _cli_has_flag(cli: list[str], flag: str) -> bool:
+    prefix = f"{flag}="
+    return any(arg == flag or arg.startswith(prefix) for arg in cli)
+
+
+def _build_cli_args() -> list[str]:
+    """Apply wallet/subtensor defaults from .env when CLI flags are omitted."""
+    cli = sys.argv[1:]
+    env_args: list[str] = []
+
+    if not _cli_has_flag(cli, "--wallet.name"):
+        wallet_name = (
+            os.environ.get("WORKER_WALLET_NAME", "").strip()
+            or os.environ.get("WALLET_NAME", "").strip()
+        )
+        if wallet_name:
+            env_args.extend(["--wallet.name", wallet_name])
+
+    if not _cli_has_flag(cli, "--wallet.hotkey"):
+        wallet_hotkey = (
+            os.environ.get("WORKER_WALLET_HOTKEY", "").strip()
+            or os.environ.get("WALLET_HOTKEY", "").strip()
+        )
+        if wallet_hotkey:
+            env_args.extend(["--wallet.hotkey", wallet_hotkey])
+
+    if not _cli_has_flag(cli, "--subtensor.network"):
+        network = os.environ.get("SUBTENSOR_NETWORK", "").strip()
+        if network:
+            env_args.extend(["--subtensor.network", network])
+
+    return env_args + cli
+
+
 def get_config():
-    """Get configuration from command line arguments."""
+    """Get configuration from command line arguments and workspace .env."""
+    # Bittensor 10+ skips argv parsing unless this is disabled.
+    os.environ.setdefault("BT_NO_PARSE_CLI_ARGS", "false")
+
     parser = argparse.ArgumentParser(description="Beam Network Worker")
 
     # Bittensor wallet arguments
@@ -1611,7 +1666,7 @@ def get_config():
     bt.Subtensor.add_args(parser)
 
     # Parse arguments
-    config = bt.Config(parser)
+    config = bt.Config(parser, args=_build_cli_args())
     return config
 
 
