@@ -1,4 +1,4 @@
-"""Re-export shared gateway protocol for standalone own-gateway runs."""
+"""Re-export shared gateway protocol for standalone worker-gateway runs."""
 
 from __future__ import annotations
 

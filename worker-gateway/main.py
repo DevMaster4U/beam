@@ -1,8 +1,8 @@
 """
-Beam Own Gateway — dedicated worker gateway for Option 1 (orchestrator-direct).
+Beam Worker Gateway — dedicated worker gateway for Option 1 (orchestrator-direct).
 
 Run:
-    cd own-gateway
+    cd worker-gateway
     python main.py
 """
 
@@ -34,7 +34,7 @@ def main() -> None:
     configure_logging(settings.log_level)
     app = create_app(settings)
 
-    print("Beam Own Gateway")
+    print("Beam Worker Gateway")
     print("=" * 40)
     print(f"Listening on {settings.host}:{settings.port}")
     print(f"Worker endpoint:  ws://{settings.host}:{settings.port}/ws/{{worker_id}}")

@@ -1385,7 +1385,7 @@ class Orchestrator:
             ):
                 logger.info(
                     "WORKER_GATEWAY_PUBLIC_URL is set but ignored in public mode; "
-                    "set WORKER_GATEWAY_MODE=dedicated to use own-gateway (Option 1)"
+                    "set WORKER_GATEWAY_MODE=dedicated to use worker-gateway (Option 1)"
                 )
             self.subnet_core_client.prime_ready_state(bool(self.settings.ready))
             logger.info(
@@ -1429,7 +1429,7 @@ class Orchestrator:
             self.subnet_core_client = None
 
     async def _handle_gateway_control_event(self, message: dict) -> None:
-        """Relay worker events from the own-gateway control channel to BeamCore."""
+        """Relay worker events from the worker-gateway control channel to BeamCore."""
         if not self.subnet_core_client:
             return
 

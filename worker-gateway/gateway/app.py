@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 def create_app(settings: GatewaySettings) -> FastAPI:
     registry = SessionRegistry()
     app = FastAPI(
-        title="Beam Own Gateway",
+        title="Beam Worker Gateway",
         description="Dedicated worker gateway for orchestrator-direct (Option 1) topology",
         version="0.1.0",
     )

@@ -214,7 +214,7 @@ def parse_task_result_summary_ack(data: dict[str, Any]) -> tuple[bool, Optional[
 
 
 # ---------------------------------------------------------------------------
-# Control channel (orchestrator ↔ own-gateway)
+# Control channel (orchestrator ↔ worker-gateway)
 # ---------------------------------------------------------------------------
 
 ControlToGatewayType = Literal[

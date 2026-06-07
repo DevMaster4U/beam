@@ -5,7 +5,7 @@ Control the orchestrator worker-pool topology with **`WORKER_GATEWAY_MODE`**:
 | Mode | Value | Option | Worker pool | Task path |
 |------|-------|--------|-------------|-----------|
 | **Public** (default) | `public` | Option 2 | `list_public_workers` from BeamCore | BeamCore public gateway |
-| **Dedicated** | `dedicated` | Option 1 | Local own-gateway sessions | Orchestrator relay via control WS |
+| **Dedicated** | `dedicated` | Option 1 | Local worker-gateway sessions | Orchestrator relay via control WS |
 
 `WORKER_GATEWAY_PUBLIC_URL` alone does **not** switch modes. It is only used when `WORKER_GATEWAY_MODE=dedicated`.
 
@@ -27,16 +27,16 @@ WORKER_GATEWAY_URL=https://public-worker-gateway.b1m.ai
 CORE_SERVER_URL=https://beamcore.b1m.ai
 ```
 
-No own-gateway process required.
+No worker-gateway process required.
 
 ---
 
-## Option 1 — Dedicated own-gateway
+## Option 1 — Dedicated worker-gateway
 
-### 1. Start own-gateway
+### 1. Start worker-gateway
 
 ```bash
-cd own-gateway
+cd worker-gateway
 export GATEWAY_CONTROL_SECRET=your-long-random-secret
 python main.py
 ```
@@ -79,7 +79,7 @@ Key behaviors by mode:
 | Message | Option 2 (public) | Option 1 (dedicated) |
 |---------|-------------------|----------------------|
 | `transfer_assigned` | `list_public_workers` → `chunk_assignments` | Gateway `list_workers` → `chunk_assignments` |
-| `worker_task_offer` | Ignored (public gateway delivers) | Relayed to own-gateway → worker |
+| `worker_task_offer` | Ignored (public gateway delivers) | Relayed to worker-gateway → worker |
 | `worker_response` | N/A (public gateway relays) | Worker → gateway → orchestrator → BeamCore |
 | `task_result_summary` | BeamCore push to orchestrator | Worker → gateway → orchestrator → BeamCore |
 | WS `register` `gateway_url` | Not sent | `WORKER_GATEWAY_PUBLIC_URL` |
@@ -93,4 +93,4 @@ Startup fails fast when:
 - `WORKER_GATEWAY_MODE=dedicated` but any of `WORKER_GATEWAY_PUBLIC_URL`, `WORKER_GATEWAY_CONTROL_URL`, or `WORKER_GATEWAY_CONTROL_SECRET` is missing
 - `WORKER_GATEWAY_MODE=public` but control URL/secret are set (misconfiguration)
 
-See also [own-gateway/README.md](../own-gateway/README.md).
+See also [worker-gateway/README.md](../worker-gateway/README.md).

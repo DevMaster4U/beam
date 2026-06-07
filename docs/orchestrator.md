@@ -11,7 +11,7 @@ Run an orchestrator on BEAM mainnet.
 
 Workers use `WORKER_GATEWAY_URL=https://public-worker-gateway.b1m.ai` (Option 2, default).
 
-For Option 1 (dedicated own-gateway), set `WORKER_GATEWAY_MODE=dedicated` — see [Own Gateway Guide](own-gateway.md).
+For Option 1 (dedicated worker-gateway), set `WORKER_GATEWAY_MODE=dedicated` — see [Worker Gateway Guide](worker-gateway.md).
 
 ## Requirements
 

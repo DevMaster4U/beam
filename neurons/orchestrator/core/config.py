@@ -121,7 +121,7 @@ class OrchestratorSettings(BaseSettings):
     orch_ws_ping_timeout: float = Field(default=45.0, env="ORCH_WS_PING_TIMEOUT")
 
     # Option 2 (default): public BeamCore worker gateway — list_public_workers, no relay.
-    # Option 1: dedicated own-gateway — local worker pool + control-channel relay.
+    # Option 1: dedicated worker-gateway — local worker pool + control-channel relay.
     worker_gateway_mode: str = Field(default="public", env="WORKER_GATEWAY_MODE")
     worker_gateway_public_url: Optional[str] = Field(default=None, env="WORKER_GATEWAY_PUBLIC_URL")
     worker_gateway_control_url: Optional[str] = Field(

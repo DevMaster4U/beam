@@ -217,7 +217,7 @@ class SubnetCoreClient:
         self._worker_update_handler = handler
 
     def enable_dedicated_gateway(self, gateway_control_client: Any) -> None:
-        """Use the local own-gateway worker pool instead of list_public_workers."""
+        """Use the local worker-gateway pool instead of list_public_workers."""
         self._gateway_control_client = gateway_control_client
         self._dedicated_gateway_enabled = True
         logger.info("Dedicated worker gateway mode enabled")
@@ -654,7 +654,7 @@ class SubnetCoreClient:
 
         elif msg_type == "task_result_summary":
             if self._dedicated_gateway_enabled:
-                # Dedicated mode: summaries are relayed outbound from the own-gateway path.
+                # Dedicated mode: summaries are relayed outbound from the worker-gateway path.
                 logger.debug("Ignoring inbound task_result_summary push (dedicated gateway mode)")
                 return
             self._note_beamcore_upstream_recovered("task_result_summary from BeamCore")

@@ -1,4 +1,4 @@
-# Beam Own Gateway
+# Beam Worker Gateway
 
 Dedicated worker gateway for **Option 1 — Orchestrator-Direct** ([Workers guide](https://data.b1m.ai/guide/workers), [Orchestrators guide](https://data.b1m.ai/guide/orchestrators)).
 
@@ -7,7 +7,7 @@ Workers connect to your gateway instead of the shared BeamCore worker gateway. T
 ## Architecture
 
 ```text
-Worker ──WS /ws/{worker_id}──► Own Gateway ◄──WS /control── Orchestrator
+Worker ──WS /ws/{worker_id}──► Worker Gateway ◄──WS /control── Orchestrator
                                    │                           │
                                    │                           └──WS──► orch-gateway (BeamCore)
 Worker ──HTTP──► BeamCore (register + PoB evidence)
@@ -23,7 +23,7 @@ Worker ──HTTP──► BeamCore (register + PoB evidence)
 ### 1. Start the gateway
 
 ```bash
-cd own-gateway
+cd worker-gateway
 cp .env.example .env
 # Edit GATEWAY_CONTROL_SECRET
 
@@ -34,8 +34,8 @@ python main.py
 Or with Docker:
 
 ```bash
-docker build -t beam-own-gateway .
-docker run --env-file .env -p 8001:8001 beam-own-gateway
+docker build -t beam-worker-gateway .
+docker run --env-file .env -p 8001:8001 beam-worker-gateway
 ```
 
 Health check:
@@ -118,4 +118,5 @@ Workers still register and submit PoB evidence to BeamCore HTTP directly.
 
 - [Subnet 105 orchestrator](../docs/orchestrator.md)
 - [Subnet 105 worker](../docs/worker.md)
+- [Worker gateway mode guide](../docs/worker-gateway.md)
 - [Dedicated gateway docs](https://data.b1m.ai/guide/orchestrators#running-your-own-worker-gateway)

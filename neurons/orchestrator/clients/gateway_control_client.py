@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 class GatewayControlClient:
-    """Maintains the orchestrator ↔ own-gateway control WebSocket."""
+    """Maintains the orchestrator ↔ worker-gateway control WebSocket."""
 
     def __init__(
         self,
@@ -185,7 +185,7 @@ class GatewayControlClient:
                     self._ws = ws
                     self._connected = True
                     self._reconnect_delay = 5.0
-                    logger.info("Connected to own-gateway control channel: %s", self._control_url)
+                    logger.info("Connected to worker-gateway control channel: %s", self._control_url)
                     await self._recv_loop(ws)
             except asyncio.CancelledError:
                 break

@@ -533,7 +533,7 @@ class WorkerManager:
                 workers_list = workers_data.get("workers", [])
 
             if not workers_list:
-                source = "own-gateway" if self.settings.dedicated_gateway_enabled else "SubnetCore"
+                source = "worker-gateway" if self.settings.dedicated_gateway_enabled else "SubnetCore"
                 logger.info("No workers returned from %s", source)
                 return 0
 
