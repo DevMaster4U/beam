@@ -22,6 +22,13 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from middleware.metrics import BEAMCORE_UPSTREAM_DEGRADED, BEAMCORE_UPSTREAM_DOWN_EVENTS
+from neurons.shared.gateway_protocol import (
+    build_beamcore_task_result_summary,
+    build_beamcore_worker_response,
+    normalize_worker_for_assignment,
+    parse_task_result_summary_ack,
+    parse_worker_response_ack,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,19 +47,11 @@ def _normalize_worker_list(workers: list[dict[str, Any]], transfer_id: str) -> l
     skipped_workers = 0
 
     for worker in workers:
-        worker_id = worker.get("worker_id")
-        if not worker_id:
+        try:
+            normalized_workers.append(normalize_worker_for_assignment(worker))
+        except ValueError:
             skipped_workers += 1
             continue
-
-        normalized_workers.append(
-            {
-                **worker,
-                "worker_id": worker_id,
-                "trust_score": _coerce_worker_metric(worker.get("trust_score"), 0.5),
-                "bandwidth_mbps": _coerce_worker_metric(worker.get("bandwidth_mbps"), 100.0),
-            }
-        )
 
     if skipped_workers:
         logger.warning(
@@ -191,6 +190,10 @@ class SubnetCoreClient:
         # orch-gateway → BeamCore upstream relay (independent of orch ↔ orch-gateway edge socket)
         self._beamcore_upstream_degraded: bool = False
 
+        # Dedicated worker gateway (Option 1) control client
+        self._gateway_control_client: Optional[Any] = None
+        self._dedicated_gateway_enabled: bool = False
+
     # =========================================================================
     # Handlers for polling notifications
     # =========================================================================
@@ -212,6 +215,12 @@ class SubnetCoreClient:
         Where event is "connected" or "disconnected".
         """
         self._worker_update_handler = handler
+
+    def enable_dedicated_gateway(self, gateway_control_client: Any) -> None:
+        """Use the local own-gateway worker pool instead of list_public_workers."""
+        self._gateway_control_client = gateway_control_client
+        self._dedicated_gateway_enabled = True
+        logger.info("Dedicated worker gateway mode enabled")
 
     def prime_ready_state(self, ready: bool) -> None:
         """Set the desired ready state before the websocket auto-registers."""
@@ -644,6 +653,10 @@ class SubnetCoreClient:
             )
 
         elif msg_type == "task_result_summary":
+            if self._dedicated_gateway_enabled:
+                # Dedicated mode: summaries are relayed outbound from the own-gateway path.
+                logger.debug("Ignoring inbound task_result_summary push (dedicated gateway mode)")
+                return
             self._note_beamcore_upstream_recovered("task_result_summary from BeamCore")
             asyncio.create_task(self._handle_task_result(data))
 
@@ -674,6 +687,9 @@ class SubnetCoreClient:
                 asyncio.create_task(
                     _run_worker_update(worker_id, event, self._worker_update_handler)
                 )
+
+        elif msg_type == "worker_task_offer":
+            asyncio.create_task(self._handle_worker_task_offer(data))
 
         elif msg_type == "transfer_assigned":
             self._note_beamcore_upstream_recovered("transfer_assigned from BeamCore")
@@ -772,6 +788,58 @@ class SubnetCoreClient:
 
         return response
 
+    async def _resolve_assignment_workers(
+        self, transfer_id: str, request_id: str
+    ) -> list[dict[str, Any]]:
+        if self._dedicated_gateway_enabled and self._gateway_control_client:
+            gateway = self._gateway_control_client
+            if not gateway.connected:
+                logger.warning(
+                    "Dedicated gateway control channel offline for transfer %s", transfer_id
+                )
+                return []
+            workers = await gateway.list_workers(timeout=max(30.0, float(self.timeout)))
+            return [
+                normalize_worker_for_assignment(w, default_trust=0.8, default_bandwidth=100.0)
+                for w in workers
+            ]
+
+        response = await self._send_ws_request(
+            {
+                "type": "list_public_workers",
+                "transfer_id": transfer_id,
+                "request_id": request_id,
+            },
+            timeout=max(30.0, float(self.timeout)),
+        )
+        return response.get("workers", [])
+
+    async def _handle_worker_task_offer(self, data: dict) -> None:
+        if not self._dedicated_gateway_enabled or not self._gateway_control_client:
+            logger.debug("Ignoring worker_task_offer (public gateway mode)")
+            return
+
+        worker_id = data.get("worker_id")
+        offer = data.get("offer") or data
+        if not worker_id or not offer:
+            logger.warning("Malformed worker_task_offer: %s", data)
+            return
+
+        delivered = await self._gateway_control_client.send_task_offer(worker_id, offer)
+        if not delivered:
+            logger.error(
+                "Failed to relay worker_task_offer to gateway for worker %s",
+                str(worker_id)[:20],
+            )
+
+    async def relay_worker_response(self, message: dict[str, Any]) -> dict[str, Any]:
+        payload = build_beamcore_worker_response(message)
+        return await self._send_ws_request(payload, timeout=15.0)
+
+    async def relay_task_result_summary(self, message: dict[str, Any]) -> dict[str, Any]:
+        payload = build_beamcore_task_result_summary(message)
+        return await self._send_ws_request(payload, timeout=30.0)
+
     async def _handle_transfer_assigned(self, data: dict) -> None:
         assignment_id = data.get("assignment_id")
         transfer_id = data.get("transfer_id")
@@ -787,15 +855,7 @@ class SubnetCoreClient:
                 return
 
             try:
-                response = await self._send_ws_request(
-                    {
-                        "type": "list_public_workers",
-                        "transfer_id": transfer_id,
-                        "request_id": request_id,
-                    },
-                    timeout=max(30.0, float(self.timeout)),
-                )
-                workers = response.get("workers", [])
+                workers = await self._resolve_assignment_workers(transfer_id, request_id)
             except Exception as e:
                 logger.error(f"Failed to get worker list for transfer {transfer_id}: {e}")
                 return

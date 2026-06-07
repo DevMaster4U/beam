@@ -29,10 +29,16 @@ logger = logging.getLogger(__name__)
 class WorkerManager:
     """Manages worker registration, verification, health checks, and WebSocket connections."""
 
-    def __init__(self, settings: OrchestratorSettings, subnet_core_client_ref=None):
+    def __init__(
+        self,
+        settings: OrchestratorSettings,
+        subnet_core_client_ref=None,
+        gateway_control_client_ref=None,
+    ):
         self.settings = settings
         # Callable that returns subnet_core_client (to avoid circular refs)
         self._get_subnet_core_client = subnet_core_client_ref or (lambda: None)
+        self._get_gateway_control_client = gateway_control_client_ref or (lambda: None)
 
         # Worker registry (local cache, SubnetCore is source of truth)
         self.workers: Dict[str, Any] = {}  # worker_id -> Worker
@@ -511,17 +517,24 @@ class WorkerManager:
         """
         from .orchestrator import Worker, WorkerStatus
 
-        subnet_core_client = self._get_subnet_core_client()
-        if not subnet_core_client:
-            logger.warning("Cannot sync workers: SubnetCore client not available")
-            return 0
-
         try:
-            workers_data = await subnet_core_client.list_public_workers(status="active")
-            workers_list = workers_data.get("workers", [])
+            if self.settings.dedicated_gateway_enabled:
+                gateway_client = self._get_gateway_control_client()
+                if not gateway_client or not gateway_client.connected:
+                    logger.debug("Dedicated gateway control offline; skipping worker sync")
+                    return 0
+                workers_list = await gateway_client.list_workers()
+            else:
+                subnet_core_client = self._get_subnet_core_client()
+                if not subnet_core_client:
+                    logger.warning("Cannot sync workers: SubnetCore client not available")
+                    return 0
+                workers_data = await subnet_core_client.list_public_workers(status="active")
+                workers_list = workers_data.get("workers", [])
 
             if not workers_list:
-                logger.info("No workers returned from SubnetCore")
+                source = "own-gateway" if self.settings.dedicated_gateway_enabled else "SubnetCore"
+                logger.info("No workers returned from %s", source)
                 return 0
 
             synced = 0

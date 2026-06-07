@@ -11,6 +11,8 @@ from typing import List, Optional
 from pydantic import Field
 from pydantic_settings import BaseSettings
 
+from neurons.shared.gateway_protocol import GatewayMode, parse_gateway_mode
+
 
 class OrchestratorSettings(BaseSettings):
     """Orchestrator configuration settings."""
@@ -118,7 +120,28 @@ class OrchestratorSettings(BaseSettings):
     orch_ws_ping_interval: float = Field(default=30.0, env="ORCH_WS_PING_INTERVAL")
     orch_ws_ping_timeout: float = Field(default=45.0, env="ORCH_WS_PING_TIMEOUT")
 
+    # Option 2 (default): public BeamCore worker gateway — list_public_workers, no relay.
+    # Option 1: dedicated own-gateway — local worker pool + control-channel relay.
+    worker_gateway_mode: str = Field(default="public", env="WORKER_GATEWAY_MODE")
     worker_gateway_public_url: Optional[str] = Field(default=None, env="WORKER_GATEWAY_PUBLIC_URL")
+    worker_gateway_control_url: Optional[str] = Field(
+        default=None, env="WORKER_GATEWAY_CONTROL_URL"
+    )
+    worker_gateway_control_secret: Optional[str] = Field(
+        default=None, env="WORKER_GATEWAY_CONTROL_SECRET"
+    )
+
+    @property
+    def gateway_mode(self) -> GatewayMode:
+        return parse_gateway_mode(self.worker_gateway_mode)
+
+    @property
+    def dedicated_gateway_enabled(self) -> bool:
+        return self.gateway_mode == GatewayMode.DEDICATED
+
+    @property
+    def public_gateway_enabled(self) -> bool:
+        return self.gateway_mode == GatewayMode.PUBLIC
 
     # ==========================================================================
     # Worker Scoring Weights (for selection)
@@ -198,6 +221,24 @@ class OrchestratorSettings(BaseSettings):
 
         if not self.orch_gateway_url:
             raise ValueError("ORCH_GATEWAY_URL is required")
+
+        if self.dedicated_gateway_enabled:
+            missing = []
+            if not self.worker_gateway_public_url:
+                missing.append("WORKER_GATEWAY_PUBLIC_URL")
+            if not self.worker_gateway_control_url:
+                missing.append("WORKER_GATEWAY_CONTROL_URL")
+            if not self.worker_gateway_control_secret:
+                missing.append("WORKER_GATEWAY_CONTROL_SECRET")
+            if missing:
+                raise ValueError(
+                    f"WORKER_GATEWAY_MODE=dedicated requires: {', '.join(missing)}"
+                )
+        elif self.worker_gateway_control_url or self.worker_gateway_control_secret:
+            raise ValueError(
+                "WORKER_GATEWAY_CONTROL_URL/SECRET are only used when "
+                "WORKER_GATEWAY_MODE=dedicated; set WORKER_GATEWAY_MODE=public for Option 2"
+            )
 
     # ==========================================================================
     # Client Tiers

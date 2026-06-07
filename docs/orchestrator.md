@@ -9,7 +9,9 @@ Run an orchestrator on BEAM mainnet.
 | Core server | `CORE_SERVER_URL` | `https://beamcore.b1m.ai` |
 | Orchestrator gateway | `ORCH_GATEWAY_URL` | `https://orch-gateway.b1m.ai` |
 
-Workers use `WORKER_GATEWAY_URL=https://public-worker-gateway.b1m.ai`.
+Workers use `WORKER_GATEWAY_URL=https://public-worker-gateway.b1m.ai` (Option 2, default).
+
+For Option 1 (dedicated own-gateway), set `WORKER_GATEWAY_MODE=dedicated` — see [Own Gateway Guide](own-gateway.md).
 
 ## Requirements
 

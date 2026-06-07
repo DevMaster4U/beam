@@ -54,6 +54,11 @@ from typing import Any, Dict, List, Optional, Set
 
 import bittensor as bt
 
+from neurons.shared.gateway_protocol import (
+    parse_task_result_summary_ack,
+    parse_worker_response_ack,
+)
+
 from .config import OrchestratorSettings, get_settings
 from .epoch_manager import EpochManager
 from .proof_aggregator import ProofAggregator
@@ -359,7 +364,11 @@ class Orchestrator:
         self.hotkey: Optional[str] = None
 
         # --- Manager instances ---
-        self._worker_mgr = WorkerManager(self.settings, lambda: self.subnet_core_client)
+        self._worker_mgr = WorkerManager(
+            self.settings,
+            lambda: self.subnet_core_client,
+            lambda: self.gateway_control_client,
+        )
         self._task_sched = TaskScheduler(
             self.settings, self._worker_mgr, get_subnet_core_client=lambda: self.subnet_core_client
         )
@@ -402,6 +411,7 @@ class Orchestrator:
 
         # SubnetCoreClient for API-based data operations
         self.subnet_core_client: Optional[Any] = None
+        self.gateway_control_client: Optional[Any] = None
 
         # Async control
         self._running: bool = False
@@ -572,6 +582,11 @@ class Orchestrator:
                 await task
             except asyncio.CancelledError:
                 pass
+
+        if self.gateway_control_client:
+            await self.gateway_control_client.stop()
+            self.gateway_control_client = None
+            logger.info("GatewayControlClient closed")
 
         if SUBNET_CORE_CLIENT_AVAILABLE and self.subnet_core_client:
             # Stop HTTP polling
@@ -1350,27 +1365,139 @@ class Orchestrator:
             except Exception:
                 local_ip = self.settings.external_ip or "127.0.0.1"
             orch_url = f"http://{local_ip}:{self.settings.api_port}"
+            registration_gateway_url = (
+                self.settings.worker_gateway_public_url
+                if self.settings.dedicated_gateway_enabled
+                else None
+            )
             self.subnet_core_client.set_registration_config(
                 url=orch_url,
                 region=self.settings.region,
                 max_workers=self.settings.max_workers,
                 uid=self.our_uid,
                 fee_percentage=self.settings.fee_percentage,
-                gateway_url=self.settings.worker_gateway_public_url,
+                gateway_url=registration_gateway_url,
             )
+            logger.info("Worker gateway mode: %s", self.settings.gateway_mode.value)
+            if (
+                self.settings.public_gateway_enabled
+                and self.settings.worker_gateway_public_url
+            ):
+                logger.info(
+                    "WORKER_GATEWAY_PUBLIC_URL is set but ignored in public mode; "
+                    "set WORKER_GATEWAY_MODE=dedicated to use own-gateway (Option 1)"
+                )
             self.subnet_core_client.prime_ready_state(bool(self.settings.ready))
             logger.info(
                 f"WS registration config set: url={orch_url}, region={self.settings.region}"
             )
+
+            if self.settings.dedicated_gateway_enabled:
+                from clients.gateway_control_client import GatewayControlClient
+
+                self.gateway_control_client = GatewayControlClient(
+                    control_url=self.settings.worker_gateway_control_url,
+                    control_secret=self.settings.worker_gateway_control_secret,
+                )
+                self.gateway_control_client.set_event_handler(self._handle_gateway_control_event)
+                self.subnet_core_client.enable_dedicated_gateway(self.gateway_control_client)
+                await self.gateway_control_client.start()
+                logger.info(
+                    "Dedicated gateway control channel started: %s",
+                    self.settings.worker_gateway_control_url,
+                )
 
             # Start WebSocket connection for real-time notifications and
             # orchestrator control-plane requests.
             await self.subnet_core_client.start_polling()
             logger.info("SubnetCore WebSocket connection started")
 
+            if self.settings.dedicated_gateway_enabled and self.settings.worker_gateway_public_url:
+                try:
+                    await self.subnet_core_client.update_worker_gateway(
+                        self.settings.worker_gateway_public_url
+                    )
+                    logger.info(
+                        "Published dedicated gateway URL: %s",
+                        self.settings.worker_gateway_public_url,
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to publish gateway_update: %s", exc)
+
         except Exception as e:
             logger.warning(f"Failed to initialize SubnetCoreClient: {e}")
             self.subnet_core_client = None
+
+    async def _handle_gateway_control_event(self, message: dict) -> None:
+        """Relay worker events from the own-gateway control channel to BeamCore."""
+        if not self.subnet_core_client:
+            return
+
+        msg_type = message.get("type")
+
+        if msg_type == "worker_connected":
+            await self._worker_mgr.handle_worker_update(message.get("worker_id", ""), "connected")
+            return
+
+        if msg_type == "worker_disconnected":
+            await self._worker_mgr.handle_worker_update(message.get("worker_id", ""), "disconnected")
+            return
+
+        if msg_type == "worker_response":
+            worker_id = message.get("worker_id", "")
+            task_id = message.get("task_id", "")
+            offer_id = message.get("offer_id") or task_id
+            try:
+                ack = await self.subnet_core_client.relay_worker_response(message)
+                accepted, reason = parse_worker_response_ack(ack)
+                if self.gateway_control_client:
+                    await self.gateway_control_client.send_task_accept_ack(
+                        worker_id,
+                        task_id,
+                        offer_id,
+                        accepted=accepted,
+                        reason=reason,
+                    )
+            except Exception as exc:
+                logger.error("Failed to relay worker_response: %s", exc)
+                if self.gateway_control_client:
+                    await self.gateway_control_client.send_task_accept_ack(
+                        worker_id,
+                        task_id,
+                        offer_id,
+                        accepted=False,
+                        reason=str(exc),
+                    )
+            return
+
+        if msg_type == "task_result_summary":
+            worker_id = message.get("worker_id", "")
+            task_id = message.get("task_id", "")
+            offer_id = message.get("offer_id") or task_id
+            try:
+                ack = await self.subnet_core_client.relay_task_result_summary(message)
+                received, completed, reason = parse_task_result_summary_ack(ack)
+                if self.gateway_control_client:
+                    await self.gateway_control_client.send_task_result_summary_ack(
+                        worker_id,
+                        task_id,
+                        offer_id,
+                        received=received,
+                        completed=completed,
+                        reason=reason,
+                    )
+                if received:
+                    await self._handle_task_completion_notification(message)
+            except Exception as exc:
+                logger.error("Failed to relay task_result_summary: %s", exc)
+                if self.gateway_control_client:
+                    await self.gateway_control_client.send_task_result_summary_ack(
+                        worker_id,
+                        task_id,
+                        offer_id,
+                        received=False,
+                        reason=str(exc),
+                    )
 
     async def _handle_task_completion_notification(self, message: dict) -> bool:
         """
