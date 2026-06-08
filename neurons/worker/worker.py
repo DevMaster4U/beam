@@ -917,6 +917,7 @@ async def execute_transfer(
 
     Returns: (bytes_transferred, success, error_message, chunk_hash, etag)
     """
+    
     gateway_url = execution_context.get("gateway_url", "")
     destination_url = execution_context.get("destination_url", "")
     transfer_id = execution_context.get("transfer_id", "")
@@ -961,6 +962,7 @@ async def execute_transfer(
         f"[Worker] Transferring {len(chunk_indices)} chunk(s) "
         f"task={task_label(task_id)} offer={task_label(offer_id)} hotkey={hotkey[:16]}"
     )
+    print(execution_context)
 
     for chunk_index in chunk_indices:
         chunk_key = str(chunk_index)
