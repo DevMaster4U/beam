@@ -21,7 +21,17 @@ async def handle_worker_websocket(
     websocket: WebSocket,
     worker_id: str,
     registry: SessionRegistry,
+    worker_secret: str,
 ) -> None:
+    provided = (
+        websocket.query_params.get("worker_secret", "").strip()
+        or websocket.headers.get("x-worker-secret", "").strip()
+    )
+    if provided != worker_secret:
+        logger.warning("Worker websocket rejected: invalid worker secret for %s", worker_id[:20])
+        await websocket.close(code=4401, reason="unauthorized")
+        return
+
     await websocket.accept()
     session = await registry.register_worker(worker_id, websocket)
 

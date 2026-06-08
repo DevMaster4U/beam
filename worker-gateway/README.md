@@ -15,7 +15,7 @@ Worker ──HTTP──► BeamCore (register + PoB evidence)
 
 | Link | Endpoint | Auth |
 |------|----------|------|
-| Worker data | `wss://{host}/ws/{worker_id}` | `?api_key=` from BeamCore registration |
+| Worker data | `wss://{host}/ws/{worker_id}` | `?worker_secret=` (or `x-worker-secret` header) |
 | Orchestrator control | `wss://{host}/control` | `x-control-secret` header |
 
 ## Quick start
@@ -27,7 +27,8 @@ cd worker-gateway
 cp .env.example .env
 # Edit GATEWAY_CONTROL_SECRET
 
-export GATEWAY_CONTROL_SECRET=your-long-random-secret
+export GATEWAY_CONTROL_SECRET=your-long-random-control-secret
+export GATEWAY_WORKER_SECRET=your-long-random-worker-secret
 python main.py
 ```
 
@@ -70,6 +71,7 @@ Set **`WORKER_GATEWAY_MODE=dedicated`** on the orchestrator (not just `WORKER_GA
 
 ```bash
 WORKER_GATEWAY_URL=https://gateway.example.com
+WORKER_GATEWAY_WORKER_SECRET=your-long-random-worker-secret
 WORKER_REQUIRED_PAYMENT=false   # own worker — no per-task on-chain payment
 CORE_SERVER_URL=https://beamcore.b1m.ai
 ```
@@ -111,6 +113,7 @@ Workers still register and submit PoB evidence to BeamCore HTTP directly.
 - Use **TLS** (`wss://`) on a public hostname for `WORKER_GATEWAY_PUBLIC_URL`
 - Put a reverse proxy (nginx, Caddy) in front if terminating TLS externally
 - `GATEWAY_CONTROL_SECRET` must match on gateway and orchestrator
+- `GATEWAY_WORKER_SECRET` / `WORKER_GATEWAY_WORKER_SECRET` must match on gateway and every authorized worker
 - Control channel can stay on a private network (`ws://` internally) if workers reach the public data endpoint only
 - BeamCore assignment engine uses `gateway_type` and `gateway_url` from orchestrator registration ([beam-core-public](https://github.com/Beam-Network/beam-core-public))
 

@@ -45,7 +45,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
-from urllib.parse import parse_qs, urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 import httpx
 
@@ -208,6 +208,7 @@ class WorkerState:
     wallet: Any  # bittensor.wallet
     api_url: str
     worker_gateway_url: Optional[str] = None
+    worker_gateway_secret: Optional[str] = None
     worker_id: Optional[str] = None
     api_key: Optional[str] = None
     orchestrator_hotkey: Optional[str] = None
@@ -1128,9 +1129,14 @@ async def execute_transfer(
 # =============================================================================
 
 
-def get_ws_url(worker_id: str, api_key: str, gateway_url: str) -> str:
+def get_ws_url(
+    worker_id: str,
+    api_key: str,
+    gateway_url: str,
+    worker_secret: Optional[str] = None,
+) -> str:
     """Convert worker-gateway URL to the worker WebSocket URL."""
-    base = gateway_url.rstrip("/") 
+    base = gateway_url.rstrip("/")
     if base.startswith("https://"):
         ws_base = "wss://" + base[8:]
     elif base.startswith("http://"):
@@ -1140,8 +1146,13 @@ def get_ws_url(worker_id: str, api_key: str, gateway_url: str) -> str:
     else:
         ws_base = "ws://" + base
     url = f"{ws_base}/ws/{worker_id}"
+    params: dict[str, str] = {}
     if api_key:
-        url = f"{url}?api_key={api_key}"
+        params["api_key"] = api_key
+    if worker_secret:
+        params["worker_secret"] = worker_secret
+    if params:
+        url = f"{url}?{urlencode(params)}"
     return url
 
 
@@ -1473,7 +1484,12 @@ async def websocket_loop(state: WorkerState):
     if not state.worker_gateway_url:
         raise RuntimeError("WORKER_GATEWAY_URL is required for worker-gateway transport")
 
-    ws_url = get_ws_url(state.worker_id, state.api_key, state.worker_gateway_url)
+    ws_url = get_ws_url(
+        state.worker_id,
+        state.api_key,
+        state.worker_gateway_url,
+        state.worker_gateway_secret,
+    )
     print(f"[Worker] Connecting to WebSocket: {ws_url.split('?')[0]}")
     reconnect_delay = WS_RECONNECT_MIN_DELAY
 
@@ -1763,10 +1779,19 @@ async def main():
     api_url = os.environ.get("CORE_SERVER_URL", MAINNET_URL)
     print("Network: mainnet")
     worker_gateway_url = os.environ.get("WORKER_GATEWAY_URL")
+    worker_gateway_secret = (
+        os.environ.get("WORKER_GATEWAY_WORKER_SECRET", "").strip()
+        or os.environ.get("GATEWAY_WORKER_SECRET", "").strip()
+    ) or None
 
     print(f"API URL: {api_url}")
     if worker_gateway_url:
         print(f"Worker gateway URL: {worker_gateway_url}")
+        if not worker_gateway_secret:
+            print(
+                "Warning: WORKER_GATEWAY_WORKER_SECRET not set — "
+                "dedicated gateways reject unsigned worker connections"
+            )
     else:
         print("Worker gateway URL: MISSING")
     print(
@@ -1777,7 +1802,12 @@ async def main():
     print()
 
     # Create worker state
-    state = WorkerState(wallet=wallet, api_url=api_url, worker_gateway_url=worker_gateway_url)
+    state = WorkerState(
+        wallet=wallet,
+        api_url=api_url,
+        worker_gateway_url=worker_gateway_url,
+        worker_gateway_secret=worker_gateway_secret,
+    )
 
     # Setup signal handlers
     loop = asyncio.get_running_loop()

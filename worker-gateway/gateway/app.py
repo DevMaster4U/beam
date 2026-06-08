@@ -34,7 +34,9 @@ def create_app(settings: GatewaySettings) -> FastAPI:
 
     @app.websocket("/ws/{worker_id}")
     async def worker_ws(websocket: WebSocket, worker_id: str) -> None:
-        await handle_worker_websocket(websocket, worker_id, registry)
+        await handle_worker_websocket(
+            websocket, worker_id, registry, settings.worker_secret
+        )
 
     @app.websocket("/control")
     async def control_ws(websocket: WebSocket) -> None:

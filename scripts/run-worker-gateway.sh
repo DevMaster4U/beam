@@ -29,6 +29,7 @@ Usage: $0 [--foreground|-f | --stop | --status]
 Configuration:
   ${ENV_FILE}
   Required: GATEWAY_CONTROL_SECRET or WORKER_GATEWAY_CONTROL_SECRET
+            GATEWAY_WORKER_SECRET or WORKER_GATEWAY_WORKER_SECRET
   Optional: GATEWAY_HOST, GATEWAY_PORT (default 8001), LOG_LEVEL
 
 See docs/worker-gateway.md and worker-gateway/README.md.
@@ -101,12 +102,17 @@ fi
 
 if [[ ! -f "$ENV_FILE" ]]; then
   echo "Missing env file: ${ENV_FILE}" >&2
-  echo "Copy .env.example and set GATEWAY_CONTROL_SECRET (or WORKER_GATEWAY_CONTROL_SECRET)." >&2
+  echo "Copy .env.example and set GATEWAY_CONTROL_SECRET and GATEWAY_WORKER_SECRET." >&2
   exit 1
 fi
 
 if ! grep -qE '^(GATEWAY_CONTROL_SECRET|WORKER_GATEWAY_CONTROL_SECRET)=' "$ENV_FILE"; then
   echo "Missing GATEWAY_CONTROL_SECRET or WORKER_GATEWAY_CONTROL_SECRET in ${ENV_FILE}" >&2
+  exit 1
+fi
+
+if ! grep -qE '^(GATEWAY_WORKER_SECRET|WORKER_GATEWAY_WORKER_SECRET)=' "$ENV_FILE"; then
+  echo "Missing GATEWAY_WORKER_SECRET or WORKER_GATEWAY_WORKER_SECRET in ${ENV_FILE}" >&2
   exit 1
 fi
 

@@ -22,11 +22,19 @@ def _get_control_secret() -> str:
     )
 
 
+def _get_worker_secret() -> str:
+    return (
+        os.environ.get("GATEWAY_WORKER_SECRET", "").strip()
+        or os.environ.get("WORKER_GATEWAY_WORKER_SECRET", "").strip()
+    )
+
+
 @dataclass(frozen=True)
 class GatewaySettings:
     host: str
     port: int
     control_secret: str
+    worker_secret: str
     ws_ping_interval: float
     ws_ping_timeout: float
     log_level: str
@@ -35,16 +43,23 @@ class GatewaySettings:
     def from_env(cls) -> "GatewaySettings":
         _load_env_file()
 
-        secret = _get_control_secret()
-        if not secret:
+        control_secret = _get_control_secret()
+        if not control_secret:
             raise ValueError(
                 "GATEWAY_CONTROL_SECRET or WORKER_GATEWAY_CONTROL_SECRET is required"
+            )
+
+        worker_secret = _get_worker_secret()
+        if not worker_secret:
+            raise ValueError(
+                "GATEWAY_WORKER_SECRET or WORKER_GATEWAY_WORKER_SECRET is required"
             )
 
         return cls(
             host=os.environ.get("GATEWAY_HOST", "0.0.0.0"),
             port=int(os.environ.get("GATEWAY_PORT", "8001")),
-            control_secret=secret,
+            control_secret=control_secret,
+            worker_secret=worker_secret,
             ws_ping_interval=float(os.environ.get("GATEWAY_WS_PING_INTERVAL", "30")),
             ws_ping_timeout=float(os.environ.get("GATEWAY_WS_PING_TIMEOUT", "10")),
             log_level=os.environ.get("LOG_LEVEL", "INFO").upper(),

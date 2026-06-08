@@ -37,8 +37,15 @@ No worker-gateway process required.
 
 ```bash
 cd worker-gateway
-export GATEWAY_CONTROL_SECRET=your-long-random-secret
+export GATEWAY_CONTROL_SECRET=your-long-random-control-secret
+export GATEWAY_WORKER_SECRET=your-long-random-worker-secret
 python main.py
+```
+
+Or from the repo root:
+
+```bash
+./scripts/run-worker-gateway.sh
 ```
 
 ### 2. Orchestrator
@@ -58,6 +65,7 @@ READY=true
 
 ```bash
 WORKER_GATEWAY_URL=https://gateway.example.com
+WORKER_GATEWAY_WORKER_SECRET=your-long-random-worker-secret
 WORKER_REQUIRED_PAYMENT=false
 CORE_SERVER_URL=https://beamcore.b1m.ai
 ```
