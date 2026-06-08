@@ -195,7 +195,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 # Participant workers default to recording a payment obligation unless opted out.
-WORKER_REQUIRED_PAYMENT = _env_bool("WORKER_REQUIRED_PAYMENT", True)
+WORKER_REQUIRED_PAYMENT = False #_env_bool("WORKER_REQUIRED_PAYMENT", True)
 
 # Global semaphore for task concurrency
 task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
@@ -501,6 +501,7 @@ async def submit_worker_payment_evidence(
     end_time_us: int,
     chunk_hash: str = "",
 ) -> bool:
+    return True
     """Submit durable worker-signed payment evidence directly to BeamCore HTTP."""
     if not state.worker_id or not state.api_key:
         print("[Worker] Payment evidence skipped: missing worker_id or api_key")

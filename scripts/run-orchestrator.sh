@@ -8,6 +8,7 @@
 #   ./scripts/run-orchestrator.sh              # background
 #   ./scripts/run-orchestrator.sh --foreground # foreground
 #   ./scripts/run-orchestrator.sh --stop       # stop background orchestrator
+#   ./scripts/run-orchestrator.sh --restart    # stop then start
 #   ./scripts/run-orchestrator.sh --status     # show running state
 #   ./scripts/run-orchestrator.sh --env-file path/to/.env
 set -euo pipefail
@@ -23,11 +24,12 @@ PID_FILE="${PID_DIR}/orchestrator.pid"
 
 usage() {
   cat <<EOF
-Usage: $0 [--foreground|-f | --stop | --status | --env-file PATH]
+Usage: $0 [--foreground|-f | --stop | --restart | --status | --env-file PATH]
 
   (default)    Start orchestrator in the background
   --foreground Run in the foreground (logs to stdout)
   --stop       Stop a background orchestrator
+  --restart    Stop if running, then start in the background
   --status     Show pid, log path, and API port
   --env-file   Env file to load (default: ${DEFAULT_ENV_FILE})
 
@@ -49,6 +51,7 @@ load_env_file() {
 
 FOREGROUND=0
 STOP=0
+RESTART=0
 STATUS=0
 
 while [[ $# -gt 0 ]]; do
@@ -59,6 +62,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --stop)
       STOP=1
+      shift
+      ;;
+    --restart|-r)
+      RESTART=1
       shift
       ;;
     --status)
@@ -87,20 +94,45 @@ done
 
 mkdir -p "$LOG_DIR" "$PID_DIR"
 
-if [[ "$STOP" -eq 1 ]]; then
+stop_service() {
+  local tolerant="${1:-0}"
   if [[ ! -f "$PID_FILE" ]]; then
+    if [[ "$tolerant" -eq 1 ]]; then
+      return 0
+    fi
     echo "No pid file for orchestrator (${PID_FILE})" >&2
-    exit 1
+    return 1
   fi
-  PID="$(cat "$PID_FILE")"
-  if kill -0 "$PID" 2>/dev/null; then
-    kill "$PID"
-    echo "Stopped orchestrator (pid ${PID})"
-  else
-    echo "Orchestrator not running (stale pid ${PID})" >&2
+
+  local pid
+  pid="$(cat "$PID_FILE")"
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid"
+    echo "Stopped orchestrator (pid ${pid})"
+    for _ in $(seq 1 20); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.25
+    done
+  elif [[ "$tolerant" -eq 0 ]]; then
+    echo "Orchestrator not running (stale pid ${pid})" >&2
   fi
   rm -f "$PID_FILE"
-  exit 0
+  return 0
+}
+
+if [[ "$STOP" -eq 1 ]]; then
+  stop_service 0
+  exit $?
+fi
+
+if [[ "$RESTART" -eq 1 && "$FOREGROUND" -eq 1 ]]; then
+  echo "Use --restart or --foreground, not both" >&2
+  exit 1
+fi
+
+if [[ "$RESTART" -eq 1 ]]; then
+  stop_service 1
+  sleep 1
 fi
 
 if [[ "$STATUS" -eq 1 ]]; then
@@ -167,10 +199,18 @@ if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
   exit 1
 fi
 
+if [[ "$RESTART" -eq 1 ]]; then
+  echo "Restarting orchestrator..."
+fi
+
 cd "${ROOT}/neurons/orchestrator"
 PYTHONUNBUFFERED=1 nohup "${CMD[@]}" >> "$LOG_FILE" 2>&1 &
 echo $! > "$PID_FILE"
-echo "Started orchestrator (pid $(cat "$PID_FILE"))"
+if [[ "$RESTART" -eq 1 ]]; then
+  echo "Restarted orchestrator (pid $(cat "$PID_FILE"))"
+else
+  echo "Started orchestrator (pid $(cat "$PID_FILE"))"
+fi
 echo "  env: ${ENV_FILE}"
 echo "  log: ${LOG_FILE}"
 port="${API_PORT:-9000}"

@@ -7,6 +7,7 @@
 #   ./scripts/run-worker-gateway.sh              # background
 #   ./scripts/run-worker-gateway.sh --foreground # foreground
 #   ./scripts/run-worker-gateway.sh --stop       # stop background gateway
+#   ./scripts/run-worker-gateway.sh --restart    # stop then start
 #   ./scripts/run-worker-gateway.sh --status     # show running state
 set -euo pipefail
 
@@ -19,11 +20,12 @@ PID_FILE="${PID_DIR}/worker-gateway.pid"
 
 usage() {
   cat <<EOF
-Usage: $0 [--foreground|-f | --stop | --status]
+Usage: $0 [--foreground|-f | --stop | --restart | --status]
 
   (default)    Start worker-gateway in the background
   --foreground Run in the foreground (logs to stdout)
   --stop       Stop a background worker-gateway
+  --restart    Stop if running, then start in the background
   --status     Show pid, log path, and listening port
 
 Configuration:
@@ -38,6 +40,7 @@ EOF
 
 FOREGROUND=0
 STOP=0
+RESTART=0
 STATUS=0
 
 while [[ $# -gt 0 ]]; do
@@ -48,6 +51,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --stop)
       STOP=1
+      shift
+      ;;
+    --restart|-r)
+      RESTART=1
       shift
       ;;
     --status)
@@ -68,20 +75,45 @@ done
 
 mkdir -p "$LOG_DIR" "$PID_DIR"
 
-if [[ "$STOP" -eq 1 ]]; then
+stop_service() {
+  local tolerant="${1:-0}"
   if [[ ! -f "$PID_FILE" ]]; then
+    if [[ "$tolerant" -eq 1 ]]; then
+      return 0
+    fi
     echo "No pid file for worker-gateway (${PID_FILE})" >&2
-    exit 1
+    return 1
   fi
-  PID="$(cat "$PID_FILE")"
-  if kill -0 "$PID" 2>/dev/null; then
-    kill "$PID"
-    echo "Stopped worker-gateway (pid ${PID})"
-  else
-    echo "Worker-gateway not running (stale pid ${PID})" >&2
+
+  local pid
+  pid="$(cat "$PID_FILE")"
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid"
+    echo "Stopped worker-gateway (pid ${pid})"
+    for _ in $(seq 1 20); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.25
+    done
+  elif [[ "$tolerant" -eq 0 ]]; then
+    echo "Worker-gateway not running (stale pid ${pid})" >&2
   fi
   rm -f "$PID_FILE"
-  exit 0
+  return 0
+}
+
+if [[ "$STOP" -eq 1 ]]; then
+  stop_service 0
+  exit $?
+fi
+
+if [[ "$RESTART" -eq 1 && "$FOREGROUND" -eq 1 ]]; then
+  echo "Use --restart or --foreground, not both" >&2
+  exit 1
+fi
+
+if [[ "$RESTART" -eq 1 ]]; then
+  stop_service 1
+  sleep 1
 fi
 
 if [[ "$STATUS" -eq 1 ]]; then
@@ -133,9 +165,17 @@ if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
   exit 1
 fi
 
+if [[ "$RESTART" -eq 1 && "$FOREGROUND" -eq 0 ]]; then
+  echo "Restarting worker-gateway..."
+fi
+
 cd "${ROOT}/worker-gateway"
 PYTHONUNBUFFERED=1 nohup "${CMD[@]}" >> "$LOG_FILE" 2>&1 &
 echo $! > "$PID_FILE"
-echo "Started worker-gateway (pid $(cat "$PID_FILE"))"
+if [[ "$RESTART" -eq 1 ]]; then
+  echo "Restarted worker-gateway (pid $(cat "$PID_FILE"))"
+else
+  echo "Started worker-gateway (pid $(cat "$PID_FILE"))"
+fi
 echo "  env: ${ENV_FILE}"
 echo "  log: ${LOG_FILE}"

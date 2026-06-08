@@ -5,6 +5,7 @@
 #   ./scripts/run-worker.sh worker1              # background
 #   ./scripts/run-worker.sh worker1 --foreground # foreground
 #   ./scripts/run-worker.sh worker1 --stop       # stop background worker
+#   ./scripts/run-worker.sh worker1 --restart    # stop then start
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -12,11 +13,12 @@ INSTANCE="${1:-}"
 
 usage() {
   cat <<EOF
-Usage: $0 <instance> [--foreground|-f | --stop] [worker.py args...]
+Usage: $0 <instance> [--foreground|-f | --stop | --restart] [worker.py args...]
 
   <instance>     Name matching config/workers/<instance>.env
   --foreground   Run in the foreground (logs to stdout)
   --stop         Stop a background worker for <instance>
+  --restart      Stop if running, then start in the background
 
 Setup:
   cp config/workers/worker1.env.example config/workers/worker1.env
@@ -34,6 +36,7 @@ shift
 
 FOREGROUND=0
 STOP=0
+RESTART=0
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -44,6 +47,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --stop)
       STOP=1
+      shift
+      ;;
+    --restart|-r)
+      RESTART=1
       shift
       ;;
     -h|--help)
@@ -65,20 +72,45 @@ PID_FILE="${PID_DIR}/${INSTANCE}.pid"
 
 mkdir -p "$LOG_DIR" "$PID_DIR"
 
-if [[ "$STOP" -eq 1 ]]; then
+stop_service() {
+  local tolerant="${1:-0}"
   if [[ ! -f "$PID_FILE" ]]; then
+    if [[ "$tolerant" -eq 1 ]]; then
+      return 0
+    fi
     echo "No pid file for worker ${INSTANCE} (${PID_FILE})" >&2
-    exit 1
+    return 1
   fi
-  PID="$(cat "$PID_FILE")"
-  if kill -0 "$PID" 2>/dev/null; then
-    kill "$PID"
-    echo "Stopped worker ${INSTANCE} (pid ${PID})"
-  else
-    echo "Worker ${INSTANCE} not running (stale pid ${PID})" >&2
+
+  local pid
+  pid="$(cat "$PID_FILE")"
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid"
+    echo "Stopped worker ${INSTANCE} (pid ${pid})"
+    for _ in $(seq 1 20); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.25
+    done
+  elif [[ "$tolerant" -eq 0 ]]; then
+    echo "Worker ${INSTANCE} not running (stale pid ${pid})" >&2
   fi
   rm -f "$PID_FILE"
-  exit 0
+  return 0
+}
+
+if [[ "$STOP" -eq 1 ]]; then
+  stop_service 0
+  exit $?
+fi
+
+if [[ "$RESTART" -eq 1 && "$FOREGROUND" -eq 1 ]]; then
+  echo "Use --restart or --foreground, not both" >&2
+  exit 1
+fi
+
+if [[ "$RESTART" -eq 1 ]]; then
+  stop_service 1
+  sleep 1
 fi
 
 if [[ ! -f "$ENV_FILE" ]]; then
@@ -108,9 +140,17 @@ if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
   exit 1
 fi
 
+if [[ "$RESTART" -eq 1 ]]; then
+  echo "Restarting worker ${INSTANCE}..."
+fi
+
 cd "${ROOT}/neurons/worker"
 PYTHONUNBUFFERED=1 nohup "${CMD[@]}" >> "$LOG_FILE" 2>&1 &
 echo $! > "$PID_FILE"
-echo "Started worker ${INSTANCE} (pid $(cat "$PID_FILE"))"
+if [[ "$RESTART" -eq 1 ]]; then
+  echo "Restarted worker ${INSTANCE} (pid $(cat "$PID_FILE"))"
+else
+  echo "Started worker ${INSTANCE} (pid $(cat "$PID_FILE"))"
+fi
 echo "  env: ${ENV_FILE}"
 echo "  log: ${LOG_FILE}"

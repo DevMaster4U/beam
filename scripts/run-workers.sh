@@ -7,11 +7,12 @@ ACTION="${1:-start}"
 
 usage() {
   cat <<EOF
-Usage: $0 [start|stop|status]
+Usage: $0 [start|stop|restart|status]
 
-  start   Start every config/workers/*.env instance in the background
-  stop    Stop every running instance
-  status  Show pid/log paths for configured instances
+  start    Start every config/workers/*.env instance in the background
+  stop     Stop every running instance
+  restart  Stop then start every configured instance
+  status   Show pid/log paths for configured instances
 EOF
 }
 
@@ -41,6 +42,18 @@ case "$ACTION" in
         "${ROOT}/scripts/run-worker.sh" "$instance" --stop || true
       fi
     done
+    ;;
+  restart)
+    found=0
+    for instance in $(list_instances); do
+      found=1
+      "${ROOT}/scripts/run-worker.sh" "$instance" --restart
+    done
+    if [[ "$found" -eq 0 ]]; then
+      echo "No worker env files found in config/workers/*.env" >&2
+      echo "Copy *.env.example files first." >&2
+      exit 1
+    fi
     ;;
   status)
     for instance in $(list_instances); do
