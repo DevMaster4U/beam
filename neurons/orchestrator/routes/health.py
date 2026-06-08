@@ -115,9 +115,6 @@ async def get_metrics(
     # Epoch metrics
     metrics.append(f"beam_current_epoch {state['current_epoch']}")
 
-    # Validator metrics
-    metrics.append(f"beam_validators_known {state['validators_known']}")
-
     return "\n".join(metrics)
 
 
