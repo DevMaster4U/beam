@@ -29,6 +29,9 @@ Usage:
 
     # Mainnet:
     python3 worker.py --subtensor.network finney
+
+    # Per-instance env (multi-worker on one host):
+    python3 worker.py --env-file config/workers/worker1.env
 """
 
 import argparse
@@ -69,16 +72,77 @@ except ImportError:
     sys.exit(1)
 
 
+def _workspace_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _extract_env_file_arg(argv: list[str]) -> tuple[Optional[Path], list[str]]:
+    """Pull --env-file from argv before bittensor/argparse runs."""
+    cleaned: list[str] = []
+    env_file: Optional[Path] = None
+    idx = 0
+    while idx < len(argv):
+        arg = argv[idx]
+        if arg == "--env-file":
+            if idx + 1 >= len(argv):
+                print("Error: --env-file requires a path argument", file=sys.stderr)
+                sys.exit(2)
+            env_file = Path(argv[idx + 1]).expanduser()
+            idx += 2
+            continue
+        if arg.startswith("--env-file="):
+            env_file = Path(arg.split("=", 1)[1]).expanduser()
+            idx += 1
+            continue
+        cleaned.append(arg)
+        idx += 1
+    return env_file, cleaned
+
+
+def _resolve_worker_env_file() -> Optional[Path]:
+    cli_file, _ = _extract_env_file_arg(sys.argv[1:])
+    if cli_file is not None:
+        return cli_file
+
+    env_path = os.environ.get("WORKER_ENV_FILE", "").strip()
+    if env_path:
+        return Path(env_path).expanduser()
+    return None
+
+
+def _resolve_env_path(path: Path) -> Path:
+    if path.is_absolute():
+        return path
+    return _workspace_root() / path
+
+
+LOADED_ENV_FILES: list[Path] = []
+
+
 def _load_workspace_env() -> None:
-    """Load sn105/.env so worker shares the workspace environment file."""
+    """Load shared .env, then optional per-worker env (override)."""
     try:
         from dotenv import load_dotenv
     except ImportError:
         return
 
-    env_file = Path(__file__).resolve().parents[2] / ".env"
-    if env_file.exists():
-        load_dotenv(env_file, override=False)
+    root = _workspace_root()
+    shared_env = root / ".env"
+    if shared_env.exists():
+        load_dotenv(shared_env, override=False)
+        LOADED_ENV_FILES.append(shared_env)
+
+    worker_env = _resolve_worker_env_file()
+    if worker_env is None:
+        return
+
+    worker_env = _resolve_env_path(worker_env)
+    if worker_env.exists():
+        load_dotenv(worker_env, override=True)
+        LOADED_ENV_FILES.append(worker_env)
+    else:
+        print(f"Error: worker env file not found: {worker_env}", file=sys.stderr)
+        sys.exit(2)
 
 
 _load_workspace_env()
@@ -1627,7 +1691,7 @@ def _cli_has_flag(cli: list[str], flag: str) -> bool:
 
 def _build_cli_args() -> list[str]:
     """Apply wallet/subtensor defaults from .env when CLI flags are omitted."""
-    cli = sys.argv[1:]
+    _, cli = _extract_env_file_arg(sys.argv[1:])
     env_args: list[str] = []
 
     if not _cli_has_flag(cli, "--wallet.name"):
@@ -1674,6 +1738,11 @@ async def main():
     """Main entry point."""
     print("Beam Network Worker")
     print("=" * 40)
+    if LOADED_ENV_FILES:
+        print("Env files:")
+        for env_file in LOADED_ENV_FILES:
+            print(f"  - {env_file}")
+        print()
 
     # Parse configuration
     config = get_config()

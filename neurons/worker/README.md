@@ -40,7 +40,13 @@ python worker.py --wallet.name my_wallet --wallet.hotkey my_hotkey
 
 # Mainnet
 python worker.py --subtensor.network finney
+
+# Multi-worker on one host (per-instance env file)
+python worker.py --env-file config/workers/worker1.env
+# Or: ./scripts/run-worker.sh worker1
 ```
+
+See [Worker Guide](../../docs/worker.md#multiple-workers-on-one-machine) for full multi-instance setup.
 
 ## Transport
 

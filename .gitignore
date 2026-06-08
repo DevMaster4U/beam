@@ -57,6 +57,7 @@ tmp/
 temp/
 .tmp/
 .tmp-*/
+run/
 checkpoint_*.json
 
 # OS
