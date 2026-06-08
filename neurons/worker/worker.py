@@ -36,6 +36,7 @@ Usage:
 
 import argparse
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -652,67 +653,219 @@ def is_retryable(error: Exception) -> bool:
     return False
 
 
-async def fetch_chunk(
-    client: httpx.AsyncClient,
-    url: str,
+def _build_fetch_headers(
     chunk_offset: int = None,
     chunk_size: int = None,
     total_size: int = None,
-    expected_max_bytes: int = None,
-    task_id: str = None,
-    offer_id: str = None,
-    chunk_index: int = None,
-) -> bytes:
-    """Fetch chunk data from source URL."""
+) -> dict:
     headers = {"ngrok-skip-browser-warning": "true"}
-
     if chunk_offset is not None and chunk_size is not None:
         if total_size is not None:
             range_end = min(chunk_offset + chunk_size - 1, total_size - 1)
         else:
             range_end = chunk_offset + chunk_size - 1
         headers["Range"] = f"bytes={chunk_offset}-{range_end}"
+    return headers
+
+
+async def fetch_and_send_chunk(
+    client: httpx.AsyncClient,
+    source_url: str,
+    destination_url: str,
+    transfer_id: str,
+    chunk_index: int,
+    *,
+    chunk_offset: int = None,
+    chunk_size: int = None,
+    total_size: int = None,
+    expected_max_bytes: int = None,
+    expected_chunk_hash: str = None,
+    auth_token: str = None,
+    task_id: str = None,
+    offer_id: str = None,
+    route_metadata: Optional[Dict[str, Any]] = None,
+    is_canary: bool = False,
+) -> tuple[int, str, Optional[str], int, float, float]:
+    """Fetch from source and stream each received part to destination concurrently.
+
+    Returns:
+        (bytes_transferred, chunk_hash, etag, response_code, fetch_ms, send_ms)
+    """
+    fetch_headers = _build_fetch_headers(chunk_offset, chunk_size, total_size)
+    is_object_storage = is_object_storage_presigned_url(destination_url)
+    route_context = (
+        object_storage_route_context(destination_url, route_metadata)
+        if is_object_storage
+        else {}
+    )
 
     for attempt in range(MAX_RETRIES):
-        try:
-            async with client.stream(
-                "GET", url, headers=headers, timeout=FETCH_TIMEOUT
-            ) as response:
-                if response.status_code not in (200, 206):
-                    response.raise_for_status()
+        queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=8)
+        hasher = hashlib.sha256()
+        bytes_transferred = 0
+        fetch_error: Optional[BaseException] = None
+        fetch_started = time.perf_counter()
+        send_started = 0.0
+        fetch_ms = 0.0
+        send_ms = 0.0
 
-                if expected_max_bytes and expected_max_bytes > 0:
-                    content_length = response.headers.get("Content-Length")
-                    if content_length:
-                        response_size = int(content_length)
-                        if response_size > expected_max_bytes:
+        async def fetch_producer() -> None:
+            nonlocal bytes_transferred, fetch_error, fetch_ms
+            try:
+                async with client.stream(
+                    "GET", source_url, headers=fetch_headers, timeout=FETCH_TIMEOUT
+                ) as response:
+                    if response.status_code not in (200, 206):
+                        response.raise_for_status()
+
+                    if expected_max_bytes and expected_max_bytes > 0:
+                        content_length = response.headers.get("Content-Length")
+                        if content_length:
+                            response_size = int(content_length)
+                            if response_size > expected_max_bytes:
+                                raise ValueError(
+                                    f"response too large: {response_size} bytes > "
+                                    f"expected {expected_max_bytes}"
+                                )
+
+                    async for part in response.aiter_bytes(chunk_size=FETCH_STREAM_CHUNK_SIZE):
+                        hasher.update(part)
+                        bytes_transferred += len(part)
+                        if (
+                            expected_max_bytes
+                            and expected_max_bytes > 0
+                            and bytes_transferred > expected_max_bytes
+                        ):
                             raise ValueError(
-                                f"response too large: {response_size} bytes > expected {expected_max_bytes}"
+                                f"response exceeded expected size while streaming: "
+                                f"{bytes_transferred} bytes > expected {expected_max_bytes}"
                             )
+                        await queue.put(part)
+            except Exception as exc:
+                fetch_error = exc
+            finally:
+                await queue.put(None)
+                fetch_ms = (time.perf_counter() - fetch_started) * 1000
 
-                data = bytearray()
-                async for chunk in response.aiter_bytes(chunk_size=FETCH_STREAM_CHUNK_SIZE):
-                    data.extend(chunk)
-                    if (
-                        expected_max_bytes
-                        and expected_max_bytes > 0
-                        and len(data) > expected_max_bytes
-                    ):
-                        raise ValueError(
-                            f"response exceeded expected size while streaming: "
-                            f"{len(data)} bytes > expected {expected_max_bytes}"
-                        )
+        async def body_stream():
+            while True:
+                part = await queue.get()
+                if part is None:
+                    break
+                yield part
 
-                return bytes(data)
+        async def stream_to_destination(chunk_hash_header: Optional[str]) -> httpx.Response:
+            if is_object_storage:
+                send_headers = {"Content-Type": "application/octet-stream"}
+                if expected_max_bytes and expected_max_bytes > 0:
+                    send_headers["Content-Length"] = str(expected_max_bytes)
+                return await client.put(
+                    destination_url,
+                    content=body_stream(),
+                    headers=send_headers,
+                    timeout=SEND_TIMEOUT,
+                )
+
+            send_headers = {
+                "Content-Type": "application/octet-stream",
+                "X-Transfer-ID": transfer_id,
+                "X-Chunk-ID": f"chunk_{chunk_index}",
+                "X-Offset": str(chunk_offset or 0),
+                "X-Length": str(expected_max_bytes or bytes_transferred or 0),
+                "X-Total-Size": str(total_size or 0),
+                "X-Chunk-SHA256": chunk_hash_header or "",
+            }
+            if auth_token:
+                send_headers["Authorization"] = f"Bearer {auth_token}"
+            return await client.post(
+                destination_url,
+                content=body_stream(),
+                headers=send_headers,
+                timeout=SEND_TIMEOUT,
+            )
+
+        producer_task = asyncio.create_task(fetch_producer())
+
+        try:
+            if is_canary:
+                async for _ in body_stream():
+                    pass
+                await producer_task
+                if fetch_error:
+                    raise fetch_error
+                return (
+                    bytes_transferred,
+                    hasher.hexdigest(),
+                    None,
+                    0,
+                    fetch_ms,
+                    0.0,
+                )
+
+            send_started = time.perf_counter()
+            pipeline_send = is_object_storage or bool(expected_chunk_hash)
+            if pipeline_send:
+                send_task = asyncio.create_task(
+                    stream_to_destination(expected_chunk_hash)
+                )
+                await producer_task
+                if fetch_error:
+                    send_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await send_task
+                    raise fetch_error
+                response = await send_task
+            else:
+                await producer_task
+                if fetch_error:
+                    raise fetch_error
+                response = await stream_to_destination(hasher.hexdigest())
+
+            response.raise_for_status()
+            send_ms = (time.perf_counter() - send_started) * 1000
+            chunk_hash = hasher.hexdigest()
+
+            if expected_chunk_hash and chunk_hash != expected_chunk_hash:
+                raise ValueError(
+                    f"chunk hash mismatch: expected {expected_chunk_hash}, got {chunk_hash}"
+                )
+
+            etag = response.headers.get("ETag") or response.headers.get("etag")
+            return (
+                bytes_transferred,
+                chunk_hash,
+                etag,
+                response.status_code,
+                fetch_ms,
+                send_ms,
+            )
 
         except Exception as e:
-            if not is_retryable(e) or attempt == MAX_RETRIES - 1:
+            if not producer_task.done():
+                producer_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await producer_task
+
+            is_transient_storage_404 = (
+                is_object_storage
+                and isinstance(e, httpx.HTTPStatusError)
+                and e.response.status_code == 404
+                and attempt < 2
+            )
+            can_retry = is_retryable(e) or is_transient_storage_404
+            if is_object_storage and (not can_retry or attempt == MAX_RETRIES - 1):
+                print(
+                    "[Worker] Object storage upload failed "
+                    f"task={task_label(task_id)} offer={task_label(offer_id)} "
+                    f"chunk={chunk_index} error={exception_detail(e)}{http_status_detail(e)}"
+                    f"{format_route_context(route_context)}"
+                )
+            if not can_retry or attempt == MAX_RETRIES - 1:
                 raise
             print(
-                "[Worker] Fetch retry "
+                "[Worker] Transfer retry "
                 f"task={task_label(task_id)} offer={task_label(offer_id)} "
-                f"chunk={chunk_index if chunk_index is not None else 'unknown'} "
-                f"attempt={attempt + 1}/{MAX_RETRIES} "
+                f"chunk={chunk_index} attempt={attempt + 1}/{MAX_RETRIES} "
                 f"error={exception_detail(e)}{http_status_detail(e)}"
             )
             await asyncio.sleep(RETRY_BACKOFF * (2**attempt))
@@ -823,87 +976,6 @@ def release_ws_capacity(
         state.reserved_ws_slots = max(0, state.reserved_ws_slots - 1)
         state.reserved_bytes = max(0, state.reserved_bytes - max(0, estimated_bytes))
     state.active_ws_task_ids.discard(task_id)
-
-
-async def send_chunk(
-    client: httpx.AsyncClient,
-    destination_url: str,
-    data: bytes,
-    transfer_id: str,
-    chunk_index: int,
-    chunk_offset: int = 0,
-    total_size: int = 0,
-    auth_token: str = None,
-    task_id: str = None,
-    offer_id: str = None,
-    route_metadata: Optional[Dict[str, Any]] = None,
-) -> tuple:
-    """Send chunk data to destination URL.
-
-    Returns: (success, etag, response_code)
-    """
-    is_object_storage = is_object_storage_presigned_url(destination_url)
-    route_context = object_storage_route_context(destination_url, route_metadata) if is_object_storage else {}
-
-    if is_object_storage:
-        headers = {"Content-Type": "application/octet-stream"}
-    else:
-        chunk_sha256 = hashlib.sha256(data).hexdigest()
-        headers = {
-            "Content-Type": "application/octet-stream",
-            "X-Transfer-ID": transfer_id,
-            "X-Chunk-ID": f"chunk_{chunk_index}",
-            "X-Offset": str(chunk_offset),
-            "X-Length": str(len(data)),
-            "X-Total-Size": str(total_size),
-            "X-Chunk-SHA256": chunk_sha256,
-        }
-        if auth_token:
-            headers["Authorization"] = f"Bearer {auth_token}"
-
-    for attempt in range(MAX_RETRIES):
-        try:
-            if is_object_storage:
-                response = await client.put(
-                    destination_url, content=data, headers=headers, timeout=SEND_TIMEOUT
-                )
-            else:
-                response = await client.post(
-                    destination_url, content=data, headers=headers, timeout=SEND_TIMEOUT
-                )
-
-            response.raise_for_status()
-            etag = response.headers.get("ETag") or response.headers.get("etag")
-            return (True, etag, response.status_code)
-
-        except Exception as e:
-            # Presigned object-storage 404s may be transient Cloudflare routing issues.
-            # Allow up to 2 retries (2 s, 4 s backoff) before giving up.
-            is_transient_storage_404 = (
-                is_object_storage
-                and isinstance(e, httpx.HTTPStatusError)
-                and e.response.status_code == 404
-                and attempt < 2
-            )
-            can_retry = is_retryable(e) or is_transient_storage_404
-            if is_object_storage and (not can_retry or attempt == MAX_RETRIES - 1):
-                print(
-                    "[Worker] Object storage upload failed "
-                    f"task={task_label(task_id)} offer={task_label(offer_id)} "
-                    f"chunk={chunk_index} error={exception_detail(e)}{http_status_detail(e)}"
-                    f"{format_route_context(route_context)}"
-                )
-            if not can_retry or attempt == MAX_RETRIES - 1:
-                raise
-            print(
-                "[Worker] Send retry "
-                f"task={task_label(task_id)} offer={task_label(offer_id)} "
-                f"chunk={chunk_index} attempt={attempt + 1}/{MAX_RETRIES} "
-                f"error={exception_detail(e)}{http_status_detail(e)}"
-            )
-            await asyncio.sleep(RETRY_BACKOFF * (2**attempt))
-
-    raise Exception("Max retries exceeded")
 
 
 async def execute_transfer(
@@ -1034,47 +1106,36 @@ async def execute_transfer(
 
         try:
             chunk_started = time.perf_counter()
-            # Fetch chunk
-            fetch_started = time.perf_counter()
-            data = await fetch_chunk(
+            (
+                bytes_fetched,
+                computed_chunk_hash,
+                etag,
+                response_code,
+                fetch_ms,
+                send_ms,
+            ) = await fetch_and_send_chunk(
                 client,
                 final_url,
+                chunk_dest_url,
+                transfer_id,
+                chunk_index,
                 chunk_offset=chunk_offset_for_fetch if use_range else None,
                 chunk_size=chunk_size_for_fetch if use_range else None,
                 total_size=total_size if use_range else None,
                 expected_max_bytes=expected_chunk_bytes,
+                expected_chunk_hash=chunk_hashes.get(chunk_index),
+                auth_token=auth_token,
                 task_id=task_id,
                 offer_id=offer_id,
-                chunk_index=chunk_index,
+                route_metadata=multipart_metadata,
+                is_canary=is_canary,
             )
-            fetch_ms = (time.perf_counter() - fetch_started) * 1000
 
-            bytes_fetched = len(data)
-            hash_started = time.perf_counter()
-            computed_chunk_hash = hashlib.sha256(data).hexdigest()
-            hash_ms = (time.perf_counter() - hash_started) * 1000
-
-            # Send chunk (or skip for canary)
             if is_canary:
                 print(f"[Worker] Chunk {chunk_index}: CANARY mode, skipping upload")
                 total_bytes += bytes_fetched
                 continue
 
-            send_started = time.perf_counter()
-            send_success, etag, response_code = await send_chunk(
-                client,
-                chunk_dest_url,
-                data,
-                transfer_id,
-                chunk_index,
-                chunk_offset=chunk_offset_for_fetch if use_range else 0,
-                total_size=total_size,
-                auth_token=auth_token,
-                task_id=task_id,
-                offer_id=offer_id,
-                route_metadata=multipart_metadata,
-            )
-            send_ms = (time.perf_counter() - send_started) * 1000
             if etag:
                 last_etag = etag
 
@@ -1084,7 +1145,7 @@ async def execute_transfer(
             print(
                 f"[Worker] Chunk {chunk_index}: {bytes_fetched} bytes transferred "
                 f"task={task_label(task_id)} offer={task_label(offer_id)} "
-                f"fetch_ms={fetch_ms:.1f} hash_ms={hash_ms:.1f} send_ms={send_ms:.1f} "
+                f"fetch_ms={fetch_ms:.1f} send_ms={send_ms:.1f} "
                 f"total_ms={total_ms:.1f} mbps={mbps:.1f} response={response_code}"
             )
 
