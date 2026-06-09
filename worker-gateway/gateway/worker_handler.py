@@ -42,7 +42,14 @@ async def handle_worker_websocket(
             "gateway_mode": "orch_owned",
         }
     )
-    await registry.notify_control({"type": "worker_connected", "worker_id": worker_id})
+    await registry.notify_control(
+        {
+            "type": "worker_connected",
+            "worker_id": worker_id,
+            "client_ip": session.client_ip,
+            "hotkey": session.hotkey,
+        }
+    )
 
     try:
         while True:
@@ -72,12 +79,17 @@ async def handle_worker_websocket(
             elif msg_type == "stats_snapshot":
                 session.bandwidth_mbps = float(message.get("bandwidth_mbps") or 0.0)
                 session.tasks_active = int(message.get("tasks_active") or 0)
+                hotkey = str(message.get("hotkey") or "").strip()
+                if hotkey:
+                    registry.update_worker_identity(worker_id, hotkey=hotkey)
                 await registry.notify_control(
                     {
                         "type": "worker_capacity_update",
                         "worker_id": worker_id,
                         "bandwidth_mbps": session.bandwidth_mbps,
                         "tasks_active": session.tasks_active,
+                        "client_ip": session.client_ip,
+                        "hotkey": session.hotkey,
                     }
                 )
                 await websocket.send_json({"type": "stats_snapshot_ack"})
@@ -93,9 +105,19 @@ async def handle_worker_websocket(
                 logger.debug("Ignoring unknown worker message type: %s", msg_type)
 
     except WebSocketDisconnect:
-        logger.info("Worker websocket disconnected: %s", worker_id[:20])
+        logger.info("Worker websocket disconnected: %s", worker_id)
     except Exception:
-        logger.exception("Worker websocket error: %s", worker_id[:20])
+        logger.exception("Worker websocket error: %s", worker_id)
     finally:
+        session = registry.get_worker(worker_id)
+        client_ip = session.client_ip if session else ""
+        hotkey = session.hotkey if session else ""
         await registry.unregister_worker(worker_id)
-        await registry.notify_control({"type": "worker_disconnected", "worker_id": worker_id})
+        await registry.notify_control(
+            {
+                "type": "worker_disconnected",
+                "worker_id": worker_id,
+                "client_ip": client_ip,
+                "hotkey": hotkey,
+            }
+        )

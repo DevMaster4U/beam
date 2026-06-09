@@ -65,6 +65,7 @@ from .proof_aggregator import ProofAggregator
 from .reward_manager import RewardManager
 from .task_scheduler import TaskScheduler
 from .worker_manager import WorkerManager
+from notifications.slack import SlackNotifier
 
 # BlindWorkerManager removed
 # GatewayManager removed
@@ -412,6 +413,9 @@ class Orchestrator:
         # SubnetCoreClient for API-based data operations
         self.subnet_core_client: Optional[Any] = None
         self.gateway_control_client: Optional[Any] = None
+        self._slack_notifier = SlackNotifier(self.settings.slack_notification_url)
+        self._pending_worker_connect_slack: dict[str, dict[str, Any]] = {}
+        self._worker_connect_slack_delay_seconds = 5.0
 
         # Async control
         self._running: bool = False
@@ -479,6 +483,9 @@ class Orchestrator:
             self._find_our_uid()
 
         # Initialize SubnetCoreClient for API-based data operations
+        await self._slack_notifier.start()
+        if self._slack_notifier.enabled:
+            logger.info("Slack notifications enabled")
         await self._init_subnet_core_client()
 
         # Skip chain-dependent initialization in local mode
@@ -594,6 +601,8 @@ class Orchestrator:
                 await self.subnet_core_client.stop_polling()
             await close_subnet_core_client()
             logger.info("SubnetCoreClient closed")
+
+        await self._slack_notifier.stop()
 
         logger.info("Orchestrator stopped")
 
@@ -1352,7 +1361,8 @@ class Orchestrator:
             self.subnet_core_client.set_task_completion_handler(
                 self._handle_task_completion_notification
             )
-            self.subnet_core_client.set_worker_update_handler(self._worker_mgr.handle_worker_update)
+            self.subnet_core_client.set_worker_update_handler(self._handle_worker_update_with_slack)
+            self.subnet_core_client.set_slack_notifier(self._slack_notifier)
 
             # Configure registration message sent on every WS connect
             import socket as _socket
@@ -1436,17 +1446,76 @@ class Orchestrator:
         msg_type = message.get("type")
 
         if msg_type == "worker_connected":
-            await self._worker_mgr.handle_worker_update(message.get("worker_id", ""), "connected")
+            worker_id = message.get("worker_id", "")
+            if worker_id and self._slack_notifier.enabled:
+                existing = self._worker_mgr.workers.get(worker_id)
+                self._schedule_worker_connect_slack(
+                    worker_id,
+                    reconnect=existing is not None,
+                    client_ip=str(message.get("client_ip") or ""),
+                    hotkey=str(message.get("hotkey") or ""),
+                )
+            await self._worker_mgr.handle_worker_update(worker_id, "connected")
             return
 
         if msg_type == "worker_disconnected":
-            await self._worker_mgr.handle_worker_update(message.get("worker_id", ""), "disconnected")
+            worker_id = message.get("worker_id", "")
+            self._cancel_worker_connect_slack(worker_id)
+            if worker_id and self._slack_notifier.enabled:
+                client_ip = str(message.get("client_ip") or self._worker_slack_meta(worker_id)[0])
+                hotkey = str(message.get("hotkey") or self._worker_slack_meta(worker_id)[1])
+                logger.info(
+                    "Worker disconnected: worker_id=%s ip=%s hotkey=%s",
+                    worker_id,
+                    client_ip,
+                    hotkey,
+                )
+                await self._slack_notifier.notify_worker_disconnected(
+                    worker_id=worker_id,
+                    client_ip=client_ip,
+                    hotkey=hotkey,
+                )
+            await self._worker_mgr.handle_worker_update(worker_id, "disconnected")
+            return
+
+        if msg_type == "worker_capacity_update":
+            worker_id = message.get("worker_id", "")
+            if worker_id:
+                await self._flush_worker_connect_slack(
+                    worker_id,
+                    client_ip=str(message.get("client_ip") or ""),
+                    hotkey=str(message.get("hotkey") or ""),
+                )
             return
 
         if msg_type == "worker_response":
             worker_id = message.get("worker_id", "")
             task_id = message.get("task_id", "")
             offer_id = message.get("offer_id") or task_id
+            decision = str(message.get("decision") or "")
+            if self._slack_notifier.enabled and task_id and worker_id:
+                accepted = decision in ("task_accept", "accept")
+                rejected = decision in ("task_reject", "reject")
+                if accepted or rejected:
+                    client_ip, hotkey = self._worker_slack_meta(worker_id)
+                    label = "Task accepted" if accepted else "Task rejected"
+                    logger.info(
+                        "%s: task_id=%s worker_id=%s ip=%s hotkey=%s reason=%s",
+                        label,
+                        task_id,
+                        worker_id,
+                        client_ip,
+                        hotkey,
+                        message.get("reason") or "",
+                    )
+                    await self._slack_notifier.notify_task_response(
+                        task_id=task_id,
+                        worker_id=worker_id,
+                        accepted=accepted,
+                        client_ip=client_ip,
+                        hotkey=hotkey,
+                        reason=message.get("reason"),
+                    )
             try:
                 ack = await self.subnet_core_client.relay_worker_response(message)
                 accepted, reason = parse_worker_response_ack(ack)
@@ -1499,6 +1568,140 @@ class Orchestrator:
                         reason=str(exc),
                     )
 
+    @staticmethod
+    def _normalize_slack_ip(ip: Optional[str]) -> str:
+        value = str(ip or "").strip()
+        if not value or value in ("unknown", "0.0.0.0"):
+            return ""
+        return value
+
+    @staticmethod
+    def _normalize_slack_hotkey(hotkey: Optional[str]) -> str:
+        value = str(hotkey or "").strip()
+        if not value or value == "unknown":
+            return ""
+        return value
+
+    def _cancel_worker_connect_slack(self, worker_id: str) -> None:
+        pending = self._pending_worker_connect_slack.pop(worker_id, None)
+        if not pending:
+            return
+        task = pending.get("task")
+        if task and not task.done():
+            task.cancel()
+
+    def _schedule_worker_connect_slack(
+        self,
+        worker_id: str,
+        *,
+        reconnect: bool,
+        client_ip: str = "",
+        hotkey: str = "",
+    ) -> None:
+        if not self._slack_notifier.enabled or not worker_id:
+            return
+
+        self._cancel_worker_connect_slack(worker_id)
+        pending: dict[str, Any] = {
+            "reconnect": reconnect,
+            "client_ip": self._normalize_slack_ip(client_ip),
+            "hotkey": self._normalize_slack_hotkey(hotkey),
+        }
+
+        async def _delayed_send() -> None:
+            try:
+                await asyncio.sleep(self._worker_connect_slack_delay_seconds)
+            except asyncio.CancelledError:
+                return
+            await self._flush_worker_connect_slack(worker_id)
+
+        pending["task"] = asyncio.create_task(_delayed_send())
+        self._pending_worker_connect_slack[worker_id] = pending
+
+    async def _flush_worker_connect_slack(
+        self,
+        worker_id: str,
+        *,
+        client_ip: str = "",
+        hotkey: str = "",
+    ) -> None:
+        pending = self._pending_worker_connect_slack.pop(worker_id, None)
+        if not pending:
+            return
+
+        task = pending.get("task")
+        if task and not task.done():
+            task.cancel()
+        if client_ip:
+            pending["client_ip"] = self._normalize_slack_ip(client_ip) or pending["client_ip"]
+        if hotkey:
+            pending["hotkey"] = self._normalize_slack_hotkey(hotkey) or pending["hotkey"]
+
+        if not self._slack_notifier.enabled:
+            return
+
+        meta_ip, meta_hotkey = self._worker_slack_meta(worker_id)
+        resolved_ip = pending.get("client_ip") or self._normalize_slack_ip(meta_ip) or "unknown"
+        resolved_hotkey = pending.get("hotkey") or self._normalize_slack_hotkey(meta_hotkey) or "unknown"
+        reconnect = bool(pending.get("reconnect"))
+        event_label = "Worker reconnected" if reconnect else "New worker connected"
+        logger.info(
+            "%s: worker_id=%s ip=%s hotkey=%s",
+            event_label,
+            worker_id,
+            resolved_ip,
+            resolved_hotkey,
+        )
+        await self._slack_notifier.notify_worker_connected(
+            worker_id=worker_id,
+            client_ip=resolved_ip,
+            hotkey=resolved_hotkey,
+            reconnect=reconnect,
+        )
+
+    def _worker_slack_meta(self, worker_id: str) -> tuple[str, str]:
+        if self.gateway_control_client:
+            for worker in self.gateway_control_client.get_local_workers():
+                if worker.get("worker_id") == worker_id:
+                    return (
+                        str(worker.get("client_ip") or "unknown"),
+                        str(worker.get("hotkey") or "unknown"),
+                    )
+
+        worker = self._worker_mgr.workers.get(worker_id)
+        if worker:
+            ip = self._normalize_slack_ip(worker.ip) or "unknown"
+            hotkey = self._normalize_slack_hotkey(worker.hotkey) or "unknown"
+            return ip, hotkey
+        return "unknown", "unknown"
+
+    async def _handle_worker_update_with_slack(self, worker_id: str, event: str) -> None:
+        """Public-gateway worker connect/disconnect push events with Slack alerts."""
+        if event == "connected" and self._slack_notifier.enabled:
+            reconnect = worker_id in self._worker_mgr.workers
+            await self._worker_mgr.handle_worker_update(worker_id, event)
+            client_ip, hotkey = self._worker_slack_meta(worker_id)
+            self._schedule_worker_connect_slack(
+                worker_id,
+                reconnect=reconnect,
+                client_ip=client_ip,
+                hotkey=hotkey,
+            )
+            return
+
+        if event == "disconnected" and self._slack_notifier.enabled:
+            self._cancel_worker_connect_slack(worker_id)
+            client_ip, hotkey = self._worker_slack_meta(worker_id)
+            await self._worker_mgr.handle_worker_update(worker_id, event)
+            await self._slack_notifier.notify_worker_disconnected(
+                worker_id=worker_id,
+                client_ip=client_ip,
+                hotkey=hotkey,
+            )
+            return
+
+        await self._worker_mgr.handle_worker_update(worker_id, event)
+
     async def _handle_task_completion_notification(self, message: dict) -> bool:
         """
         Handle task completion notifications from SubnetCore.
@@ -1523,8 +1726,10 @@ class Orchestrator:
         bandwidth_mbps = message.get("bandwidth_mbps", 0.0)
 
         logger.info(
-            f"Verifying task completion: task={task_id[:16] if task_id else 'none'}... "
-            f"worker={worker_id[:16] if worker_id else 'none'}... bytes={bytes_transferred}"
+            "Verifying task completion: task=%s worker=%s bytes=%s",
+            task_id or "none",
+            worker_id or "none",
+            bytes_transferred,
         )
 
         task = self.active_tasks.get(task_id) or self.completed_tasks.get(task_id)
@@ -1562,13 +1767,40 @@ class Orchestrator:
                 self.completed_tasks[task_id] = task
                 self.total_bytes_relayed += bytes_transferred
                 self.total_tasks_completed += 1
-                logger.info(f"Task {task_id[:16]}... marked completed via SubnetCore notification")
+                logger.info("Task marked completed via SubnetCore notification: task_id=%s", task_id)
         else:
             logger.info(
-                f"Task {task_id[:16]}... not in memory, recording stats from SubnetCore data"
+                "Task not in memory, recording stats from SubnetCore data: task_id=%s",
+                task_id,
             )
             self.total_bytes_relayed += bytes_transferred
             self.total_tasks_completed += 1
+
+        if self._slack_notifier.enabled and task_id and worker_id:
+            client_ip, hotkey = self._worker_slack_meta(worker_id)
+            assignment_id = message.get("assignment_id") or ""
+            if not assignment_id and task_id in self.completed_tasks:
+                assignment_id = getattr(self.completed_tasks[task_id], "assignment_id", "") or ""
+            logger.info(
+                "Task complete: task_id=%s assignment_id=%s worker_id=%s ip=%s hotkey=%s "
+                "bytes=%s bandwidth_mbps=%s",
+                task_id,
+                assignment_id or "unknown",
+                worker_id,
+                client_ip,
+                hotkey,
+                bytes_transferred,
+                bandwidth_mbps,
+            )
+            await self._slack_notifier.notify_task_complete(
+                task_id=task_id,
+                worker_id=worker_id,
+                assignment_id=str(assignment_id),
+                client_ip=client_ip,
+                hotkey=hotkey,
+                bytes_transferred=int(bytes_transferred or 0),
+                bandwidth_mbps=float(bandwidth_mbps or 0.0),
+            )
 
         return True
 
@@ -1580,13 +1812,13 @@ class Orchestrator:
     async def _init_orch_manager(self) -> None:
         """Initialize the orchestrator manager for incentive mechanism."""
         try:
-            from beam.orchestrator import OrchestratorManager
+            try:
+                from beam.orchestrator import OrchestratorManager
+            except ImportError:
+                from core.orch_manager import OrchestratorManager
 
             self.orch_manager = OrchestratorManager()
             logger.info("Orchestrator manager initialized (in-memory mode)")
-        except ImportError:
-            # OrchestratorManager is optional - not needed for normal operation
-            self.orch_manager = None
         except Exception as e:
             logger.error(f"Failed to initialize orchestrator manager: {e}")
             self.orch_manager = None

@@ -12,10 +12,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RESTART_DELAY=10
 ENV_FILE="${ROOT}/.env"
 LOG_DIR="${ROOT}/logs"
 PID_DIR="${ROOT}/run"
-LOG_FILE="${LOG_DIR}/worker-gateway.log"
+LOG_FILE="${LOG_DIR}/gateway.log"
 PID_FILE="${PID_DIR}/worker-gateway.pid"
 
 usage() {
@@ -113,7 +114,8 @@ fi
 
 if [[ "$RESTART" -eq 1 ]]; then
   stop_service 1
-  sleep 1
+  echo "Waiting ${RESTART_DELAY}s before starting worker-gateway..."
+  sleep "$RESTART_DELAY"
 fi
 
 if [[ "$STATUS" -eq 1 ]]; then

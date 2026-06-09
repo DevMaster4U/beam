@@ -282,6 +282,11 @@ class OrchestratorSettings(BaseSettings):
     cors_allowed_headers: str = Field(default="*", env="CORS_ALLOWED_HEADERS")
 
     # ==========================================================================
+    # Notifications
+    # ==========================================================================
+    slack_notification_url: Optional[str] = Field(default=None, env="SLACK_NOTIFICATION_URL")
+
+    # ==========================================================================
     # Compliance / Audit Settings
     # ==========================================================================
     # Enable audit event publishing to BeamCore

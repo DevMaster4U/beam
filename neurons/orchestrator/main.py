@@ -58,7 +58,7 @@ logging.basicConfig(
 )
 
 # Add file handler for log viewer
-file_handler = logging.FileHandler(f"{LOG_DIR}/orchestrator.log")
+file_handler = logging.FileHandler(f"{LOG_DIR}/miner.log")
 file_handler.setFormatter(logging.Formatter(log_format, datefmt=log_datefmt))
 logging.getLogger().addHandler(file_handler)
 

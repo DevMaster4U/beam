@@ -231,6 +231,8 @@ class GatewayControlClient:
             if worker_id:
                 self._local_workers[worker_id] = {
                     "worker_id": worker_id,
+                    "client_ip": str(data.get("client_ip") or ""),
+                    "hotkey": str(data.get("hotkey") or ""),
                     "bandwidth_mbps": 0.0,
                     "trust_score": 0.8,
                 }
@@ -249,9 +251,14 @@ class GatewayControlClient:
         if msg_type == "worker_capacity_update":
             worker_id = data.get("worker_id")
             if worker_id and worker_id in self._local_workers:
-                self._local_workers[worker_id]["bandwidth_mbps"] = float(
-                    data.get("bandwidth_mbps") or 0.0
-                )
+                worker = self._local_workers[worker_id]
+                worker["bandwidth_mbps"] = float(data.get("bandwidth_mbps") or 0.0)
+                if data.get("client_ip"):
+                    worker["client_ip"] = str(data["client_ip"])
+                if data.get("hotkey"):
+                    worker["hotkey"] = str(data["hotkey"])
+            if self._event_handler:
+                await self._dispatch_event(data)
             return
 
         if self._event_handler:

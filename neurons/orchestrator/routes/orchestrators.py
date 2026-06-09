@@ -130,6 +130,13 @@ def get_orchestrator_instance() -> Orchestrator:
     return get_orchestrator()
 
 
+def _require_orch_manager(orchestrator: Orchestrator):
+    manager = getattr(orchestrator, "orch_manager", None)
+    if manager is None:
+        raise HTTPException(status_code=503, detail="Orchestrator manager not initialized")
+    return manager
+
+
 # =============================================================================
 # Orchestrator Registration
 # =============================================================================
@@ -149,13 +156,11 @@ async def register_orchestrator(
 
     """
     try:
-        # Check if manager is available
-        if not hasattr(orchestrator, "orch_manager") or orchestrator.orch_manager is None:
-            raise HTTPException(status_code=503, detail="Orchestrator manager not initialized")
+        manager = _require_orch_manager(orchestrator)
 
         # Check for async method (PersistentOrchestratorManager) vs sync (OrchestratorManager)
-        if hasattr(orchestrator.orch_manager, "register_orchestrator_async"):
-            orch = await orchestrator.orch_manager.register_orchestrator_async(
+        if hasattr(manager, "register_orchestrator_async"):
+            orch = await manager.register_orchestrator_async(
                 uid=request.uid,
                 hotkey=request.hotkey,
                 name=request.name,
@@ -163,7 +168,7 @@ async def register_orchestrator(
                 contact=request.contact,
             )
         else:
-            orch = orchestrator.orch_manager.register_orchestrator(
+            orch = manager.register_orchestrator(
                 uid=request.uid,
                 hotkey=request.hotkey,
                 name=request.name,
@@ -206,13 +211,12 @@ async def deregister_orchestrator(
         raise HTTPException(status_code=400, detail="Cannot deregister subnet orchestrator #1")
 
     try:
-        if not hasattr(orchestrator, "orch_manager"):
-            raise HTTPException(status_code=503, detail="Orchestrator manager not initialized")
+        manager = _require_orch_manager(orchestrator)
 
-        if hasattr(orchestrator.orch_manager, "deregister_orchestrator_async"):
-            success = await orchestrator.orch_manager.deregister_orchestrator_async(uid)
+        if hasattr(manager, "deregister_orchestrator_async"):
+            success = await manager.deregister_orchestrator_async(uid)
         else:
-            success = orchestrator.orch_manager.deregister_orchestrator(uid)
+            success = manager.deregister_orchestrator(uid)
 
         if success:
             return {"success": True, "message": f"Orchestrator UID {uid} deregistered"}
@@ -233,10 +237,9 @@ async def update_orchestrator(
     orchestrator: Orchestrator = Depends(get_orchestrator_instance),
 ):
     """Update orchestrator information."""
-    if not hasattr(orchestrator, "orch_manager"):
-        raise HTTPException(status_code=503, detail="Orchestrator manager not initialized")
+    manager = _require_orch_manager(orchestrator)
 
-    orch = orchestrator.orch_manager.get_orchestrator(uid)
+    orch = manager.get_orchestrator(uid)
     if not orch:
         raise HTTPException(status_code=404, detail=f"Orchestrator UID {uid} not found")
 
@@ -274,10 +277,9 @@ async def get_orchestrator_info(
     orchestrator: Orchestrator = Depends(get_orchestrator_instance),
 ):
     """Get information about a specific orchestrator."""
-    if not hasattr(orchestrator, "orch_manager"):
-        raise HTTPException(status_code=503, detail="Orchestrator manager not initialized")
+    manager = _require_orch_manager(orchestrator)
 
-    orch = orchestrator.orch_manager.get_orchestrator(uid)
+    orch = manager.get_orchestrator(uid)
     if not orch:
         raise HTTPException(status_code=404, detail=f"Orchestrator UID {uid} not found")
 
@@ -304,10 +306,9 @@ async def list_orchestrators(
     orchestrator: Orchestrator = Depends(get_orchestrator_instance),
 ):
     """List all registered orchestrators."""
-    if not hasattr(orchestrator, "orch_manager"):
-        raise HTTPException(status_code=503, detail="Orchestrator manager not initialized")
+    manager = _require_orch_manager(orchestrator)
 
-    orchestrators = list(orchestrator.orch_manager.orchestrators.values())
+    orchestrators = list(manager.orchestrators.values())
 
     # Apply filters
     if not include_subnet:
@@ -360,18 +361,17 @@ async def create_datastream(
     - Unique datastream ID
     """
     try:
-        if not hasattr(orchestrator, "orch_manager"):
-            raise HTTPException(status_code=503, detail="Orchestrator manager not initialized")
+        manager = _require_orch_manager(orchestrator)
 
-        if hasattr(orchestrator.orch_manager, "create_datastream_async"):
-            ds = await orchestrator.orch_manager.create_datastream_async(
+        if hasattr(manager, "create_datastream_async"):
+            ds = await manager.create_datastream_async(
                 orchestrator_uid=uid,
                 datastream_id=request.datastream_id,
                 name=request.name,
                 description=request.description,
             )
         else:
-            ds = orchestrator.orch_manager.create_datastream(
+            ds = manager.create_datastream(
                 orchestrator_uid=uid,
                 datastream_id=request.datastream_id,
                 name=request.name,
@@ -402,10 +402,9 @@ async def list_datastreams(
     orchestrator: Orchestrator = Depends(get_orchestrator_instance),
 ):
     """List all datastreams for an orchestrator."""
-    if not hasattr(orchestrator, "orch_manager"):
-        raise HTTPException(status_code=503, detail="Orchestrator manager not initialized")
+    manager = _require_orch_manager(orchestrator)
 
-    orch = orchestrator.orch_manager.get_orchestrator(uid)
+    orch = manager.get_orchestrator(uid)
     if not orch:
         raise HTTPException(status_code=404, detail=f"Orchestrator UID {uid} not found")
 
@@ -436,10 +435,9 @@ async def get_datastream(
     orchestrator: Orchestrator = Depends(get_orchestrator_instance),
 ):
     """Get information about a specific datastream."""
-    if not hasattr(orchestrator, "orch_manager"):
-        raise HTTPException(status_code=503, detail="Orchestrator manager not initialized")
+    manager = _require_orch_manager(orchestrator)
 
-    orch = orchestrator.orch_manager.get_orchestrator(uid)
+    orch = manager.get_orchestrator(uid)
     if not orch:
         raise HTTPException(status_code=404, detail=f"Orchestrator UID {uid} not found")
 
@@ -467,13 +465,12 @@ async def terminate_datastream(
 ):
     """Terminate a datastream."""
     try:
-        if not hasattr(orchestrator, "orch_manager"):
-            raise HTTPException(status_code=503, detail="Orchestrator manager not initialized")
+        manager = _require_orch_manager(orchestrator)
 
-        if hasattr(orchestrator.orch_manager, "terminate_datastream_async"):
-            success = await orchestrator.orch_manager.terminate_datastream_async(uid, datastream_id)
+        if hasattr(manager, "terminate_datastream_async"):
+            success = await manager.terminate_datastream_async(uid, datastream_id)
         else:
-            success = orchestrator.orch_manager.terminate_datastream(uid, datastream_id)
+            success = manager.terminate_datastream(uid, datastream_id)
 
         if success:
             return {"success": True, "message": f"Datastream {datastream_id} terminated"}
@@ -504,17 +501,16 @@ async def affiliate_worker(
     Workers can voluntarily choose an orchestrator to route their traffic through.
     """
     try:
-        if not hasattr(orchestrator, "orch_manager"):
-            raise HTTPException(status_code=503, detail="Orchestrator manager not initialized")
+        manager = _require_orch_manager(orchestrator)
 
-        if hasattr(orchestrator.orch_manager, "affiliate_worker_async"):
-            success = await orchestrator.orch_manager.affiliate_worker_async(
+        if hasattr(manager, "affiliate_worker_async"):
+            success = await manager.affiliate_worker_async(
                 worker_id=request.worker_id,
                 worker_hotkey=request.worker_hotkey,
                 orchestrator_uid=uid,
             )
         else:
-            success = orchestrator.orch_manager.affiliate_worker(
+            success = manager.affiliate_worker(
                 worker_id=request.worker_id,
                 worker_hotkey=request.worker_hotkey,
                 orchestrator_uid=uid,
@@ -547,10 +543,9 @@ async def list_affiliated_workers(
     orchestrator: Orchestrator = Depends(get_orchestrator_instance),
 ):
     """List all workers affiliated with this orchestrator."""
-    if not hasattr(orchestrator, "orch_manager"):
-        raise HTTPException(status_code=503, detail="Orchestrator manager not initialized")
+    manager = _require_orch_manager(orchestrator)
 
-    orch = orchestrator.orch_manager.get_orchestrator(uid)
+    orch = manager.get_orchestrator(uid)
     if not orch:
         raise HTTPException(status_code=404, detail=f"Orchestrator UID {uid} not found")
 
@@ -573,10 +568,9 @@ async def get_orchestrator_stats(
     orchestrator: Orchestrator = Depends(get_orchestrator_instance),
 ):
     """Get aggregate orchestrator statistics."""
-    if not hasattr(orchestrator, "orch_manager"):
-        raise HTTPException(status_code=503, detail="Orchestrator manager not initialized")
+    manager = _require_orch_manager(orchestrator)
 
-    orchestrators = list(orchestrator.orch_manager.orchestrators.values())
+    orchestrators = list(manager.orchestrators.values())
     non_subnet = [o for o in orchestrators if not o.is_subnet_owned]
 
     # Status distribution
@@ -594,6 +588,8 @@ async def get_orchestrator_stats(
     )
 
 
+    subnet_orch = manager.orchestrators.get(1)
+
     return {
         "total_orchestrators": len(orchestrators),
         "non_subnet_orchestrators": len(non_subnet),
@@ -603,9 +599,9 @@ async def get_orchestrator_stats(
         "subnet_orchestrator": (
             {
                 "uid": 1,
-                "workers": len(orchestrators[0].worker_hotkeys) if orchestrators else 0,
+                "workers": len(subnet_orch.worker_hotkeys) if subnet_orch else 0,
             }
-            if orchestrators and orchestrators[0].is_subnet_owned
+            if subnet_orch and subnet_orch.is_subnet_owned
             else None
         ),
     }

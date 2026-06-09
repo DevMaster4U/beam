@@ -63,6 +63,75 @@ def _normalize_worker_list(workers: list[dict[str, Any]], transfer_id: str) -> l
     return normalized_workers
 
 
+def _workers_by_id(workers: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {str(worker["worker_id"]): worker for worker in workers if worker.get("worker_id")}
+
+
+def _format_worker_identity(
+    worker_id: Optional[str],
+    workers_by_id: dict[str, dict[str, Any]],
+) -> str:
+    wid = worker_id or "unknown"
+    meta = workers_by_id.get(wid, {})
+    ip = str(meta.get("client_ip") or "unknown")
+    hotkey = str(meta.get("hotkey") or "unknown")
+    return f"{wid} (ip={ip}, hotkey={hotkey})"
+
+
+def _log_chunk_assignment_map(
+    response: dict[str, Any],
+    assignment_id: Optional[str],
+    assignments: list[dict[str, Any]],
+    workers: Optional[list[dict[str, Any]]] = None,
+) -> None:
+    """Log task_id => assignment_id => worker_id after chunk_assignments ack."""
+    aid = assignment_id or "unknown"
+    workers_by_id = _workers_by_id(workers or [])
+    workers_by_chunk = {
+        int(item["chunk_index"]): str(item["worker_id"])
+        for item in assignments
+        if item.get("chunk_index") is not None and item.get("worker_id")
+    }
+
+    task_entries: list[dict[str, Any]] = []
+    for key in ("tasks", "queued_tasks", "task_assignments"):
+        raw = response.get(key)
+        if isinstance(raw, list) and raw:
+            task_entries = [entry for entry in raw if isinstance(entry, dict)]
+            if task_entries:
+                break
+
+    if task_entries:
+        logger.info("Chunk assignment map for assignment %s:", aid)
+        for entry in task_entries:
+            task_id = entry.get("task_id") or entry.get("id") or "unknown"
+            worker_id = entry.get("worker_id")
+            if worker_id is None and entry.get("chunk_index") is not None:
+                worker_id = workers_by_chunk.get(int(entry["chunk_index"]), "unknown")
+            entry_aid = entry.get("assignment_id") or aid
+            logger.info(
+                "  %s => %s => %s",
+                task_id,
+                entry_aid,
+                _format_worker_identity(worker_id, workers_by_id),
+            )
+        return
+
+    if not workers_by_chunk:
+        logger.info("Chunk assignment map for assignment %s: (empty)", aid)
+        return
+
+    logger.info("Chunk assignment map for assignment %s:", aid)
+    for chunk_index in sorted(workers_by_chunk):
+        worker_id = workers_by_chunk[chunk_index]
+        logger.info(
+            "  chunk_index=%s => %s => %s",
+            chunk_index,
+            aid,
+            _format_worker_identity(worker_id, workers_by_id),
+        )
+
+
 @dataclass
 class TaskExecutionContext:
     """Execution context for real data transfer - passed to workers."""
@@ -193,6 +262,7 @@ class SubnetCoreClient:
         # Dedicated worker gateway (Option 1) control client
         self._gateway_control_client: Optional[Any] = None
         self._dedicated_gateway_enabled: bool = False
+        self._slack_notifier: Optional[Any] = None
 
     # =========================================================================
     # Handlers for polling notifications
@@ -221,6 +291,10 @@ class SubnetCoreClient:
         self._gateway_control_client = gateway_control_client
         self._dedicated_gateway_enabled = True
         logger.info("Dedicated worker gateway mode enabled")
+
+    def set_slack_notifier(self, notifier: Any) -> None:
+        """Optional SlackNotifier for task-offer alerts."""
+        self._slack_notifier = notifier
 
     def prime_ready_state(self, ready: bool) -> None:
         """Set the desired ready state before the websocket auto-registers."""
@@ -825,11 +899,33 @@ class SubnetCoreClient:
             logger.warning("Malformed worker_task_offer: %s", data)
             return
 
+        task_id = offer.get("task_id") or data.get("task_id")
+        assignment_id = offer.get("assignment_id") or data.get("assignment_id")
+        if task_id and assignment_id:
+            workers_by_id = _workers_by_id(self._gateway_control_client.get_local_workers())
+            meta = workers_by_id.get(worker_id, {})
+            logger.info(
+                "Task offer: task_id=%s assignment_id=%s worker_id=%s ip=%s hotkey=%s",
+                task_id,
+                assignment_id,
+                worker_id,
+                str(meta.get("client_ip") or "unknown"),
+                str(meta.get("hotkey") or "unknown"),
+            )
+            if self._slack_notifier and self._slack_notifier.enabled:
+                await self._slack_notifier.notify_task_offer(
+                    task_id=task_id,
+                    assignment_id=assignment_id,
+                    worker_id=worker_id,
+                    client_ip=str(meta.get("client_ip") or "unknown"),
+                    hotkey=str(meta.get("hotkey") or "unknown"),
+                )
+
         delivered = await self._gateway_control_client.send_task_offer(worker_id, offer)
         if not delivered:
             logger.error(
                 "Failed to relay worker_task_offer to gateway for worker %s",
-                str(worker_id)[:20],
+                worker_id,
             )
 
     async def relay_worker_response(self, message: dict[str, Any]) -> dict[str, Any]:
@@ -911,6 +1007,9 @@ class SubnetCoreClient:
                         task_count,
                         len(assignments),
                         assignment_id,
+                    )
+                    _log_chunk_assignment_map(
+                        response, assignment_id, assignments, normalized_workers
                     )
                     return
                 except Exception as e:

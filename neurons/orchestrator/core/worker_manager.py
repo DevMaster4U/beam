@@ -432,7 +432,10 @@ class WorkerManager:
                     status=WorkerStatus.ACTIVE,
                 )
                 self.workers[worker_id] = worker
-                logger.info(f"Worker {worker_id[:20]}... added to local cache (push: connected)")
+                logger.info(
+                    "Worker added to local cache (push: connected): worker_id=%s",
+                    worker_id,
+                )
             else:
                 # Reactivate if previously offline
                 existing = self.workers[worker_id]
@@ -440,7 +443,8 @@ class WorkerManager:
                     existing.status = WorkerStatus.ACTIVE
                     existing.last_seen = datetime.utcnow()
                     logger.info(
-                        f"Worker {worker_id[:20]}... reactivated in local cache (push: connected)"
+                        "Worker reactivated in local cache (push: connected): worker_id=%s",
+                        worker_id,
                     )
 
         elif event == "disconnected":
@@ -448,7 +452,11 @@ class WorkerManager:
             if worker:
                 worker.status = WorkerStatus.OFFLINE
                 logger.info(
-                    f"Worker {worker_id[:20]}... marked offline in local cache (push: disconnected)"
+                    "Worker marked offline in local cache (push: disconnected): "
+                    "worker_id=%s hotkey=%s ip=%s",
+                    worker_id,
+                    worker.hotkey or "unknown",
+                    worker.ip or "unknown",
                 )
 
     def register_worker_connection(self, worker_id: str, websocket: Any) -> None:

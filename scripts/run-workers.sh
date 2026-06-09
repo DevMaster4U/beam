@@ -47,13 +47,20 @@ case "$ACTION" in
     found=0
     for instance in $(list_instances); do
       found=1
-      "${ROOT}/scripts/run-worker.sh" "$instance" --restart
+      if [[ -f "${ROOT}/run/workers/${instance}.pid" ]]; then
+        "${ROOT}/scripts/run-worker.sh" "$instance" --stop || true
+      fi
     done
     if [[ "$found" -eq 0 ]]; then
       echo "No worker env files found in config/workers/*.env" >&2
       echo "Copy *.env.example files first." >&2
       exit 1
     fi
+    echo "Waiting 10s before starting workers..."
+    sleep 10
+    for instance in $(list_instances); do
+      "${ROOT}/scripts/run-worker.sh" "$instance"
+    done
     ;;
   status)
     for instance in $(list_instances); do

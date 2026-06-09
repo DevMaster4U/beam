@@ -9,6 +9,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RESTART_DELAY=10
 INSTANCE="${1:-}"
 
 usage() {
@@ -110,7 +111,8 @@ fi
 
 if [[ "$RESTART" -eq 1 ]]; then
   stop_service 1
-  sleep 1
+  echo "Waiting ${RESTART_DELAY}s before starting worker ${INSTANCE}..."
+  sleep "$RESTART_DELAY"
 fi
 
 if [[ ! -f "$ENV_FILE" ]]; then

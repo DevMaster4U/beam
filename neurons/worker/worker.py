@@ -1245,11 +1245,14 @@ async def ws_send_stats_snapshot(websocket, state: WorkerState) -> bool:
     """Send a worker telemetry snapshot over WebSocket."""
     try:
         bytes_delta = max(0, state.bytes_relayed - state.reported_bytes_relayed)
+        hotkey = getattr(getattr(state.wallet, "hotkey", None), "ss58_address", None)
         msg = {
             "type": "stats_snapshot",
             "bandwidth_mbps": state.last_measured_bandwidth_mbps,
             "tasks_active": state.active_tasks,
         }
+        if hotkey:
+            msg["hotkey"] = hotkey
         if bytes_delta > 0:
             msg["bytes_relayed_delta"] = bytes_delta
         await ws_send_json(websocket, state, msg)

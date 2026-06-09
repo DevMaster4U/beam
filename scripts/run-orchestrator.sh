@@ -14,12 +14,13 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RESTART_DELAY=10
 DEFAULT_ENV_FILE="${ROOT}/.env"
 FALLBACK_ENV_FILE="${ROOT}/neurons/orchestrator/.env"
 ENV_FILE="${DEFAULT_ENV_FILE}"
 LOG_DIR="${ROOT}/logs"
 PID_DIR="${ROOT}/run"
-LOG_FILE="${LOG_DIR}/orchestrator.log"
+LOG_FILE="${LOG_DIR}/miner.log"
 PID_FILE="${PID_DIR}/orchestrator.pid"
 
 usage() {
@@ -132,7 +133,8 @@ fi
 
 if [[ "$RESTART" -eq 1 ]]; then
   stop_service 1
-  sleep 1
+  echo "Waiting ${RESTART_DELAY}s before starting orchestrator..."
+  sleep "$RESTART_DELAY"
 fi
 
 if [[ "$STATUS" -eq 1 ]]; then
