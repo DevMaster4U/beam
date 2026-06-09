@@ -39,6 +39,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import signal
 import sys
@@ -120,6 +121,74 @@ def _resolve_env_path(path: Path) -> Path:
 LOADED_ENV_FILES: list[Path] = []
 
 
+def _worker_instance_name() -> Optional[str]:
+    worker_env = _resolve_worker_env_file()
+    if worker_env is None:
+        return None
+    return _resolve_env_path(worker_env).stem
+
+
+class _StreamToLogger:
+    """Capture print() output into the worker log file."""
+
+    def __init__(self, log_fn, mirror):
+        self._log_fn = log_fn
+        self._mirror = mirror
+
+    def write(self, buf: str) -> None:
+        if not buf:
+            return
+        for line in buf.rstrip().splitlines():
+            if line:
+                self._log_fn(line)
+        if self._mirror is not None:
+            self._mirror.write(buf)
+            self._mirror.flush()
+
+    def flush(self) -> None:
+        if self._mirror is not None:
+            self._mirror.flush()
+
+    def isatty(self) -> bool:
+        return bool(self._mirror and self._mirror.isatty())
+
+
+def configure_worker_logging() -> None:
+    """Write worker output to logs/workers/<instance>.log (console when interactive)."""
+    instance = _worker_instance_name()
+    if not instance:
+        return
+
+    log_root = Path(os.environ.get("LOG_DIR", _workspace_root() / "logs"))
+    log_dir = log_root / "workers"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    log_format = "%(asctime)s | %(levelname)s | %(message)s"
+    log_datefmt = "%Y-%m-%d %H:%M:%S"
+    formatter = logging.Formatter(log_format, datefmt=log_datefmt)
+
+    file_handler = logging.FileHandler(log_dir / f"{instance}.log")
+    file_handler.setFormatter(formatter)
+
+    handlers: list[logging.Handler] = [file_handler]
+    if sys.stderr.isatty():
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        handlers.append(stream_handler)
+
+    worker_logger = logging.getLogger("worker")
+    worker_logger.handlers.clear()
+    worker_logger.propagate = False
+    worker_logger.setLevel(logging.INFO)
+    for handler in handlers:
+        worker_logger.addHandler(handler)
+
+    mirror_out = sys.stdout if sys.stdout.isatty() else None
+    mirror_err = sys.stderr if sys.stderr.isatty() else None
+    sys.stdout = _StreamToLogger(worker_logger.info, mirror_out)
+    sys.stderr = _StreamToLogger(worker_logger.warning, mirror_err)
+
+
 def _load_workspace_env() -> None:
     """Load shared .env, then optional per-worker env (override)."""
     try:
@@ -147,6 +216,7 @@ def _load_workspace_env() -> None:
 
 
 _load_workspace_env()
+configure_worker_logging()
 
 # =============================================================================
 # Configuration

@@ -201,7 +201,7 @@ Use `--foreground` on any run script to bypass systemd for debugging.
 | ------- | -------- |
 | Orchestrator | `logs/miner.log` (application FileHandler) |
 | Worker gateway | `logs/gateway.log` (systemd append) |
-| Worker `@instance` | `logs/workers/<instance>.log` (systemd append) |
+| Worker `@instance` | `logs/workers/<instance>.log` (application FileHandler) |
 
 Startup errors for the orchestrator also appear in the journal:
 
