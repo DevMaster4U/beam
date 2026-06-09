@@ -39,13 +39,17 @@ class SlackNotifier:
         if not self.enabled or self._client is None:
             return
 
-        lines = [f"*{title}*"]
+        body_lines: list[str] = []
         for key, value in fields.items():
             if value is None or value == "":
                 continue
-            lines.append(f"• {key}: `{value}`")
+            body_lines.append(f"{key}: {value}")
 
-        payload = {"text": "\n".join(lines)}
+        if not body_lines:
+            body_lines.append("(no details)")
+
+        text = f"*{title}*\n```\n" + "\n".join(body_lines) + "\n```"
+        payload = {"text": text}
         try:
             response = await self._client.post(self._webhook_url, json=payload)
             response.raise_for_status()
