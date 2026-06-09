@@ -502,7 +502,6 @@ async def submit_worker_payment_evidence(
     end_time_us: int,
     chunk_hash: str = "",
 ) -> bool:
-    return True
     """Submit durable worker-signed payment evidence directly to BeamCore HTTP."""
     if not state.worker_id or not state.api_key:
         print("[Worker] Payment evidence skipped: missing worker_id or api_key")
