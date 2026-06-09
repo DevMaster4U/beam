@@ -42,10 +42,12 @@ export GATEWAY_WORKER_SECRET=your-long-random-worker-secret
 python main.py
 ```
 
-Or from the repo root:
+Or from the repo root (systemd):
 
 ```bash
+./scripts/install-systemd.sh --enable
 ./scripts/run-worker-gateway.sh
+./scripts/run-worker-gateway.sh --status
 ```
 
 ### 2. Orchestrator

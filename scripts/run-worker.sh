@@ -1,30 +1,40 @@
 #!/usr/bin/env bash
-# Start one worker instance with its own env file, log, and pid file.
+# Manage one worker instance via systemd (beam-worker@<instance>.service).
+#
+# First-time setup:
+#   ./scripts/install-systemd.sh --enable-workers
 #
 # Usage:
-#   ./scripts/run-worker.sh worker1              # background
-#   ./scripts/run-worker.sh worker1 --foreground # foreground
-#   ./scripts/run-worker.sh worker1 --stop       # stop background worker
-#   ./scripts/run-worker.sh worker1 --restart    # stop then start
+#   ./scripts/run-worker.sh worker1
+#   ./scripts/run-worker.sh worker1 --foreground
+#   ./scripts/run-worker.sh worker1 --stop
+#   ./scripts/run-worker.sh worker1 --restart
+#   ./scripts/run-worker.sh worker1 --status
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RESTART_DELAY=10
+BEAM_ROOT="$ROOT"
+# shellcheck disable=SC1091
+source "${ROOT}/scripts/lib/systemd.sh"
+
 INSTANCE="${1:-}"
 
 usage() {
   cat <<EOF
-Usage: $0 <instance> [--foreground|-f | --stop | --restart] [worker.py args...]
+Usage: $0 <instance> [--foreground|-f | --stop | --restart | --status] [worker.py args...]
 
   <instance>     Name matching config/workers/<instance>.env
-  --foreground   Run in the foreground (logs to stdout)
-  --stop         Stop a background worker for <instance>
-  --restart      Stop if running, then start in the background
+  --foreground   Run in the foreground (debug; bypasses systemd)
+  --stop         Stop the worker via systemd
+  --restart      Restart the worker via systemd
+  --status       Show systemd status and log path
+
+Install units once with:
+  ./scripts/install-systemd.sh --enable
+  ./scripts/install-systemd.sh --enable-workers
 
 Setup:
   cp config/workers/worker1.env.example config/workers/worker1.env
-  cp config/workers/worker2.env.example config/workers/worker2.env
-  # Edit each .env with a unique WORKER_WALLET_HOTKEY
 EOF
 }
 
@@ -38,6 +48,7 @@ shift
 FOREGROUND=0
 STOP=0
 RESTART=0
+STATUS=0
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -54,6 +65,10 @@ while [[ $# -gt 0 ]]; do
       RESTART=1
       shift
       ;;
+    --status)
+      STATUS=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -66,53 +81,27 @@ while [[ $# -gt 0 ]]; do
 done
 
 ENV_FILE="${ROOT}/config/workers/${INSTANCE}.env"
-LOG_DIR="${ROOT}/logs/workers"
-PID_DIR="${ROOT}/run/workers"
-LOG_FILE="${LOG_DIR}/${INSTANCE}.log"
-PID_FILE="${PID_DIR}/${INSTANCE}.pid"
+LOG_FILE="${ROOT}/logs/workers/${INSTANCE}.log"
+SERVICE="beam-worker@${INSTANCE}.service"
 
-mkdir -p "$LOG_DIR" "$PID_DIR"
-
-stop_service() {
-  local tolerant="${1:-0}"
-  if [[ ! -f "$PID_FILE" ]]; then
-    if [[ "$tolerant" -eq 1 ]]; then
-      return 0
-    fi
-    echo "No pid file for worker ${INSTANCE} (${PID_FILE})" >&2
-    return 1
-  fi
-
-  local pid
-  pid="$(cat "$PID_FILE")"
-  if kill -0 "$pid" 2>/dev/null; then
-    kill "$pid"
-    echo "Stopped worker ${INSTANCE} (pid ${pid})"
-    for _ in $(seq 1 20); do
-      kill -0 "$pid" 2>/dev/null || break
-      sleep 0.25
-    done
-  elif [[ "$tolerant" -eq 0 ]]; then
-    echo "Worker ${INSTANCE} not running (stale pid ${pid})" >&2
-  fi
-  rm -f "$PID_FILE"
-  return 0
-}
+mkdir -p "${ROOT}/logs/workers"
 
 if [[ "$STOP" -eq 1 ]]; then
-  stop_service 0
-  exit $?
+  beam_require_unit "$SERVICE"
+  beam_systemctl stop "$SERVICE"
+  exit 0
 fi
 
-if [[ "$RESTART" -eq 1 && "$FOREGROUND" -eq 1 ]]; then
-  echo "Use --restart or --foreground, not both" >&2
-  exit 1
-fi
-
-if [[ "$RESTART" -eq 1 ]]; then
-  stop_service 1
-  echo "Waiting ${RESTART_DELAY}s before starting worker ${INSTANCE}..."
-  sleep "$RESTART_DELAY"
+if [[ "$STATUS" -eq 1 ]]; then
+  if beam_unit_installed "$SERVICE"; then
+    beam_systemctl status "$SERVICE" --no-pager || true
+  else
+    echo "${INSTANCE}: unit not installed"
+    echo "  install: ${ROOT}/scripts/install-systemd.sh --enable-workers"
+  fi
+  echo "  env: ${ENV_FILE}"
+  echo "  log: ${LOG_FILE}"
+  exit 0
 fi
 
 if [[ ! -f "$ENV_FILE" ]]; then
@@ -121,11 +110,7 @@ if [[ ! -f "$ENV_FILE" ]]; then
   exit 1
 fi
 
-PY="${ROOT}/venv/bin/python"
-if [[ ! -x "$PY" ]]; then
-  PY="python3"
-fi
-
+PY="$(beam_python)"
 CMD=(
   "$PY" "${ROOT}/neurons/worker/worker.py"
   --env-file "$ENV_FILE"
@@ -137,22 +122,16 @@ if [[ "$FOREGROUND" -eq 1 ]]; then
   exec "${CMD[@]}"
 fi
 
-if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-  echo "Worker ${INSTANCE} already running (pid $(cat "$PID_FILE"))" >&2
-  exit 1
-fi
+beam_ensure_worker_instance "$INSTANCE"
 
 if [[ "$RESTART" -eq 1 ]]; then
-  echo "Restarting worker ${INSTANCE}..."
-fi
-
-cd "${ROOT}/neurons/worker"
-PYTHONUNBUFFERED=1 nohup "${CMD[@]}" >> "$LOG_FILE" 2>&1 &
-echo $! > "$PID_FILE"
-if [[ "$RESTART" -eq 1 ]]; then
-  echo "Restarted worker ${INSTANCE} (pid $(cat "$PID_FILE"))"
+  beam_systemctl restart "$SERVICE"
+  echo "Restarted worker ${INSTANCE}"
 else
-  echo "Started worker ${INSTANCE} (pid $(cat "$PID_FILE"))"
+  beam_systemctl start "$SERVICE"
+  echo "Started worker ${INSTANCE}"
 fi
+
+echo "  service: ${SERVICE}"
 echo "  env: ${ENV_FILE}"
 echo "  log: ${LOG_FILE}"

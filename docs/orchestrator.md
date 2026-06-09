@@ -59,9 +59,27 @@ Set `READY=true` only when the orchestrator is ready to accept transfer work.
 
 ## Run
 
+Install orchestrator + gateway systemd units:
+
 ```bash
-cd neurons/orchestrator
-python main.py
+./scripts/install-systemd.sh --enable
+```
+
+Workers are installed separately — see [Worker Guide](worker.md).
+
+Start and manage:
+
+```bash
+./scripts/run-orchestrator.sh
+./scripts/run-orchestrator.sh --status
+./scripts/run-orchestrator.sh --restart
+./scripts/run-orchestrator.sh --stop
+```
+
+Debug in the foreground (bypasses systemd):
+
+```bash
+./scripts/run-orchestrator.sh --foreground
 ```
 
 Useful health checks:
@@ -72,28 +90,13 @@ curl http://localhost:8000/state | jq
 curl "$CORE_SERVER_URL/health"
 ```
 
-## systemd
+Application logs are written to `logs/miner.log`. Startup errors also appear in the journal:
 
-Use `/srv/beam/beam` as the example checkout path below. Adjust paths if you deploy elsewhere.
-
-```ini
-[Unit]
-Description=BEAM Orchestrator
-After=network.target
-
-[Service]
-Type=simple
-User=beam
-WorkingDirectory=/srv/beam/beam/neurons/orchestrator
-Environment="PATH=/srv/beam/beam/.venv/bin:/usr/local/bin:/usr/bin:/bin"
-EnvironmentFile=/srv/beam/beam/neurons/orchestrator/.env
-ExecStart=/srv/beam/beam/.venv/bin/python main.py
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
+```bash
+journalctl -u beam-orchestrator -f
 ```
+
+See `deploy/systemd/README.md` for all three services.
 
 ## Troubleshooting
 

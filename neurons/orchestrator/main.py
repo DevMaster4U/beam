@@ -27,6 +27,7 @@ Orchestrators still coordinate exclusively through BeamCore APIs rather than tal
 import logging
 import os
 import socket
+import sys
 import time
 from contextlib import asynccontextmanager
 
@@ -44,23 +45,28 @@ from routes import health, orchestrators
 # SubnetCoreClient. main.py only wires lifespan + FastAPI routes.
 
 
-# Configure logging - both console and file
+# Configure logging: always write to file; mirror to console only in a terminal.
 LOG_DIR = os.environ.get("LOG_DIR", "/tmp/beam_logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
 log_format = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 log_datefmt = "%Y-%m-%d %H:%M:%S"
+formatter = logging.Formatter(log_format, datefmt=log_datefmt)
+
+file_handler = logging.FileHandler(f"{LOG_DIR}/miner.log")
+file_handler.setFormatter(formatter)
+
+handlers: list[logging.Handler] = [file_handler]
+if sys.stderr.isatty():
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    handlers.append(stream_handler)
 
 logging.basicConfig(
     level=logging.INFO,
-    format=log_format,
-    datefmt=log_datefmt,
+    handlers=handlers,
+    force=True,
 )
-
-# Add file handler for log viewer
-file_handler = logging.FileHandler(f"{LOG_DIR}/miner.log")
-file_handler.setFormatter(logging.Formatter(log_format, datefmt=log_datefmt))
-logging.getLogger().addHandler(file_handler)
 
 logger = logging.getLogger(__name__)
 

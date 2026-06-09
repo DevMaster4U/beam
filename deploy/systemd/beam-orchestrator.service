@@ -1,0 +1,25 @@
+[Unit]
+Description=BEAM Orchestrator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@BEAM_USER@
+Group=@BEAM_GROUP@
+WorkingDirectory=@BEAM_ROOT@/neurons/orchestrator
+Environment="PATH=@BEAM_VENV@/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="LOG_DIR=@BEAM_ROOT@/logs"
+EnvironmentFile=-@BEAM_ROOT@/.env
+EnvironmentFile=-@BEAM_ROOT@/neurons/orchestrator/.env
+ExecStart=@BEAM_VENV@/bin/python main.py
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+
+# Application logs go to ${LOG_DIR}/miner.log.
+StandardOutput=null
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

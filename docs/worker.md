@@ -65,14 +65,26 @@ Each worker needs a **unique registered hotkey** and its own resource limits. Sh
 cp config/workers/worker1.env.example config/workers/worker1.env
 cp config/workers/worker2.env.example config/workers/worker2.env
 
-# 2. Start workers (separate logs and pid files)
+# 2. Enable workers (after orchestrator/gateway: ./scripts/install-systemd.sh --enable)
+./scripts/install-systemd.sh --enable-workers
+./scripts/run-workers.sh start
+
+# Or start one instance
 ./scripts/run-worker.sh worker1
 ./scripts/run-worker.sh worker2
 
-# Or start/stop all configured workers
-./scripts/run-workers.sh start
 ./scripts/run-workers.sh status
 ./scripts/run-workers.sh stop
+```
+
+Add another worker on the same machine:
+
+```bash
+cp config/workers/worker1.env.example config/workers/worker3.env
+# edit worker3.env (unique WORKER_WALLET_HOTKEY)
+
+./scripts/install-systemd.sh --enable-workers
+./scripts/run-worker.sh worker3
 ```
 
 Layout:
@@ -81,8 +93,9 @@ Layout:
 | ---- | ------- |
 | `.env` | Shared: `CORE_SERVER_URL`, `WORKER_GATEWAY_URL`, `SUBTENSOR_NETWORK` |
 | `config/workers/worker1.env` | Instance 1: wallet hotkey, concurrency limits |
-| `logs/workers/worker1.log` | Instance 1 log |
-| `run/workers/worker1.pid` | Instance 1 pid (background mode) |
+| `config/workers/worker2.env` | Instance 2: unique hotkey and limits |
+| `logs/workers/worker1.log` | Instance 1 log (`beam-worker@worker1.service`) |
+| `beam-workers.target` | Starts all `config/workers/*.env` instances |
 
 Manual foreground run with a specific env file:
 
