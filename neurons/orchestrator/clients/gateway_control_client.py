@@ -278,9 +278,15 @@ class GatewayControlClient:
     async def _dispatch_event(self, data: dict[str, Any]) -> None:
         if not self._event_handler:
             return
-        try:
-            result = self._event_handler(data)
-            if asyncio.iscoroutine(result):
-                await result
-        except Exception as exc:
-            logger.error("Gateway control event handler error: %s", exc)
+
+        handler = self._event_handler
+
+        async def _run() -> None:
+            try:
+                result = handler(data)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as exc:
+                logger.error("Gateway control event handler error: %s", exc)
+
+        asyncio.create_task(_run())

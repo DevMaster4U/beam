@@ -45,8 +45,9 @@ import signal
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 import httpx
@@ -265,6 +266,11 @@ def _env_bool(name: str, default: bool) -> bool:
     return str(raw).strip().lower() in ("1", "true", "yes")
 
 
+PREWARM_ENABLED = _env_bool("WORKER_PREWARM_ENABLED", True)
+PREWARM_TIMEOUT = float(os.environ.get("WORKER_PREWARM_TIMEOUT", "5.0"))
+MAX_PREWARM_ORIGINS = max(4, int(os.environ.get("WORKER_PREWARM_MAX_ORIGINS", "32")))
+
+
 # Participant workers default to recording a payment obligation unless opted out.
 WORKER_REQUIRED_PAYMENT = False #_env_bool("WORKER_REQUIRED_PAYMENT", True)
 
@@ -299,6 +305,8 @@ class WorkerState:
     reserved_ws_slots: int = 0
     reserved_bytes: int = 0
     ws_send_lock: Optional[asyncio.Lock] = None
+    prewarm_origins: list[str] = field(default_factory=list)
+    prewarm_lock: Optional[asyncio.Lock] = None
 
 
 @dataclass
@@ -737,6 +745,188 @@ def _build_fetch_headers(
     return headers
 
 
+def _prewarm_cache_path() -> Optional[Path]:
+    """Per-worker JSON cache of learned HTTP origins (next to worker env file)."""
+    instance = _worker_instance_name()
+    if not instance:
+        return None
+    cache_dir = _workspace_root() / "config" / "workers"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / f"{instance}.prewarm-hosts.json"
+
+
+def _http_origin_from_url(url: str) -> Optional[str]:
+    """Return scheme://host[:port] for HTTP(S) transfer URLs."""
+    if not url or is_canary_destination(url):
+        return None
+    parsed = urlsplit(url.strip())
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return None
+    host = parsed.hostname.lower()
+    if parsed.port and parsed.port not in (80, 443):
+        return f"{parsed.scheme}://{host}:{parsed.port}"
+    return f"{parsed.scheme}://{host}"
+
+
+def _origin_label(origin: str) -> str:
+    return urlsplit(origin).hostname or origin
+
+
+def _seed_prewarm_origins() -> list[str]:
+    """Optional static origins from WORKER_PREWARM_ORIGINS (comma-separated URLs or hosts)."""
+    raw = os.environ.get("WORKER_PREWARM_ORIGINS", "").strip()
+    if not raw:
+        return []
+    origins: list[str] = []
+    for item in raw.split(","):
+        token = item.strip()
+        if not token:
+            continue
+        if "://" not in token:
+            token = f"https://{token}"
+        origin = _http_origin_from_url(token)
+        if origin and origin not in origins:
+            origins.append(origin)
+    return origins
+
+
+def _merge_prewarm_origins(existing: Iterable[str], discovered: Iterable[str]) -> list[str]:
+    """Newest-first deduped origin list capped at MAX_PREWARM_ORIGINS."""
+    merged: list[str] = []
+    seen: set[str] = set()
+    for origin in list(discovered) + list(existing):
+        if not origin or origin in seen:
+            continue
+        seen.add(origin)
+        merged.append(origin)
+        if len(merged) >= MAX_PREWARM_ORIGINS:
+            break
+    return merged
+
+
+def _load_prewarm_cache(path: Path) -> list[str]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return _seed_prewarm_origins()
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"[Worker] Prewarm cache load failed ({path.name}): {exc}")
+        return _seed_prewarm_origins()
+
+    origins = data.get("origins") if isinstance(data, dict) else None
+    if not isinstance(origins, list):
+        return _seed_prewarm_origins()
+
+    cleaned: list[str] = []
+    for item in origins:
+        if not isinstance(item, str):
+            continue
+        origin = _http_origin_from_url(item) or item.strip()
+        if origin and origin not in cleaned:
+            cleaned.append(origin)
+    return _merge_prewarm_origins(_seed_prewarm_origins(), cleaned)
+
+
+def _save_prewarm_cache(path: Path, origins: list[str]) -> None:
+    payload = {
+        "origins": origins,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        print(f"[Worker] Prewarm cache save failed ({path.name}): {exc}")
+
+
+def _collect_transfer_origins(execution_context: dict) -> set[str]:
+    origins: set[str] = set()
+    for key in ("gateway_url", "destination_url"):
+        origin = _http_origin_from_url(str(execution_context.get(key) or ""))
+        if origin:
+            origins.add(origin)
+
+    for mapping_key in ("source_urls", "dest_urls"):
+        mapping = execution_context.get(mapping_key)
+        if not isinstance(mapping, dict):
+            continue
+        for url in mapping.values():
+            origin = _http_origin_from_url(str(url or ""))
+            if origin:
+                origins.add(origin)
+    return origins
+
+
+async def _prewarm_single_origin(
+    client: httpx.AsyncClient, origin: str
+) -> tuple[str, float, Optional[str]]:
+    started = time.perf_counter()
+    try:
+        await client.head(f"{origin}/", timeout=PREWARM_TIMEOUT)
+        return origin, (time.perf_counter() - started) * 1000, None
+    except Exception as exc:
+        return origin, (time.perf_counter() - started) * 1000, str(exc)
+
+
+async def _prewarm_origins(
+    client: httpx.AsyncClient,
+    origins: Iterable[str],
+    *,
+    reason: str,
+) -> None:
+    unique = sorted({origin for origin in origins if origin})
+    if not unique:
+        return
+
+    started = time.perf_counter()
+    results = await asyncio.gather(*(_prewarm_single_origin(client, origin) for origin in unique))
+    total_ms = (time.perf_counter() - started) * 1000
+    warmed = sum(1 for _, _, err in results if err is None)
+    labels = ", ".join(_origin_label(origin) for origin in unique)
+    print(
+        f"[Worker] Prewarm {reason}: {warmed}/{len(unique)} origin(s) "
+        f"in {total_ms:.1f}ms — {labels}"
+    )
+    for origin, ms, err in results:
+        if err:
+            print(
+                f"[Worker] Prewarm {reason} note: {_origin_label(origin)} "
+                f"({ms:.1f}ms, non-fatal): {err}"
+            )
+
+
+async def prewarm_for_transfer(state: WorkerState, execution_context: dict, *, reason: str) -> None:
+    """Warm DNS/TLS/HTTP pool for transfer hosts; persist newly learned origins."""
+    if not PREWARM_ENABLED or not state.http_client:
+        return
+
+    task_origins = _collect_transfer_origins(execution_context)
+    if not task_origins and not state.prewarm_origins:
+        return
+
+    if state.prewarm_lock is None:
+        state.prewarm_lock = asyncio.Lock()
+
+    warm_origins = task_origins or set(state.prewarm_origins)
+    async with state.prewarm_lock:
+        previous = list(state.prewarm_origins)
+        merged = _merge_prewarm_origins(previous, task_origins)
+        added = [origin for origin in merged if origin not in previous]
+        if merged != previous:
+            state.prewarm_origins = merged
+            cache_path = _prewarm_cache_path()
+            if cache_path:
+                _save_prewarm_cache(cache_path, merged)
+                if added:
+                    added_labels = ", ".join(_origin_label(origin) for origin in added)
+                    cache_name = cache_path.name
+                    print(
+                        f"[Worker] Prewarm cache updated ({cache_name}): "
+                        f"+{len(added)} origin(s) — {added_labels}"
+                    )
+
+    await _prewarm_origins(state.http_client, warm_origins, reason=reason)
+
+
 async def fetch_and_send_chunk(
     client: httpx.AsyncClient,
     source_url: str,
@@ -1098,6 +1288,8 @@ async def execute_transfer(
     last_etag: Optional[str] = None
     offer_id = task_message.get("offer_id") or task_id
     hotkey = getattr(getattr(state.wallet, "hotkey", None), "ss58_address", "unknown")
+
+    await prewarm_for_transfer(state, execution_context, reason="task")
 
     print(
         f"[Worker] Transferring {len(chunk_indices)} chunk(s) "
@@ -1788,6 +1980,15 @@ async def run_worker(state: WorkerState):
     hotkey = wallet.hotkey.ss58_address
     if state.ws_send_lock is None:
         state.ws_send_lock = asyncio.Lock()
+    state.prewarm_lock = asyncio.Lock()
+    cache_path = _prewarm_cache_path()
+    if cache_path:
+        state.prewarm_origins = _load_prewarm_cache(cache_path)
+        if state.prewarm_origins:
+            print(
+                f"[Worker] Prewarm cache loaded ({cache_path.name}): "
+                f"{len(state.prewarm_origins)} origin(s)"
+            )
 
     # Create HTTP client
     state.http_client = httpx.AsyncClient(
@@ -1797,6 +1998,9 @@ async def run_worker(state: WorkerState):
             max_keepalive_connections=max(4, MAX_CONCURRENT_TASKS * 2),
         ),
     )
+
+    if PREWARM_ENABLED and state.prewarm_origins:
+        await _prewarm_origins(state.http_client, state.prewarm_origins, reason="startup")
 
     try:
         async with httpx.AsyncClient() as client:
@@ -1933,7 +2137,8 @@ async def main():
     print(
         f"Worker limits: concurrency={MAX_CONCURRENT_TASKS}, "
         f"ws_queue={MAX_QUEUED_WS_TASKS}, "
-        f"in_flight={MAX_IN_FLIGHT_BYTES // (1024 * 1024)} MiB"
+        f"in_flight={MAX_IN_FLIGHT_BYTES // (1024 * 1024)} MiB, "
+        f"prewarm={'on' if PREWARM_ENABLED else 'off'}"
     )
     print()
 

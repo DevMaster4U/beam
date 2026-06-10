@@ -901,6 +901,7 @@ class SubnetCoreClient:
 
         task_id = offer.get("task_id") or data.get("task_id")
         assignment_id = offer.get("assignment_id") or data.get("assignment_id")
+        meta: dict[str, Any] = {}
         if task_id and assignment_id:
             workers_by_id = _workers_by_id(self._gateway_control_client.get_local_workers())
             meta = workers_by_id.get(worker_id, {})
@@ -912,20 +913,27 @@ class SubnetCoreClient:
                 str(meta.get("client_ip") or "unknown"),
                 str(meta.get("hotkey") or "unknown"),
             )
-            if self._slack_notifier and self._slack_notifier.enabled:
-                await self._slack_notifier.notify_task_offer(
-                    task_id=task_id,
-                    assignment_id=assignment_id,
-                    worker_id=worker_id,
-                    client_ip=str(meta.get("client_ip") or "unknown"),
-                    hotkey=str(meta.get("hotkey") or "unknown"),
-                )
 
         delivered = await self._gateway_control_client.send_task_offer(worker_id, offer)
         if not delivered:
             logger.error(
                 "Failed to relay worker_task_offer to gateway for worker %s",
                 worker_id,
+            )
+        elif (
+            task_id
+            and assignment_id
+            and self._slack_notifier
+            and self._slack_notifier.enabled
+        ):
+            asyncio.create_task(
+                self._slack_notifier.notify_task_offer(
+                    task_id=task_id,
+                    assignment_id=assignment_id,
+                    worker_id=worker_id,
+                    client_ip=str(meta.get("client_ip") or "unknown"),
+                    hotkey=str(meta.get("hotkey") or "unknown"),
+                )
             )
 
     async def relay_worker_response(self, message: dict[str, Any]) -> dict[str, Any]:

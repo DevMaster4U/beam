@@ -105,6 +105,93 @@ python neurons/worker/worker.py --env-file config/workers/worker1.env
 
 Split `WORKER_MAX_CONCURRENT_TASKS` across instances so total concurrency fits your uplink/CPU (e.g. two workers × 2 tasks = 4 total).
 
+## Host tuning (BBR + concurrency)
+
+Transfers are limited by **per-connection TCP throughput** (BBR helps) and **how many chunks run in parallel** (concurrency helps). Both matter; neither replaces the other.
+
+### BBR (once per worker host)
+
+BBR is a Linux TCP congestion-control setting. It can improve throughput on each GET/PUT leg, especially on cross-region paths to S3/R2. It does not replace raising concurrency when the link is underutilized.
+
+```bash
+# Check current setting
+sysctl net.ipv4.tcp_congestion_control
+
+# Install (Ubuntu 22.04+; requires sudo)
+./scripts/tune-worker-host.sh --install-bbr
+
+# Or manually:
+sudo cp deploy/sysctl/99-beam-worker-tcp.conf /etc/sysctl.d/
+sudo sysctl --system
+```
+
+Expected after install: `net.ipv4.tcp_congestion_control = bbr`.
+
+### Pick `WORKER_MAX_CONCURRENT_TASKS`
+
+Each active task uses about **two HTTP connections** (source GET + destination PUT). Default chunks are **4 MiB**. Uplink is usually the bottleneck.
+
+Interactive helper:
+
+```bash
+./scripts/tune-worker-host.sh --link-mbps 500 --workers 2
+```
+
+Rule of thumb (symmetric link, 4 MiB chunks):
+
+| Link (Mbps) | Total concurrent tasks (host) | Per worker instance (1 instance) |
+| ----------- | ----------------------------- | -------------------------------- |
+| 100         | 4                             | 4                                |
+| 250         | 10                            | 10                               |
+| 500         | 20 → cap ~16                  | 16                               |
+| 1000        | 40 → cap ~16                  | 16                               |
+
+Formula: `total_tasks ≈ link_mbps / 25`, split across local worker instances, cap at **16 per instance** unless you have measured headroom.
+
+Also set:
+
+```bash
+WORKER_MAX_QUEUED_WS_TASKS=${WORKER_MAX_CONCURRENT_TASKS}
+WORKER_MAX_IN_FLIGHT_BYTES=$(( WORKER_MAX_CONCURRENT_TASKS * 8 * 1024 * 1024 ))  # ~2× 4 MiB chunks
+```
+
+Example for one 500 Mbps host, two worker processes:
+
+```bash
+# worker1.env / worker2.env
+WORKER_MAX_CONCURRENT_TASKS=8
+WORKER_MAX_QUEUED_WS_TASKS=8
+WORKER_MAX_IN_FLIGHT_BYTES=67108864   # 64 MiB
+```
+
+Raise concurrency gradually and watch `fetch_ms` / `send_ms` in `logs/workers/*.log`. Back off if you see timeouts or CPU pegged.
+
+### HTTP prewarm (cold connections after idle)
+
+Workers learn HTTP origins from task `source_urls` / `dest_urls` and persist them to:
+
+`config/workers/<instance>.prewarm-hosts.json`
+
+On **startup** and **before each transfer**, the worker issues lightweight `HEAD` requests through the same `httpx` client to warm DNS, TLS, and the connection pool. This helps when tasks arrive infrequently (e.g. every 30 minutes) and the first chunk would otherwise pay full connect cost.
+
+Log examples:
+
+```text
+[Worker] Prewarm cache loaded (worker1.prewarm-hosts.json): 1 origin(s)
+[Worker] Prewarm startup: 1/1 origin(s) in 42.3ms — ef88....r2.cloudflarestorage.com
+[Worker] Prewarm task: 1/1 origin(s) in 38.1ms — ef88....r2.cloudflarestorage.com
+```
+
+Optional env (in `config/workers/<instance>.env`):
+
+```bash
+WORKER_PREWARM_ENABLED=true
+WORKER_PREWARM_TIMEOUT=5
+WORKER_PREWARM_MAX_ORIGINS=32
+# Optional seed before first task:
+# WORKER_PREWARM_ORIGINS=https://account.r2.cloudflarestorage.com
+```
+
 ## Troubleshooting
 
 - Verify the hotkey is registered on subnet 105.

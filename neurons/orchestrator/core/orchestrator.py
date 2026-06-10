@@ -1461,6 +1461,7 @@ class Orchestrator:
         if msg_type == "worker_disconnected":
             worker_id = message.get("worker_id", "")
             self._cancel_worker_connect_slack(worker_id)
+            await self._worker_mgr.handle_worker_update(worker_id, "disconnected")
             if worker_id and self._slack_notifier.enabled:
                 client_ip = str(message.get("client_ip") or self._worker_slack_meta(worker_id)[0])
                 hotkey = str(message.get("hotkey") or self._worker_slack_meta(worker_id)[1])
@@ -1470,12 +1471,13 @@ class Orchestrator:
                     client_ip,
                     hotkey,
                 )
-                await self._slack_notifier.notify_worker_disconnected(
-                    worker_id=worker_id,
-                    client_ip=client_ip,
-                    hotkey=hotkey,
+                asyncio.create_task(
+                    self._slack_notifier.notify_worker_disconnected(
+                        worker_id=worker_id,
+                        client_ip=client_ip,
+                        hotkey=hotkey,
+                    )
                 )
-            await self._worker_mgr.handle_worker_update(worker_id, "disconnected")
             return
 
         if msg_type == "worker_capacity_update":
@@ -1493,6 +1495,7 @@ class Orchestrator:
             task_id = message.get("task_id", "")
             offer_id = message.get("offer_id") or task_id
             decision = str(message.get("decision") or "")
+            slack_notify: Optional[tuple[dict[str, Any], bool]] = None
             if self._slack_notifier.enabled and task_id and worker_id:
                 accepted = decision in ("task_accept", "accept")
                 rejected = decision in ("task_reject", "reject")
@@ -1508,13 +1511,15 @@ class Orchestrator:
                         hotkey,
                         message.get("reason") or "",
                     )
-                    await self._slack_notifier.notify_task_response(
-                        task_id=task_id,
-                        worker_id=worker_id,
-                        accepted=accepted,
-                        client_ip=client_ip,
-                        hotkey=hotkey,
-                        reason=message.get("reason"),
+                    slack_notify = (
+                        {
+                            "task_id": task_id,
+                            "worker_id": worker_id,
+                            "client_ip": client_ip,
+                            "hotkey": hotkey,
+                            "reason": message.get("reason"),
+                        },
+                        accepted,
                     )
             try:
                 ack = await self.subnet_core_client.relay_worker_response(message)
@@ -1537,6 +1542,14 @@ class Orchestrator:
                         accepted=False,
                         reason=str(exc),
                     )
+            if slack_notify:
+                fields, notify_accepted = slack_notify
+                asyncio.create_task(
+                    self._slack_notifier.notify_task_response(
+                        accepted=notify_accepted,
+                        **fields,
+                    )
+                )
             return
 
         if msg_type == "task_result_summary":
@@ -1556,7 +1569,7 @@ class Orchestrator:
                         reason=reason,
                     )
                 if received:
-                    await self._handle_task_completion_notification(message)
+                    asyncio.create_task(self._handle_task_completion_notification(message))
             except Exception as exc:
                 logger.error("Failed to relay task_result_summary: %s", exc)
                 if self.gateway_control_client:
@@ -1693,10 +1706,12 @@ class Orchestrator:
             self._cancel_worker_connect_slack(worker_id)
             client_ip, hotkey = self._worker_slack_meta(worker_id)
             await self._worker_mgr.handle_worker_update(worker_id, event)
-            await self._slack_notifier.notify_worker_disconnected(
-                worker_id=worker_id,
-                client_ip=client_ip,
-                hotkey=hotkey,
+            asyncio.create_task(
+                self._slack_notifier.notify_worker_disconnected(
+                    worker_id=worker_id,
+                    client_ip=client_ip,
+                    hotkey=hotkey,
+                )
             )
             return
 
@@ -1792,14 +1807,16 @@ class Orchestrator:
                 bytes_transferred,
                 bandwidth_mbps,
             )
-            await self._slack_notifier.notify_task_complete(
-                task_id=task_id,
-                worker_id=worker_id,
-                assignment_id=str(assignment_id),
-                client_ip=client_ip,
-                hotkey=hotkey,
-                bytes_transferred=int(bytes_transferred or 0),
-                bandwidth_mbps=float(bandwidth_mbps or 0.0),
+            asyncio.create_task(
+                self._slack_notifier.notify_task_complete(
+                    task_id=task_id,
+                    worker_id=worker_id,
+                    assignment_id=str(assignment_id),
+                    client_ip=client_ip,
+                    hotkey=hotkey,
+                    bytes_transferred=int(bytes_transferred or 0),
+                    bandwidth_mbps=float(bandwidth_mbps or 0.0),
+                )
             )
 
         return True
