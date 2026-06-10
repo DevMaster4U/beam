@@ -36,6 +36,7 @@ Usage:
 
 import argparse
 import asyncio
+import concurrent.futures
 import contextlib
 import hashlib
 import json
@@ -252,10 +253,13 @@ MAX_IN_FLIGHT_BYTES = max(
     int(os.environ.get("WORKER_MAX_IN_FLIGHT_BYTES", str(256 * 1024 * 1024))),
 )
 FETCH_TIMEOUT = 30  # seconds
-SEND_TIMEOUT = 30  # seconds
+SEND_TIMEOUT = 120  # seconds — increased to cover large uploads on slow links
 MAX_RETRIES = 3
 RETRY_BACKOFF = 1.0  # Base backoff in seconds
-FETCH_STREAM_CHUNK_SIZE = 64 * 1024
+FETCH_STREAM_CHUNK_SIZE = 512 * 1024  # 512 KB — was 64 KB; fewer await cycles for 20 MB transfers
+
+# Thread pool for SHA-256 hashing — keeps the event loop free during large object hashing
+_hash_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="hash")
 WS_TASK_RESULT_ACK_TIMEOUT = float(os.environ.get("WORKER_TASK_RESULT_ACK_TIMEOUT", "3.0"))
 
 
@@ -959,7 +963,7 @@ async def fetch_and_send_chunk(
     )
 
     for attempt in range(MAX_RETRIES):
-        queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=8)
+        queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=32)  # was 8 — larger buffer reduces producer stalls
         hasher = hashlib.sha256()
         bytes_transferred = 0
         fetch_error: Optional[BaseException] = None
@@ -987,8 +991,10 @@ async def fetch_and_send_chunk(
                                     f"expected {expected_max_bytes}"
                                 )
 
+                    loop = asyncio.get_event_loop()
                     async for part in response.aiter_bytes(chunk_size=FETCH_STREAM_CHUNK_SIZE):
-                        hasher.update(part)
+                        # Hash in thread pool so the event loop stays free during large transfers
+                        await loop.run_in_executor(_hash_executor, hasher.update, part)
                         bytes_transferred += len(part)
                         if (
                             expected_max_bytes
@@ -1034,6 +1040,9 @@ async def fetch_and_send_chunk(
                 "X-Total-Size": str(total_size or 0),
                 "X-Chunk-SHA256": chunk_hash_header or "",
             }
+            # Sending Content-Length allows the server to preallocate and avoids chunked-transfer overhead
+            if expected_max_bytes and expected_max_bytes > 0:
+                send_headers["Content-Length"] = str(expected_max_bytes)
             if auth_token:
                 send_headers["Authorization"] = f"Bearer {auth_token}"
             return await client.post(
@@ -1062,7 +1071,9 @@ async def fetch_and_send_chunk(
                 )
 
             send_started = time.perf_counter()
-            pipeline_send = is_object_storage or bool(expected_chunk_hash)
+            # Always pipeline: fetch and upload run concurrently.
+            # This halves wall-clock time for a single chunk from O(fetch+send) to O(max(fetch,send)).
+            pipeline_send = True
             if pipeline_send:
                 send_task = asyncio.create_task(
                     stream_to_destination(expected_chunk_hash)
@@ -1992,10 +2003,10 @@ async def run_worker(state: WorkerState):
 
     # Create HTTP client
     state.http_client = httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=5.0),
+        timeout=httpx.Timeout(connect=10.0, read=120.0, write=120.0, pool=5.0),  # read/write: 60→120s
         limits=httpx.Limits(
-            max_connections=max(8, MAX_CONCURRENT_TASKS * 4),
-            max_keepalive_connections=max(4, MAX_CONCURRENT_TASKS * 2),
+            max_connections=max(16, MAX_CONCURRENT_TASKS * 8),         # was *4
+            max_keepalive_connections=max(8, MAX_CONCURRENT_TASKS * 4), # was *2
         ),
     )
 
