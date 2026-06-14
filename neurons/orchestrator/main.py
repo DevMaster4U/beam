@@ -24,12 +24,91 @@ Transfer execution happens on workers that dial the **worker-gateway** endpoints
 Orchestrators still coordinate exclusively through BeamCore APIs rather than talking to arbitrary workers directly.
 """
 
+from __future__ import annotations
+
 import logging
 import os
 import socket
 import sys
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Optional
+
+_WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _extract_env_file_arg(argv: list[str]) -> tuple[Optional[Path], list[str]]:
+    """Pull --env-file from argv before other startup logic runs."""
+    cleaned: list[str] = []
+    env_file: Optional[Path] = None
+    idx = 0
+    while idx < len(argv):
+        arg = argv[idx]
+        if arg == "--env-file":
+            if idx + 1 >= len(argv):
+                print("Error: --env-file requires a path argument", file=sys.stderr)
+                sys.exit(2)
+            env_file = Path(argv[idx + 1]).expanduser()
+            idx += 2
+            continue
+        if arg.startswith("--env-file="):
+            env_file = Path(arg.split("=", 1)[1]).expanduser()
+            idx += 1
+            continue
+        cleaned.append(arg)
+        idx += 1
+    return env_file, cleaned
+
+
+def _resolve_orchestrator_env_file() -> Optional[Path]:
+    cli_file, _ = _extract_env_file_arg(sys.argv[1:])
+    if cli_file is not None:
+        return cli_file
+
+    env_path = os.environ.get("ORCHESTRATOR_ENV_FILE", "").strip()
+    if env_path:
+        return Path(env_path).expanduser()
+    return None
+
+
+def _resolve_env_path(path: Path) -> Path:
+    if path.is_absolute():
+        return path
+    return _WORKSPACE_ROOT / path
+
+
+def _orchestrator_instance_name() -> Optional[str]:
+    orch_env = _resolve_orchestrator_env_file()
+    if orch_env is None:
+        return None
+    return _resolve_env_path(orch_env).stem
+
+
+def _load_workspace_env() -> None:
+    """Load shared .env, then optional per-orchestrator env (override)."""
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+
+    shared_env = _WORKSPACE_ROOT / ".env"
+    if shared_env.exists():
+        load_dotenv(shared_env, override=False)
+
+    orch_env = _resolve_orchestrator_env_file()
+    if orch_env is None:
+        return
+
+    orch_env = _resolve_env_path(orch_env)
+    if orch_env.exists():
+        load_dotenv(orch_env, override=True)
+    else:
+        print(f"Error: orchestrator env file not found: {orch_env}", file=sys.stderr)
+        sys.exit(2)
+
+
+_load_workspace_env()
 
 import uvicorn
 from fastapi import FastAPI
@@ -45,30 +124,40 @@ from routes import health, orchestrators
 # SubnetCoreClient. main.py only wires lifespan + FastAPI routes.
 
 
-# Configure logging: always write to file; mirror to console only in a terminal.
-LOG_DIR = os.environ.get("LOG_DIR", "/tmp/beam_logs")
-os.makedirs(LOG_DIR, exist_ok=True)
+def _configure_logging() -> logging.Logger:
+    """Write orchestrator output to logs/orchestrators/<instance>.log when configured."""
+    log_root = Path(os.environ.get("LOG_DIR", _WORKSPACE_ROOT / "logs"))
+    instance = _orchestrator_instance_name()
+    if instance:
+        log_dir = log_root / "orchestrators"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{instance}.log"
+    else:
+        log_root.mkdir(parents=True, exist_ok=True)
+        log_file = log_root / "miner.log"
 
-log_format = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-log_datefmt = "%Y-%m-%d %H:%M:%S"
-formatter = logging.Formatter(log_format, datefmt=log_datefmt)
+    log_format = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    log_datefmt = "%Y-%m-%d %H:%M:%S"
+    formatter = logging.Formatter(log_format, datefmt=log_datefmt)
 
-file_handler = logging.FileHandler(f"{LOG_DIR}/miner.log")
-file_handler.setFormatter(formatter)
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(formatter)
 
-handlers: list[logging.Handler] = [file_handler]
-if sys.stderr.isatty():
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(formatter)
-    handlers.append(stream_handler)
+    handlers: list[logging.Handler] = [file_handler]
+    if sys.stderr.isatty():
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        handlers.append(stream_handler)
 
-logging.basicConfig(
-    level=logging.INFO,
-    handlers=handlers,
-    force=True,
-)
+    logging.basicConfig(
+        level=logging.INFO,
+        handlers=handlers,
+        force=True,
+    )
+    return logging.getLogger(__name__)
 
-logger = logging.getLogger(__name__)
+
+logger = _configure_logging()
 
 # Global instances
 orchestrator: Orchestrator = None

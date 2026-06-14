@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Manage the BEAM orchestrator via systemd.
+# Manage one orchestrator instance via systemd (beam-orchestrator@<instance>.service).
 #
 # First-time setup:
 #   ./scripts/install-systemd.sh --enable
+#   ./scripts/install-systemd.sh --enable-orchestrators
 #
 # Usage:
-#   ./scripts/run-orchestrator.sh              # start
-#   ./scripts/run-orchestrator.sh --foreground # foreground (debug)
-#   ./scripts/run-orchestrator.sh --stop
-#   ./scripts/run-orchestrator.sh --restart
-#   ./scripts/run-orchestrator.sh --status
-#   ./scripts/run-orchestrator.sh --env-file path/to/.env
+#   ./scripts/run-orchestrator.sh orch1
+#   ./scripts/run-orchestrator.sh orch1 --foreground
+#   ./scripts/run-orchestrator.sh orch1 --stop
+#   ./scripts/run-orchestrator.sh orch1 --restart
+#   ./scripts/run-orchestrator.sh orch1 --status
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -18,37 +18,35 @@ BEAM_ROOT="$ROOT"
 # shellcheck disable=SC1091
 source "${ROOT}/scripts/lib/systemd.sh"
 
-SERVICE="beam-orchestrator.service"
-DEFAULT_ENV_FILE="${ROOT}/.env"
-FALLBACK_ENV_FILE="${ROOT}/neurons/orchestrator/.env"
-ENV_FILE="${DEFAULT_ENV_FILE}"
-LOG_FILE="${ROOT}/logs/miner.log"
+INSTANCE="${1:-}"
 
 usage() {
   cat <<EOF
-Usage: $0 [--foreground|-f | --stop | --restart | --status | --env-file PATH]
+Usage: $0 <instance> [--foreground|-f | --stop | --restart | --status]
 
-  (default)    Start orchestrator via systemd
-  --foreground Run in the foreground (debug; bypasses systemd)
-  --stop       Stop orchestrator
-  --restart    Restart orchestrator
-  --status     Show systemd status, log path, and API port
-  --env-file   Env file to validate before start (default: ${DEFAULT_ENV_FILE})
+  <instance>     Name matching config/orchestrators/<instance>.env
+  --foreground   Run in the foreground (debug; bypasses systemd)
+  --stop         Stop the orchestrator via systemd
+  --restart      Restart the orchestrator via systemd
+  --status       Show systemd status, log path, and API port
 
 Install units once with:
   ./scripts/install-systemd.sh --enable
+  ./scripts/install-systemd.sh --enable-orchestrators
+
+Setup:
+  cp config/orchestrators/orch1.env.example config/orchestrators/orch1.env
 
 See docs/orchestrator.md.
 EOF
 }
 
-load_env_file() {
-  local file="$1"
-  set -a
-  # shellcheck disable=SC1090
-  source "$file"
-  set +a
-}
+if [[ -z "$INSTANCE" || "$INSTANCE" == "-h" || "$INSTANCE" == "--help" ]]; then
+  usage >&2
+  exit 1
+fi
+
+shift
 
 FOREGROUND=0
 STOP=0
@@ -73,14 +71,6 @@ while [[ $# -gt 0 ]]; do
       STATUS=1
       shift
       ;;
-    --env-file)
-      if [[ $# -lt 2 ]]; then
-        echo "--env-file requires a path" >&2
-        exit 1
-      fi
-      ENV_FILE="$2"
-      shift 2
-      ;;
     -h|--help)
       usage
       exit 0
@@ -93,7 +83,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-mkdir -p "${ROOT}/logs"
+ENV_FILE="${ROOT}/config/orchestrators/${INSTANCE}.env"
+LOG_FILE="${ROOT}/logs/orchestrators/${INSTANCE}.log"
+SERVICE="beam-orchestrator@${INSTANCE}.service"
+
+mkdir -p "${ROOT}/logs/orchestrators"
 
 if [[ "$STOP" -eq 1 ]]; then
   beam_require_unit "$SERVICE"
@@ -105,12 +99,12 @@ if [[ "$STATUS" -eq 1 ]]; then
   if beam_unit_installed "$SERVICE"; then
     beam_systemctl status "$SERVICE" --no-pager || true
   else
-    echo "orchestrator: unit not installed"
-    echo "  install: ${ROOT}/scripts/install-systemd.sh --enable"
+    echo "${INSTANCE}: unit not installed"
+    echo "  install: ${ROOT}/scripts/install-systemd.sh --enable-orchestrators"
   fi
   echo "  env: ${ENV_FILE}"
   echo "  log: ${LOG_FILE}"
-  port="${API_PORT:-9000}"
+  port="9000"
   if [[ -f "$ENV_FILE" ]]; then
     env_port="$(grep -E '^API_PORT=' "$ENV_FILE" | tail -n1 | cut -d= -f2- || true)"
     if [[ -n "$env_port" ]]; then
@@ -122,13 +116,9 @@ if [[ "$STATUS" -eq 1 ]]; then
 fi
 
 if [[ ! -f "$ENV_FILE" ]]; then
-  if [[ -f "$FALLBACK_ENV_FILE" ]]; then
-    ENV_FILE="$FALLBACK_ENV_FILE"
-  else
-    echo "Missing env file: ${DEFAULT_ENV_FILE}" >&2
-    echo "Copy .env.example or neurons/orchestrator/.env.example and customize." >&2
-    exit 1
-  fi
+  echo "Missing env file: ${ENV_FILE}" >&2
+  echo "Copy config/orchestrators/${INSTANCE}.env.example and customize it." >&2
+  exit 1
 fi
 
 if ! grep -qE '^ORCH_GATEWAY_URL=' "$ENV_FILE"; then
@@ -147,29 +137,31 @@ if ! grep -qE '^WALLET_HOTKEY=' "$ENV_FILE"; then
 fi
 
 PY="$(beam_python)"
-CMD=("$PY" main.py)
+CMD=(
+  "$PY" main.py
+  --env-file "$ENV_FILE"
+)
 
 if [[ "$FOREGROUND" -eq 1 ]]; then
-  load_env_file "$ENV_FILE"
   export LOG_DIR="${ROOT}/logs"
   cd "${ROOT}/neurons/orchestrator"
   exec "${CMD[@]}"
 fi
 
-beam_require_unit "$SERVICE"
+beam_ensure_orchestrator_instance "$INSTANCE"
 
 if [[ "$RESTART" -eq 1 ]]; then
   beam_systemctl restart "$SERVICE"
-  echo "Restarted orchestrator"
+  echo "Restarted orchestrator ${INSTANCE}"
 else
   beam_systemctl start "$SERVICE"
-  echo "Started orchestrator"
+  echo "Started orchestrator ${INSTANCE}"
 fi
 
 echo "  service: ${SERVICE}"
 echo "  env: ${ENV_FILE}"
 echo "  log: ${LOG_FILE}"
-port="${API_PORT:-9000}"
+port="9000"
 if [[ -f "$ENV_FILE" ]]; then
   env_port="$(grep -E '^API_PORT=' "$ENV_FILE" | tail -n1 | cut -d= -f2- || true)"
   if [[ -n "$env_port" ]]; then
