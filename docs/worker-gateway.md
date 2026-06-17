@@ -42,12 +42,14 @@ export GATEWAY_WORKER_SECRET=your-long-random-worker-secret
 python main.py
 ```
 
-Or from the repo root (systemd):
+Or from the repo root (systemd, multi-instance):
 
 ```bash
+cp config/gateways/gateway1.env.example config/gateways/gateway1.env
 ./scripts/install-systemd.sh --enable
-./scripts/run-worker-gateway.sh
-./scripts/run-worker-gateway.sh --status
+./scripts/install-systemd.sh --enable-gateways
+./scripts/run-worker-gateway.sh gateway1
+./scripts/run-worker-gateway.sh gateway1 --status
 ```
 
 ### 2. Orchestrator

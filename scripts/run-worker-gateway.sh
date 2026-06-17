@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# Manage the dedicated worker-gateway via systemd.
+# Manage one worker-gateway instance via systemd (beam-worker-gateway@<instance>.service).
 #
 # First-time setup:
 #   ./scripts/install-systemd.sh --enable
+#   ./scripts/install-systemd.sh --enable-gateways
 #
 # Usage:
-#   ./scripts/run-worker-gateway.sh
-#   ./scripts/run-worker-gateway.sh --foreground
-#   ./scripts/run-worker-gateway.sh --stop
-#   ./scripts/run-worker-gateway.sh --restart
-#   ./scripts/run-worker-gateway.sh --status
+#   ./scripts/run-worker-gateway.sh gateway1
+#   ./scripts/run-worker-gateway.sh gateway1 --foreground
+#   ./scripts/run-worker-gateway.sh gateway1 --stop
+#   ./scripts/run-worker-gateway.sh gateway1 --restart
+#   ./scripts/run-worker-gateway.sh gateway1 --status
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -17,26 +18,35 @@ BEAM_ROOT="$ROOT"
 # shellcheck disable=SC1091
 source "${ROOT}/scripts/lib/systemd.sh"
 
-SERVICE="beam-worker-gateway.service"
-ENV_FILE="${ROOT}/.env"
-LOG_FILE="${ROOT}/logs/gateway.log"
+INSTANCE="${1:-}"
 
 usage() {
   cat <<EOF
-Usage: $0 [--foreground|-f | --stop | --restart | --status]
+Usage: $0 <instance> [--foreground|-f | --stop | --restart | --status]
 
-  (default)    Start worker-gateway via systemd
-  --foreground Run in the foreground (debug; bypasses systemd)
-  --stop       Stop worker-gateway
-  --restart    Restart worker-gateway
-  --status     Show systemd status, log path, and listening port
+  <instance>     Name matching config/gateways/<instance>.env
+  --foreground   Run in the foreground (debug; bypasses systemd)
+  --stop         Stop the gateway via systemd
+  --restart      Restart the gateway via systemd
+  --status       Show systemd status, log path, and listening port
 
 Install units once with:
   ./scripts/install-systemd.sh --enable
+  ./scripts/install-systemd.sh --enable-gateways
+
+Setup:
+  cp config/gateways/gateway1.env.example config/gateways/gateway1.env
 
 See docs/worker-gateway.md.
 EOF
 }
+
+if [[ -z "$INSTANCE" || "$INSTANCE" == "-h" || "$INSTANCE" == "--help" ]]; then
+  usage >&2
+  exit 1
+fi
+
+shift
 
 FOREGROUND=0
 STOP=0
@@ -73,7 +83,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-mkdir -p "${ROOT}/logs"
+ENV_FILE="${ROOT}/config/gateways/${INSTANCE}.env"
+LOG_FILE="${ROOT}/logs/gateways/${INSTANCE}.log"
+SERVICE="beam-worker-gateway@${INSTANCE}.service"
+
+mkdir -p "${ROOT}/logs/gateways"
 
 if [[ "$STOP" -eq 1 ]]; then
   beam_require_unit "$SERVICE"
@@ -85,8 +99,8 @@ if [[ "$STATUS" -eq 1 ]]; then
   if beam_unit_installed "$SERVICE"; then
     beam_systemctl status "$SERVICE" --no-pager || true
   else
-    echo "worker-gateway: unit not installed"
-    echo "  install: ${ROOT}/scripts/install-systemd.sh --enable"
+    echo "${INSTANCE}: unit not installed"
+    echo "  install: ${ROOT}/scripts/install-systemd.sh --enable-gateways"
   fi
   echo "  env: ${ENV_FILE}"
   echo "  log: ${LOG_FILE}"
@@ -100,7 +114,7 @@ fi
 
 if [[ ! -f "$ENV_FILE" ]]; then
   echo "Missing env file: ${ENV_FILE}" >&2
-  echo "Copy .env.example and set GATEWAY_CONTROL_SECRET and GATEWAY_WORKER_SECRET." >&2
+  echo "Copy config/gateways/${INSTANCE}.env.example and customize it." >&2
   exit 1
 fi
 
@@ -115,21 +129,24 @@ if ! grep -qE '^(GATEWAY_WORKER_SECRET|WORKER_GATEWAY_WORKER_SECRET)=' "$ENV_FIL
 fi
 
 PY="$(beam_python)"
-CMD=("$PY" "${ROOT}/worker-gateway/main.py")
+CMD=(
+  "$PY" "${ROOT}/worker-gateway/main.py"
+  --env-file "$ENV_FILE"
+)
 
 if [[ "$FOREGROUND" -eq 1 ]]; then
   cd "${ROOT}/worker-gateway"
   exec "${CMD[@]}"
 fi
 
-beam_require_unit "$SERVICE"
+beam_ensure_gateway_instance "$INSTANCE"
 
 if [[ "$RESTART" -eq 1 ]]; then
   beam_systemctl restart "$SERVICE"
-  echo "Restarted worker-gateway"
+  echo "Restarted worker-gateway ${INSTANCE}"
 else
   beam_systemctl start "$SERVICE"
-  echo "Started worker-gateway"
+  echo "Started worker-gateway ${INSTANCE}"
 fi
 
 echo "  service: ${SERVICE}"

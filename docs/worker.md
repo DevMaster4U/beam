@@ -65,7 +65,7 @@ Each worker needs a **unique registered hotkey** and its own resource limits. Sh
 cp config/workers/worker1.env.example config/workers/worker1.env
 cp config/workers/worker2.env.example config/workers/worker2.env
 
-# 2. Enable workers (after orchestrator/gateway: ./scripts/install-systemd.sh --enable)
+# 2. Enable workers (after orchestrator/gateway: ./scripts/install-systemd.sh --enable-orchestrators / --enable-gateways)
 ./scripts/install-systemd.sh --enable-workers
 ./scripts/run-workers.sh start
 

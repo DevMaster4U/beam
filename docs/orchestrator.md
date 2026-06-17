@@ -39,7 +39,19 @@ btcli subnet register --netuid 105 --subtensor.network finney \
 
 ## Configure
 
-Create `neurons/orchestrator/.env`:
+Create a per-instance env file (multi-instance on one host):
+
+```bash
+cp config/orchestrators/orch1.env.example config/orchestrators/orch1.env
+```
+
+Or for a single dev setup, use `neurons/orchestrator/.env`:
+
+```bash
+cp neurons/orchestrator/.env.example neurons/orchestrator/.env
+```
+
+Example `config/orchestrators/orch1.env`:
 
 ```bash
 CORE_SERVER_URL=https://beamcore.b1m.ai
@@ -59,27 +71,34 @@ Set `READY=true` only when the orchestrator is ready to accept transfer work.
 
 ## Run
 
-Install orchestrator + gateway systemd units:
+Install systemd unit templates:
 
 ```bash
 ./scripts/install-systemd.sh --enable
+./scripts/install-systemd.sh --enable-orchestrators
 ```
 
-Workers are installed separately — see [Worker Guide](worker.md).
+Workers and gateways are installed separately — see [Worker Guide](worker.md) and [Worker Gateway Guide](worker-gateway.md).
 
-Start and manage:
+Start and manage one instance:
 
 ```bash
-./scripts/run-orchestrator.sh
-./scripts/run-orchestrator.sh --status
-./scripts/run-orchestrator.sh --restart
-./scripts/run-orchestrator.sh --stop
+./scripts/run-orchestrator.sh orch1
+./scripts/run-orchestrator.sh orch1 --status
+./scripts/run-orchestrator.sh orch1 --restart
+./scripts/run-orchestrator.sh orch1 --stop
+```
+
+Start all configured orchestrators:
+
+```bash
+./scripts/run-orchestrators.sh start
 ```
 
 Debug in the foreground (bypasses systemd):
 
 ```bash
-./scripts/run-orchestrator.sh --foreground
+./scripts/run-orchestrator.sh orch1 --foreground
 ```
 
 Useful health checks:
@@ -90,10 +109,10 @@ curl http://localhost:8000/state | jq
 curl "$CORE_SERVER_URL/health"
 ```
 
-Application logs are written to `logs/miner.log`. Startup errors also appear in the journal:
+Application logs are written to `logs/orchestrators/<instance>.log`. Startup errors also appear in the journal:
 
 ```bash
-journalctl -u beam-orchestrator -f
+journalctl -u beam-orchestrator@orch1 -f
 ```
 
 See `deploy/systemd/README.md` for all three services.
