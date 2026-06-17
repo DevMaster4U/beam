@@ -1,0 +1,3 @@
+[submodule "sn_origin"]
+	path = sn_origin
+	url = https://github.com/Beam-Network/beam.git

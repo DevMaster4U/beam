@@ -130,7 +130,7 @@ class GatewayControlClient:
             )
         )
 
-    async def send_task_result_summary_ack(
+    async def send_task_result_ack(
         self,
         worker_id: str,
         task_id: str,
@@ -145,7 +145,7 @@ class GatewayControlClient:
         await self._ws.send(
             json.dumps(
                 {
-                    "type": "task_result_summary_ack",
+                    "type": "task_result_ack",
                     "worker_id": worker_id,
                     "task_id": task_id,
                     "offer_id": offer_id,
@@ -155,6 +155,9 @@ class GatewayControlClient:
                 }
             )
         )
+
+    # Backward-compatible alias (deprecated)
+    send_task_result_summary_ack = send_task_result_ack
 
     async def _send_request(self, message: dict[str, Any], timeout: float = 10.0) -> dict[str, Any]:
         if not self._ws or not self._connected:

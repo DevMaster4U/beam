@@ -8,7 +8,7 @@ from typing import Any
 
 from fastapi import WebSocket, WebSocketDisconnect
 
-from .protocol import build_task_accept_ack, build_task_offer_for_worker, build_task_result_summary_ack
+from .protocol import build_task_accept_ack, build_task_offer_for_worker, build_task_result_ack
 from .sessions import SessionRegistry
 
 logger = logging.getLogger(__name__)
@@ -42,13 +42,13 @@ async def _handle_task_accept_ack(registry: SessionRegistry, message: dict[str, 
     )
 
 
-async def _handle_task_result_summary_ack(registry: SessionRegistry, message: dict[str, Any]) -> None:
+async def _handle_task_result_ack(registry: SessionRegistry, message: dict[str, Any]) -> None:
     worker_id = message.get("worker_id")
     if not worker_id:
         return
     await registry.send_to_worker(
         worker_id,
-        build_task_result_summary_ack(
+        build_task_result_ack(
             task_id=message.get("task_id"),
             offer_id=message.get("offer_id") or message.get("task_id"),
             received=bool(message.get("received", True)),
@@ -56,6 +56,10 @@ async def _handle_task_result_summary_ack(registry: SessionRegistry, message: di
             reason=message.get("reason"),
         ),
     )
+
+
+# Backward-compatible alias (deprecated)
+_handle_task_result_summary_ack = _handle_task_result_ack
 
 
 async def handle_control_websocket(
@@ -99,8 +103,8 @@ async def handle_control_websocket(
             elif msg_type == "task_accept_ack":
                 await _handle_task_accept_ack(registry, message)
 
-            elif msg_type == "task_result_summary_ack":
-                await _handle_task_result_summary_ack(registry, message)
+            elif msg_type in ("task_result_ack", "task_result_summary_ack"):
+                await _handle_task_result_ack(registry, message)
 
             elif msg_type == "ping":
                 await websocket.send_json({"type": "pong", "request_id": request_id})

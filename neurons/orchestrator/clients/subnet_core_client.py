@@ -23,10 +23,10 @@ from websockets.exceptions import ConnectionClosed
 
 from middleware.metrics import BEAMCORE_UPSTREAM_DEGRADED, BEAMCORE_UPSTREAM_DOWN_EVENTS
 from neurons.shared.gateway_protocol import (
-    build_beamcore_task_result_summary,
+    build_beamcore_task_result,
     build_beamcore_worker_response,
     normalize_worker_for_assignment,
-    parse_task_result_summary_ack,
+    parse_task_result_ack,
     parse_worker_response_ack,
 )
 
@@ -762,6 +762,10 @@ class SubnetCoreClient:
                     _run_worker_update(worker_id, event, self._worker_update_handler)
                 )
 
+        elif msg_type == "worker_task_offer_batch":
+            self._note_beamcore_upstream_recovered("worker_task_offer_batch from BeamCore")
+            asyncio.create_task(self._handle_task_offer_batch(data))
+
         elif msg_type == "worker_task_offer":
             asyncio.create_task(self._handle_worker_task_offer(data))
 
@@ -941,8 +945,162 @@ class SubnetCoreClient:
         return await self._send_ws_request(payload, timeout=15.0)
 
     async def relay_task_result_summary(self, message: dict[str, Any]) -> dict[str, Any]:
-        payload = build_beamcore_task_result_summary(message)
-        return await self._send_ws_request(payload, timeout=30.0)
+        """Relay worker task_result to BeamCore (legacy name)."""
+        return await self.send_task_result(message)
+
+    async def send_task_accept(
+        self,
+        task_id: str,
+        worker_id: str,
+        offer_id: Optional[str],
+        worker_version: Optional[str] = None,
+    ) -> dict[str, Any]:
+        if not self._ws or not self._ws_connected:
+            logger.warning("send_task_accept: no WS, dropping task=%s", task_id)
+            return {
+                "type": "task_accept_ack",
+                "task_id": task_id,
+                "offer_id": offer_id or task_id,
+                "accepted": False,
+                "reason": "orchestrator_ws_disconnected",
+            }
+        msg: dict[str, Any] = {
+            "type": "task_accept",
+            "task_id": task_id,
+            "worker_id": worker_id,
+            "offer_id": offer_id or task_id,
+        }
+        if worker_version:
+            msg["worker_version"] = worker_version
+        try:
+            return await self._send_ws_request(msg, timeout=15.0)
+        except Exception as exc:
+            logger.warning("send_task_accept send error: %s", exc)
+            return {
+                "type": "task_accept_ack",
+                "task_id": task_id,
+                "offer_id": offer_id or task_id,
+                "accepted": False,
+                "reason": "beamcore_accept_forward_failed",
+            }
+
+    async def send_task_reject(
+        self,
+        task_id: str,
+        worker_id: str,
+        offer_id: Optional[str],
+        reason: Optional[str] = None,
+    ) -> dict[str, Any]:
+        if not self._ws or not self._ws_connected:
+            logger.warning("send_task_reject: no WS, dropping task=%s", task_id)
+            return {
+                "type": "task_reject_ack",
+                "task_id": task_id,
+                "offer_id": offer_id or task_id,
+                "accepted": False,
+                "reason": "orchestrator_ws_disconnected",
+            }
+        msg: dict[str, Any] = {
+            "type": "task_reject",
+            "task_id": task_id,
+            "worker_id": worker_id,
+            "offer_id": offer_id or task_id,
+        }
+        if reason:
+            msg["reason"] = reason
+        try:
+            return await self._send_ws_request(msg, timeout=15.0)
+        except Exception as exc:
+            logger.warning("send_task_reject send error: %s", exc)
+            return {
+                "type": "task_reject_ack",
+                "task_id": task_id,
+                "offer_id": offer_id or task_id,
+                "accepted": False,
+                "reason": "beamcore_reject_forward_failed",
+            }
+
+    async def send_task_result(self, payload: dict[str, Any]) -> dict[str, Any]:
+        task_id = payload.get("task_id")
+        offer_id = payload.get("offer_id") or task_id
+        if not self._ws or not self._ws_connected:
+            logger.warning("send_task_result: no WS, dropping")
+            return {
+                "type": "task_result_ack",
+                "task_id": task_id,
+                "offer_id": offer_id,
+                "received": False,
+                "completed": False,
+                "reason": "orchestrator_ws_disconnected",
+            }
+        try:
+            if not task_id or not offer_id:
+                logger.warning("send_task_result: missing task_id/offer_id, dropping")
+                return {
+                    "type": "task_result_ack",
+                    "task_id": task_id,
+                    "offer_id": offer_id,
+                    "received": False,
+                    "completed": False,
+                    "reason": "missing_task_or_offer_id",
+                }
+            message = build_beamcore_task_result(payload)
+            return await self._send_ws_request(message, timeout=30.0)
+        except Exception as exc:
+            logger.warning("send_task_result send error: %s", exc)
+            return {
+                "type": "task_result_ack",
+                "task_id": task_id,
+                "offer_id": offer_id,
+                "received": False,
+                "completed": False,
+                "reason": "beamcore_result_forward_failed",
+            }
+
+    async def _handle_task_offer_batch(self, data: dict) -> None:
+        batch_id = data.get("batch_id")
+        offers = data.get("offers") or []
+        if not isinstance(offers, list) or not offers:
+            logger.warning("worker_task_offer_batch missing offers: batch=%s", batch_id)
+            return
+        if not self._dedicated_gateway_enabled or not self._gateway_control_client:
+            logger.warning("No dedicated gateway for batch %s", batch_id)
+            return
+
+        gateway = self._gateway_control_client
+        if not gateway.connected:
+            logger.warning("Gateway control offline for batch %s", batch_id)
+            return
+
+        workers = gateway.get_local_workers()
+        if not workers:
+            logger.warning("No connected local workers for batch %s", batch_id)
+            return
+
+        delivered = 0
+        worker_ids = [w["worker_id"] for w in workers if w.get("worker_id")]
+        for index, offer in enumerate(offers):
+            if not isinstance(offer, dict):
+                continue
+            if not worker_ids:
+                break
+            worker_id = worker_ids[index % len(worker_ids)]
+            if await gateway.send_task_offer(worker_id, offer):
+                delivered += 1
+            else:
+                logger.warning(
+                    "Failed to forward batch offer: batch=%s worker=%s task=%s",
+                    batch_id,
+                    worker_id,
+                    offer.get("task_id"),
+                )
+
+        logger.info(
+            "worker_task_offer_batch delivered: batch=%s offers=%s delivered=%s",
+            batch_id,
+            len(offers),
+            delivered,
+        )
 
     async def _handle_transfer_assigned(self, data: dict) -> None:
         assignment_id = data.get("assignment_id")

@@ -49,7 +49,7 @@ def parse_gateway_mode(value: Optional[str]) -> GatewayMode:
 WorkerToGatewayType = Literal[
     "task_accept",
     "task_reject",
-    "task_result_summary",
+    "task_result",
     "stats_snapshot",
     "task_transfer_progress",
     "bw_challenge_response",
@@ -59,7 +59,7 @@ GatewayToWorkerType = Literal[
     "connected",
     "task_offer",
     "task_accept_ack",
-    "task_result_summary_ack",
+    "task_result_ack",
     "stats_snapshot_ack",
     "session_displaced",
     "error",
@@ -74,13 +74,16 @@ def build_task_offer_for_worker(offer: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_worker_response_from_accept(message: dict[str, Any]) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "type": "worker_response",
         "task_id": message.get("task_id"),
         "offer_id": message.get("offer_id") or message.get("task_id"),
         "worker_id": message.get("worker_id"),
         "decision": "task_accept",
     }
+    if message.get("worker_version"):
+        payload["worker_version"] = message["worker_version"]
+    return payload
 
 
 def build_worker_response_from_reject(message: dict[str, Any]) -> dict[str, Any]:
@@ -110,7 +113,7 @@ def build_task_accept_ack(
     }
 
 
-def build_task_result_summary_ack(
+def build_task_result_ack(
     *,
     task_id: str,
     offer_id: str,
@@ -119,7 +122,7 @@ def build_task_result_summary_ack(
     reason: Optional[str] = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
-        "type": "task_result_summary_ack",
+        "type": "task_result_ack",
         "task_id": task_id,
         "offer_id": offer_id,
         "received": received,
@@ -129,6 +132,10 @@ def build_task_result_summary_ack(
     if reason is not None:
         payload["reason"] = reason
     return payload
+
+
+# Backward-compatible alias (deprecated)
+build_task_result_summary_ack = build_task_result_ack
 
 
 # ---------------------------------------------------------------------------
@@ -155,40 +162,28 @@ def build_beamcore_worker_response(message: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def build_beamcore_task_result_summary(message: dict[str, Any]) -> dict[str, Any]:
+def build_beamcore_task_result(message: dict[str, Any]) -> dict[str, Any]:
     """
-    Normalize worker task_result_summary for BeamCore relay.
+    Normalize worker task_result for BeamCore relay.
 
-    Worker sends bytes_transferred; BeamCore docs use bytes_transferred on the
-    relay and bytes_relayed in some completion handlers — include both.
+    BeamCore derives verified bytes from trusted task metadata; workers send
+    success, chunk_hash, etag, and error only (see data.b1m.ai guide).
     """
-    bytes_value = int(
-        message.get("bytes_transferred")
-        or message.get("bytes_relayed")
-        or 0
-    )
     payload: dict[str, Any] = {
-        "type": "task_result_summary",
+        "type": "task_result",
         "task_id": message.get("task_id"),
         "offer_id": message.get("offer_id") or message.get("task_id"),
         "worker_id": message.get("worker_id"),
         "success": bool(message.get("success", False)),
-        "bytes_transferred": bytes_value,
-        "bytes_relayed": bytes_value,
-        "bandwidth_mbps": float(message.get("bandwidth_mbps") or 0.0),
     }
-    for field in (
-        "chunk_hash",
-        "etag",
-        "error",
-        "latency_ms",
-        "duration_ms",
-        "start_time_us",
-        "end_time_us",
-    ):
+    for field in ("chunk_hash", "etag", "error"):
         if message.get(field) is not None:
             payload[field] = message[field]
     return payload
+
+
+# Backward-compatible alias (deprecated)
+build_beamcore_task_result_summary = build_beamcore_task_result
 
 
 def parse_worker_response_ack(data: dict[str, Any]) -> tuple[bool, Optional[str]]:
@@ -199,10 +194,10 @@ def parse_worker_response_ack(data: dict[str, Any]) -> tuple[bool, Optional[str]
     return bool(data.get("accepted", True)), data.get("reason")
 
 
-def parse_task_result_summary_ack(data: dict[str, Any]) -> tuple[bool, Optional[bool], Optional[str]]:
+def parse_task_result_ack(data: dict[str, Any]) -> tuple[bool, Optional[bool], Optional[str]]:
     if data.get("type") == "error":
         return False, None, data.get("message") or data.get("error")
-    if data.get("type") == "task_result_summary_ack":
+    if data.get("type") in ("task_result_ack", "task_result_summary_ack"):
         received = bool(data.get("received", False))
         completed_raw = data.get("completed")
         completed = bool(completed_raw) if completed_raw is not None else received
@@ -213,6 +208,10 @@ def parse_task_result_summary_ack(data: dict[str, Any]) -> tuple[bool, Optional[
     return received, completed, data.get("reason")
 
 
+# Backward-compatible alias (deprecated)
+parse_task_result_summary_ack = parse_task_result_ack
+
+
 # ---------------------------------------------------------------------------
 # Control channel (orchestrator ↔ worker-gateway)
 # ---------------------------------------------------------------------------
@@ -221,7 +220,7 @@ ControlToGatewayType = Literal[
     "list_workers",
     "task_offer",
     "task_accept_ack",
-    "task_result_summary_ack",
+    "task_result_ack",
     "ping",
 ]
 
@@ -231,7 +230,7 @@ GatewayToControlType = Literal[
     "worker_connected",
     "worker_disconnected",
     "worker_response",
-    "task_result_summary",
+    "task_result",
     "worker_capacity_update",
     "task_transfer_progress",
     "bw_challenge_response",

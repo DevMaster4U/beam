@@ -7,11 +7,6 @@ from typing import Any
 
 from fastapi import WebSocket, WebSocketDisconnect
 
-from .protocol import (
-    build_task_accept_ack,
-    build_worker_response_from_accept,
-    build_worker_response_from_reject,
-)
 from .sessions import SessionRegistry
 
 logger = logging.getLogger(__name__)
@@ -59,21 +54,13 @@ async def handle_worker_websocket(
             if msg_type == "task_accept":
                 # Relay to orchestrator; task_accept_ack comes back on the control channel
                 # after BeamCore confirms the lease (orch-owned gateway semantics).
-                await registry.notify_control(build_worker_response_from_accept(message))
+                await registry.notify_control(message)
 
             elif msg_type == "task_reject":
-                await registry.notify_control(build_worker_response_from_reject(message))
-                await websocket.send_json(
-                    build_task_accept_ack(
-                        task_id=message.get("task_id"),
-                        offer_id=message.get("offer_id") or message.get("task_id"),
-                        accepted=False,
-                        reason=message.get("reason", "rejected"),
-                    )
-                )
+                await registry.notify_control(message)
 
-            elif msg_type == "task_result_summary":
-                # Relay to orchestrator; summary ack is sent after BeamCore verification.
+            elif msg_type in ("task_result", "task_result_summary"):
+                # Relay to orchestrator; result ack is sent after BeamCore verification.
                 await registry.notify_control(message)
 
             elif msg_type == "stats_snapshot":

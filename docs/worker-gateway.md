@@ -89,9 +89,9 @@ Key behaviors by mode:
 | Message | Option 2 (public) | Option 1 (dedicated) |
 |---------|-------------------|----------------------|
 | `transfer_assigned` | `list_public_workers` → `chunk_assignments` | Gateway `list_workers` → `chunk_assignments` |
-| `worker_task_offer` | Ignored (public gateway delivers) | Relayed to worker-gateway → worker |
-| `worker_response` | N/A (public gateway relays) | Worker → gateway → orchestrator → BeamCore |
-| `task_result_summary` | BeamCore push to orchestrator | Worker → gateway → orchestrator → BeamCore |
+| `worker_task_offer` / `worker_task_offer_batch` | Ignored (public gateway delivers) | Relayed to worker-gateway → worker |
+| `task_accept` / `task_reject` | N/A (public gateway relays) | Worker → gateway → orchestrator → BeamCore |
+| `task_result` | BeamCore push to orchestrator | Worker → gateway → orchestrator → BeamCore |
 | WS `register` `gateway_url` | Not sent | `WORKER_GATEWAY_PUBLIC_URL` |
 
 ---

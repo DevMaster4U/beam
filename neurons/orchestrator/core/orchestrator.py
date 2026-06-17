@@ -55,7 +55,7 @@ from typing import Any, Dict, List, Optional, Set
 import bittensor as bt
 
 from neurons.shared.gateway_protocol import (
-    parse_task_result_summary_ack,
+    parse_task_result_ack,
     parse_worker_response_ack,
 )
 
@@ -1438,6 +1438,85 @@ class Orchestrator:
             logger.warning(f"Failed to initialize SubnetCoreClient: {e}")
             self.subnet_core_client = None
 
+    async def _relay_worker_task_decision(
+        self,
+        *,
+        worker_id: str,
+        task_id: str,
+        offer_id: str,
+        is_accept: bool,
+        reason: Optional[str] = None,
+        worker_version: Optional[str] = None,
+        log_label: str = "worker task decision",
+    ) -> None:
+        """Forward worker accept/reject to BeamCore and ack the worker via gateway."""
+        slack_notify: Optional[tuple[dict[str, Any], bool]] = None
+        if self._slack_notifier.enabled and task_id and worker_id:
+            client_ip, hotkey = self._worker_slack_meta(worker_id)
+            label = "Task accepted" if is_accept else "Task rejected"
+            logger.info(
+                "%s: task_id=%s worker_id=%s ip=%s hotkey=%s reason=%s",
+                label,
+                task_id,
+                worker_id,
+                client_ip,
+                hotkey,
+                reason or "",
+            )
+            slack_notify = (
+                {
+                    "task_id": task_id,
+                    "worker_id": worker_id,
+                    "client_ip": client_ip,
+                    "hotkey": hotkey,
+                    "reason": reason,
+                },
+                is_accept,
+            )
+        try:
+            if is_accept:
+                ack = await self.subnet_core_client.send_task_accept(
+                    task_id,
+                    worker_id,
+                    offer_id,
+                    worker_version=worker_version,
+                )
+            else:
+                ack = await self.subnet_core_client.send_task_reject(
+                    task_id,
+                    worker_id,
+                    offer_id,
+                    reason=reason,
+                )
+            accepted = bool(ack.get("accepted", is_accept))
+            ack_reason = ack.get("reason")
+            if self.gateway_control_client:
+                await self.gateway_control_client.send_task_accept_ack(
+                    worker_id,
+                    task_id,
+                    offer_id,
+                    accepted=accepted,
+                    reason=ack_reason,
+                )
+        except Exception as exc:
+            logger.error("Failed to relay %s: %s", log_label, exc)
+            if self.gateway_control_client:
+                await self.gateway_control_client.send_task_accept_ack(
+                    worker_id,
+                    task_id,
+                    offer_id,
+                    accepted=False,
+                    reason=str(exc),
+                )
+        if slack_notify:
+            fields, notify_accepted = slack_notify
+            asyncio.create_task(
+                self._slack_notifier.notify_task_response(
+                    accepted=notify_accepted,
+                    **fields,
+                )
+            )
+
     async def _handle_gateway_control_event(self, message: dict) -> None:
         """Relay worker events from the worker-gateway control channel to BeamCore."""
         if not self.subnet_core_client:
@@ -1490,77 +1569,47 @@ class Orchestrator:
                 )
             return
 
+        if msg_type in ("task_accept", "task_reject"):
+            worker_id = message.get("worker_id", "")
+            task_id = message.get("task_id", "")
+            offer_id = message.get("offer_id") or task_id
+            await self._relay_worker_task_decision(
+                worker_id=worker_id,
+                task_id=task_id,
+                offer_id=offer_id,
+                is_accept=msg_type == "task_accept",
+                reason=message.get("reason"),
+                worker_version=message.get("worker_version"),
+                log_label=msg_type,
+            )
+            return
+
         if msg_type == "worker_response":
             worker_id = message.get("worker_id", "")
             task_id = message.get("task_id", "")
             offer_id = message.get("offer_id") or task_id
             decision = str(message.get("decision") or "")
-            slack_notify: Optional[tuple[dict[str, Any], bool]] = None
-            if self._slack_notifier.enabled and task_id and worker_id:
-                accepted = decision in ("task_accept", "accept")
-                rejected = decision in ("task_reject", "reject")
-                if accepted or rejected:
-                    client_ip, hotkey = self._worker_slack_meta(worker_id)
-                    label = "Task accepted" if accepted else "Task rejected"
-                    logger.info(
-                        "%s: task_id=%s worker_id=%s ip=%s hotkey=%s reason=%s",
-                        label,
-                        task_id,
-                        worker_id,
-                        client_ip,
-                        hotkey,
-                        message.get("reason") or "",
-                    )
-                    slack_notify = (
-                        {
-                            "task_id": task_id,
-                            "worker_id": worker_id,
-                            "client_ip": client_ip,
-                            "hotkey": hotkey,
-                            "reason": message.get("reason"),
-                        },
-                        accepted,
-                    )
-            try:
-                ack = await self.subnet_core_client.relay_worker_response(message)
-                accepted, reason = parse_worker_response_ack(ack)
-                if self.gateway_control_client:
-                    await self.gateway_control_client.send_task_accept_ack(
-                        worker_id,
-                        task_id,
-                        offer_id,
-                        accepted=accepted,
-                        reason=reason,
-                    )
-            except Exception as exc:
-                logger.error("Failed to relay worker_response: %s", exc)
-                if self.gateway_control_client:
-                    await self.gateway_control_client.send_task_accept_ack(
-                        worker_id,
-                        task_id,
-                        offer_id,
-                        accepted=False,
-                        reason=str(exc),
-                    )
-            if slack_notify:
-                fields, notify_accepted = slack_notify
-                asyncio.create_task(
-                    self._slack_notifier.notify_task_response(
-                        accepted=notify_accepted,
-                        **fields,
-                    )
-                )
+            is_accept = decision in ("task_accept", "accept")
+            await self._relay_worker_task_decision(
+                worker_id=worker_id,
+                task_id=task_id,
+                offer_id=offer_id,
+                is_accept=is_accept,
+                reason=message.get("reason"),
+                worker_version=message.get("worker_version"),
+                log_label="worker_response",
+            )
             return
 
-        if msg_type == "task_result_summary":
+        if msg_type in ("task_result", "task_result_summary"):
             worker_id = message.get("worker_id", "")
             task_id = message.get("task_id", "")
             offer_id = message.get("offer_id") or task_id
             try:
-                ack = await self.subnet_core_client.relay_task_result_summary(message)
-                received, completed, reason = parse_task_result_summary_ack(ack)
+                ack = await self.subnet_core_client.send_task_result(message)
+                received, completed, reason = parse_task_result_ack(ack)
                 if self.gateway_control_client:
-                    await self.gateway_control_client.send_task_result_summary_ack(
+                    await self.gateway_control_client.send_task_result_ack(
                         worker_id,
                         task_id,
                         offer_id,
@@ -1571,9 +1620,9 @@ class Orchestrator:
                 if received:
                     asyncio.create_task(self._handle_task_completion_notification(message))
             except Exception as exc:
-                logger.error("Failed to relay task_result_summary: %s", exc)
+                logger.error("Failed to relay task_result: %s", exc)
                 if self.gateway_control_client:
-                    await self.gateway_control_client.send_task_result_summary_ack(
+                    await self.gateway_control_client.send_task_result_ack(
                         worker_id,
                         task_id,
                         offer_id,

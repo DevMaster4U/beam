@@ -64,8 +64,8 @@ Set **`WORKER_GATEWAY_MODE=dedicated`** on the orchestrator (not just `WORKER_GA
 
 - Register with `gateway_url` on BeamCore
 - Assign chunks from **locally connected workers** (not `list_public_workers`)
-- Relay `worker_task_offer` → workers
-- Relay `worker_response` / `task_result_summary` → BeamCore
+- Relay `worker_task_offer` / `worker_task_offer_batch` → workers
+- Relay `task_accept` / `task_reject` / `task_result` → BeamCore
 
 ### 3. Configure your worker
 
@@ -84,9 +84,9 @@ Workers still register and submit PoB evidence to BeamCore HTTP directly.
 
 | Message | Action |
 |---------|--------|
-| `task_accept` | Relayed as `worker_response` to orchestrator control |
-| `task_reject` | Relayed as `worker_response` with `decision: task_reject` |
-| `task_result_summary` | Relayed to orchestrator control |
+| `task_accept` | Relayed to orchestrator control (BeamCore ack via `task_accept_ack`) |
+| `task_reject` | Relayed to orchestrator control |
+| `task_result` | Relayed to orchestrator control |
 | `stats_snapshot` | Relayed as `worker_capacity_update` |
 
 ### Orchestrator → gateway (control)
@@ -96,7 +96,7 @@ Workers still register and submit PoB evidence to BeamCore HTTP directly.
 | `list_workers` | Returns connected worker sessions |
 | `task_offer` | Forwarded verbatim to target worker |
 | `task_accept_ack` | Forwarded to worker after BeamCore lease confirmation |
-| `task_result_summary_ack` | Forwarded to worker after BeamCore verification |
+| `task_result_ack` | Forwarded to worker after BeamCore verification |
 
 ### Gateway → orchestrator (control push)
 
@@ -104,8 +104,8 @@ Workers still register and submit PoB evidence to BeamCore HTTP directly.
 |---------|------|
 | `worker_connected` | Worker opens `/ws/{worker_id}` |
 | `worker_disconnected` | Worker disconnects |
-| `worker_response` | Worker accepts or rejects a task |
-| `task_result_summary` | Worker reports chunk completion |
+| `task_accept` / `task_reject` | Worker accepts or rejects a task |
+| `task_result` | Worker reports chunk completion |
 | `worker_capacity_update` | Worker sends `stats_snapshot` |
 
 ## Production notes

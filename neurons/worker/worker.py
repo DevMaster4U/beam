@@ -42,11 +42,13 @@ import hashlib
 import json
 import logging
 import os
+import re
 import signal
 import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
@@ -263,6 +265,16 @@ _hash_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_nam
 WS_TASK_RESULT_ACK_TIMEOUT = float(os.environ.get("WORKER_TASK_RESULT_ACK_TIMEOUT", "3.0"))
 
 
+def resolve_worker_version() -> str:
+    try:
+        return package_version("beam")
+    except PackageNotFoundError:
+        return "0.1.0"
+
+
+WORKER_VERSION = resolve_worker_version()
+
+
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
     if raw is None or not str(raw).strip():
@@ -330,7 +342,7 @@ class TaskExecutionResult:
 
 @dataclass
 class TaskSummaryAck:
-    """BeamCore task_result_summary_ack fields used for payment gating."""
+    """BeamCore task_result_ack fields used for payment gating."""
 
     received: bool = False
     completed: bool = False
@@ -442,6 +454,87 @@ def api_key_headers(state: WorkerState) -> Dict[str, str]:
     return {"X-Api-Key": state.api_key} if state.api_key else {}
 
 
+RANGE_HEADER_RE = re.compile(r"^bytes=(\d+)-(\d+)$")
+
+
+def offer_headers(value: Any) -> Dict[str, str]:
+    """Return string-only offer headers."""
+    if not isinstance(value, dict):
+        return {}
+    return {str(k): v for k, v in value.items() if isinstance(v, str)}
+
+
+def parse_offer_range(headers: Dict[str, str]) -> Optional[tuple[int, int, int]]:
+    """Parse the signed source Range header as start, end, length."""
+    range_header = headers.get("Range") or headers.get("range")
+    if not range_header:
+        return None
+    match = RANGE_HEADER_RE.fullmatch(range_header.strip())
+    if not match:
+        raise ValueError(f"invalid source Range header: {range_header!r}")
+    start = int(match.group(1))
+    end = int(match.group(2))
+    if end < start:
+        raise ValueError(f"invalid source Range header: {range_header!r}")
+    return start, end, end - start + 1
+
+
+def build_transfer_context(task: dict) -> tuple[Optional[dict], Optional[str]]:
+    """Validate and normalize a flat BeamCore task offer (worker_task_offer_batch item)."""
+    source_url = task.get("source_url")
+    dest_url = task.get("dest_url")
+    if not isinstance(source_url, str) or not source_url.strip():
+        return None, None
+    if not isinstance(dest_url, str) or not dest_url.strip():
+        return None, None
+
+    try:
+        chunk_size = int(task.get("chunk_size"))
+    except (TypeError, ValueError):
+        return None, "invalid_chunk_size"
+    if chunk_size <= 0:
+        return None, "invalid_chunk_size"
+
+    source_headers = offer_headers(task.get("source_headers"))
+    dest_headers = offer_headers(task.get("dest_headers"))
+    try:
+        parsed_range = parse_offer_range(source_headers)
+    except ValueError as exc:
+        return None, str(exc)
+    if parsed_range is None:
+        return None, "missing_source_range"
+    range_start, range_end, range_size = parsed_range
+    if range_size != chunk_size:
+        return None, f"range_size_mismatch:{range_size}!={chunk_size}"
+
+    return {
+        "mode": "flat",
+        "source_url": source_url.strip(),
+        "dest_url": dest_url.strip(),
+        "chunk_size": chunk_size,
+        "range_start": range_start,
+        "range_end": range_end,
+        "source_headers": source_headers,
+        "dest_headers": dest_headers,
+        "transfer_id": str(task.get("transfer_id") or task.get("task_id") or ""),
+        "etag_required": bool(task.get("etag_required")),
+    }, None
+
+
+def resolve_transfer_plan(task: dict) -> tuple[Optional[dict], Optional[str]]:
+    """Resolve flat offer (BeamCore batch) or legacy execution_context plan."""
+    flat_ctx, flat_err = build_transfer_context(task)
+    if flat_ctx is not None:
+        return flat_ctx, None
+    if flat_err:
+        return None, flat_err
+
+    execution_context = task.get("execution_context") or {}
+    if isinstance(execution_context, dict) and has_transfer_endpoints(execution_context):
+        return {"mode": "legacy", "execution_context": execution_context}, None
+    return None, "missing_transfer_endpoints"
+
+
 def has_transfer_endpoints(execution_context: dict) -> bool:
     """Return True if a task has enough routing info to move data."""
     has_gateway_pair = bool(
@@ -464,7 +557,7 @@ async def execute_task_with_metrics(
     state: WorkerState,
     task_id: str,
     task: dict,
-    execution_context: dict,
+    transfer_plan: dict,
     deadline_us: int,
     log_prefix: str = "[Worker]",
 ) -> TaskExecutionResult:
@@ -483,11 +576,19 @@ async def execute_task_with_metrics(
             if remaining_sec is not None and remaining_sec < 2:
                 error_msg = f"Deadline expired while waiting ({remaining_sec:.1f}s)"
                 print(f"{log_prefix} {error_msg}")
+            elif transfer_plan.get("mode") == "flat":
+                bytes_transferred, success, error_msg, chunk_hash, etag = await execute_flat_transfer(
+                    state,
+                    task_id,
+                    transfer_plan,
+                    task,
+                    deadline_us,
+                )
             else:
                 bytes_transferred, success, error_msg, chunk_hash, etag = await execute_transfer(
                     state,
                     task_id,
-                    execution_context,
+                    transfer_plan.get("execution_context", {}),
                     task,
                     deadline_us,
                 )
@@ -558,7 +659,6 @@ def payment_evidence_message(
     worker_id: str,
     task_id: str,
     offer_id: str,
-    bytes_relayed: int,
     chunk_hash: str = "",
 ) -> str:
     """Canonical message BeamCore verifies for worker payment evidence."""
@@ -568,7 +668,6 @@ def payment_evidence_message(
             worker_id,
             task_id,
             offer_id,
-            str(bytes_relayed),
             chunk_hash or "",
         ]
     )
@@ -578,10 +677,6 @@ async def submit_worker_payment_evidence(
     state: WorkerState,
     task_id: str,
     offer_id: str,
-    bytes_relayed: int,
-    bandwidth_mbps: float,
-    start_time_us: int,
-    end_time_us: int,
     chunk_hash: str = "",
 ) -> bool:
     """Submit durable worker-signed payment evidence directly to BeamCore HTTP."""
@@ -601,7 +696,6 @@ async def submit_worker_payment_evidence(
         state.worker_id,
         task_id,
         effective_offer,
-        bytes_relayed,
         chunk_hash,
     )
     try:
@@ -613,10 +707,6 @@ async def submit_worker_payment_evidence(
     payload = {
         "offer_id": effective_offer,
         "success": True,
-        "bytes_relayed": int(bytes_relayed),
-        "bandwidth_mbps": float(bandwidth_mbps),
-        "start_time_us": int(start_time_us),
-        "end_time_us": int(end_time_us),
         "chunk_hash": chunk_hash or "",
         "worker_signature": worker_signature,
         "required_payment": WORKER_REQUIRED_PAYMENT,
@@ -844,7 +934,7 @@ def _save_prewarm_cache(path: Path, origins: list[str]) -> None:
 
 def _collect_transfer_origins(execution_context: dict) -> set[str]:
     origins: set[str] = set()
-    for key in ("gateway_url", "destination_url"):
+    for key in ("gateway_url", "destination_url", "source_url", "dest_url"):
         origin = _http_origin_from_url(str(execution_context.get(key) or ""))
         if origin:
             origins.add(origin)
@@ -898,12 +988,15 @@ async def _prewarm_origins(
             )
 
 
-async def prewarm_for_transfer(state: WorkerState, execution_context: dict, *, reason: str) -> None:
+async def prewarm_for_transfer(state: WorkerState, transfer_plan: dict, *, reason: str) -> None:
     """Warm DNS/TLS/HTTP pool for transfer hosts; persist newly learned origins."""
     if not PREWARM_ENABLED or not state.http_client:
         return
 
-    task_origins = _collect_transfer_origins(execution_context)
+    if transfer_plan.get("mode") == "flat":
+        task_origins = _collect_transfer_origins(transfer_plan)
+    else:
+        task_origins = _collect_transfer_origins(transfer_plan.get("execution_context", {}))
     if not task_origins and not state.prewarm_origins:
         return
 
@@ -948,6 +1041,8 @@ async def fetch_and_send_chunk(
     offer_id: str = None,
     route_metadata: Optional[Dict[str, Any]] = None,
     is_canary: bool = False,
+    extra_fetch_headers: Optional[Dict[str, str]] = None,
+    extra_dest_headers: Optional[Dict[str, str]] = None,
 ) -> tuple[int, str, Optional[str], int, float, float]:
     """Fetch from source and stream each received part to destination concurrently.
 
@@ -955,6 +1050,8 @@ async def fetch_and_send_chunk(
         (bytes_transferred, chunk_hash, etag, response_code, fetch_ms, send_ms)
     """
     fetch_headers = _build_fetch_headers(chunk_offset, chunk_size, total_size)
+    if extra_fetch_headers:
+        fetch_headers.update(extra_fetch_headers)
     is_object_storage = is_object_storage_presigned_url(destination_url)
     route_context = (
         object_storage_route_context(destination_url, route_metadata)
@@ -1024,6 +1121,8 @@ async def fetch_and_send_chunk(
                 send_headers = {"Content-Type": "application/octet-stream"}
                 if expected_max_bytes and expected_max_bytes > 0:
                     send_headers["Content-Length"] = str(expected_max_bytes)
+                if extra_dest_headers:
+                    send_headers.update(extra_dest_headers)
                 return await client.put(
                     destination_url,
                     content=body_stream(),
@@ -1043,6 +1142,8 @@ async def fetch_and_send_chunk(
             # Sending Content-Length allows the server to preallocate and avoids chunked-transfer overhead
             if expected_max_bytes and expected_max_bytes > 0:
                 send_headers["Content-Length"] = str(expected_max_bytes)
+            if extra_dest_headers:
+                send_headers.update(extra_dest_headers)
             if auth_token:
                 send_headers["Authorization"] = f"Bearer {auth_token}"
             return await client.post(
@@ -1162,8 +1263,19 @@ def is_canary_destination(url: str) -> bool:
     return url.startswith(("null://", "canary://", "skip://"))
 
 
-def estimate_task_bytes(task: dict, execution_context: dict) -> int:
+def estimate_task_bytes(task: dict, transfer_plan: Optional[dict] = None) -> int:
     """Estimate how many bytes this task can hold in memory."""
+    if transfer_plan and transfer_plan.get("mode") == "flat":
+        try:
+            return max(1, int(transfer_plan.get("chunk_size") or task.get("chunk_size") or DEFAULT_CHUNK_SIZE_BYTES))
+        except (TypeError, ValueError):
+            return DEFAULT_CHUNK_SIZE_BYTES
+
+    execution_context = (
+        transfer_plan.get("execution_context", {})
+        if transfer_plan
+        else task.get("execution_context", {})
+    )
     chunk_indices = execution_context.get("chunk_indices") or [0]
 
     try:
@@ -1191,6 +1303,155 @@ def estimate_task_bytes(task: dict, execution_context: dict) -> int:
         pass
 
     return chunk_size * chunk_count
+
+
+async def execute_flat_transfer(
+    state: WorkerState,
+    task_id: str,
+    transfer_plan: dict,
+    task_message: dict,
+    deadline_us: int,
+) -> tuple:
+    """Execute a flat BeamCore offer using the pipelined fetch_and_send_chunk path."""
+    source_url = transfer_plan["source_url"]
+    destination_url = transfer_plan["dest_url"]
+    transfer_id = transfer_plan.get("transfer_id", "")
+    chunk_size = int(transfer_plan["chunk_size"])
+    range_start = int(transfer_plan["range_start"])
+    source_headers_offer = transfer_plan.get("source_headers") or {}
+    dest_headers_offer = transfer_plan.get("dest_headers") or {}
+    chunk_index = 0
+
+    chunk_hashes: dict = {}
+    if "chunk_hashes" in task_message and isinstance(task_message["chunk_hashes"], dict):
+        for k, v in task_message["chunk_hashes"].items():
+            chunk_hashes[int(k)] = v
+    elif "chunk_hash" in task_message and task_message["chunk_hash"]:
+        chunk_hashes[chunk_index] = task_message["chunk_hash"]
+
+    client = state.http_client
+    is_canary = is_canary_destination(destination_url)
+    computed_chunk_hash = ""
+    last_etag: Optional[str] = None
+    offer_id = task_message.get("offer_id") or task_id
+    hotkey = getattr(getattr(state.wallet, "hotkey", None), "ss58_address", "unknown")
+
+    await prewarm_for_transfer(state, transfer_plan, reason="task")
+
+    print(
+        f"[Worker] Transferring flat offer bytes={range_start}-{transfer_plan['range_end']} "
+        f"task={task_label(task_id)} offer={task_label(offer_id)} hotkey={hotkey[:16]}"
+    )
+
+    if deadline_us > 0:
+        now_us = time.time() * 1_000_000
+        remaining_us = deadline_us - now_us
+        if remaining_us <= 0:
+            return (
+                0,
+                False,
+                f"Deadline exceeded before chunk {chunk_index}",
+                "",
+                last_etag,
+            )
+
+    try:
+        chunk_started = time.perf_counter()
+        (
+            bytes_fetched,
+            computed_chunk_hash,
+            etag,
+            response_code,
+            fetch_ms,
+            send_ms,
+        ) = await fetch_and_send_chunk(
+            client,
+            source_url,
+            destination_url,
+            transfer_id,
+            chunk_index,
+            chunk_offset=range_start,
+            chunk_size=chunk_size,
+            total_size=chunk_size,
+            expected_max_bytes=chunk_size,
+            expected_chunk_hash=chunk_hashes.get(chunk_index),
+            task_id=task_id,
+            offer_id=offer_id,
+            is_canary=is_canary,
+            extra_fetch_headers=source_headers_offer or None,
+            extra_dest_headers=dest_headers_offer or None,
+        )
+
+        if is_canary:
+            print(f"[Worker] Chunk {chunk_index}: CANARY mode, skipping upload")
+        else:
+            if etag:
+                last_etag = etag
+
+            total_ms = (time.perf_counter() - chunk_started) * 1000
+            mbps = (bytes_fetched * 8 / 1_000_000) / (total_ms / 1000) if total_ms > 0 else 0
+            print(
+                f"[Worker] Chunk {chunk_index}: {bytes_fetched} bytes transferred "
+                f"task={task_label(task_id)} offer={task_label(offer_id)} "
+                f"fetch_ms={fetch_ms:.1f} send_ms={send_ms:.1f} "
+                f"total_ms={total_ms:.1f} mbps={mbps:.1f} response={response_code}"
+            )
+
+        if bytes_fetched != chunk_size:
+            return (
+                bytes_fetched,
+                False,
+                f"source range returned {bytes_fetched} bytes, expected {chunk_size}",
+                computed_chunk_hash,
+                last_etag,
+            )
+
+        if transfer_plan.get("etag_required") and not last_etag and not is_canary:
+            return (
+                bytes_fetched,
+                False,
+                "missing ETag from storage PUT response",
+                computed_chunk_hash or "",
+                last_etag,
+            )
+
+        print(f"[Worker] Transfer complete: {bytes_fetched} bytes")
+        return (bytes_fetched, True, None, computed_chunk_hash, last_etag)
+
+    except asyncio.TimeoutError as e:
+        detail = exception_detail(e)
+        print(
+            f"[Worker] Chunk {chunk_index} timeout "
+            f"task={task_label(task_id)} offer={task_label(offer_id)} error={detail}"
+        )
+        return (
+            0,
+            False,
+            f"Deadline exceeded at chunk {chunk_index}: {detail}",
+            "",
+            last_etag,
+        )
+    except httpx.HTTPStatusError as e:
+        detail = exception_detail(e)
+        print(
+            f"[Worker] Chunk {chunk_index} HTTP failure "
+            f"task={task_label(task_id)} offer={task_label(offer_id)} "
+            f"status={e.response.status_code} error={detail}"
+        )
+        return (
+            0,
+            False,
+            f"HTTP {e.response.status_code} at chunk {chunk_index}: {detail}",
+            "",
+            last_etag,
+        )
+    except Exception as e:
+        detail = exception_detail(e)
+        print(
+            f"[Worker] Chunk {chunk_index} failure "
+            f"task={task_label(task_id)} offer={task_label(offer_id)} error={detail}{http_status_detail(e)}"
+        )
+        return (0, False, f"Error at chunk {chunk_index}: {detail}", "", last_etag)
 
 
 async def ws_send_task_reject(
@@ -1300,7 +1561,9 @@ async def execute_transfer(
     offer_id = task_message.get("offer_id") or task_id
     hotkey = getattr(getattr(state.wallet, "hotkey", None), "ss58_address", "unknown")
 
-    await prewarm_for_transfer(state, execution_context, reason="task")
+    await prewarm_for_transfer(
+        state, {"mode": "legacy", "execution_context": execution_context}, reason="task"
+    )
 
     print(
         f"[Worker] Transferring {len(chunk_indices)} chunk(s) "
@@ -1516,7 +1779,6 @@ def get_ws_status_code(exc: Exception) -> Optional[int]:
 async def ws_send_stats_snapshot(websocket, state: WorkerState) -> bool:
     """Send a worker telemetry snapshot over WebSocket."""
     try:
-        bytes_delta = max(0, state.bytes_relayed - state.reported_bytes_relayed)
         hotkey = getattr(getattr(state.wallet, "hotkey", None), "ss58_address", None)
         msg = {
             "type": "stats_snapshot",
@@ -1525,10 +1787,7 @@ async def ws_send_stats_snapshot(websocket, state: WorkerState) -> bool:
         }
         if hotkey:
             msg["hotkey"] = hotkey
-        if bytes_delta > 0:
-            msg["bytes_relayed_delta"] = bytes_delta
         await ws_send_json(websocket, state, msg)
-        state.reported_bytes_relayed = state.bytes_relayed
         return True
     except Exception as e:
         print(f"[Worker] WS stats snapshot error: {e}")
@@ -1545,6 +1804,7 @@ async def ws_send_task_accept(
             "offer_id": offer_id or task_id,
             "task_id": task_id,
             "worker_id": state.worker_id,
+            "worker_version": WORKER_VERSION,
         }
         await ws_send_json(websocket, state, msg)
         return True
@@ -1568,20 +1828,14 @@ async def ws_send_task_result(
     error: str = None,
     offer_id: str = None,
 ) -> bool:
-    """Send fast task completion summary over WebSocket."""
+    """Send task_result over WebSocket (BeamCore derives bytes from task metadata)."""
     try:
         msg = {
-            "type": "task_result_summary",
+            "type": "task_result",
             "task_id": task_id,
             "offer_id": offer_id or task_id,
             "worker_id": state.worker_id,
             "success": success,
-            "bytes_transferred": bytes_transferred,
-            "bandwidth_mbps": bandwidth_mbps,
-            "start_time_us": start_time_us,
-            "end_time_us": end_time_us,
-            "latency_ms": duration_ms,
-            "duration_ms": int(duration_ms),
         }
         if chunk_hash:
             msg["chunk_hash"] = chunk_hash
@@ -1592,7 +1846,7 @@ async def ws_send_task_result(
         await ws_send_json(websocket, state, msg)
         return True
     except Exception as e:
-        print(f"[Worker] WS task_result_summary error: {e}")
+        print(f"[Worker] WS task_result error: {e}")
         return False
 
 
@@ -1611,7 +1865,7 @@ async def finalize_ws_task_result(
     error: str = None,
     offer_id: str = None,
 ) -> TaskSummaryAck:
-    """Send task_result_summary and wait for BeamCore ack (received / completed)."""
+    """Send task_result and wait for BeamCore ack (received / completed)."""
     result_key = offer_id or task_id
     empty = TaskSummaryAck()
 
@@ -1701,13 +1955,21 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
     offer_id = task.get("offer_id") or task_id
     task_key = offer_id or task_id
     deadline_us = task.get("deadline_us", 0)
-    execution_context = task.get("execution_context", {})
-    estimated_bytes = estimate_task_bytes(task, execution_context)
+    transfer_plan, validation_error = resolve_transfer_plan(task)
+    estimated_bytes = estimate_task_bytes(task, transfer_plan)
     reserved_capacity = False
 
     print(f"[Worker] [WS] Task: {task_label(task_id)} offer={task_label(offer_id)}...")
     if not task_id:
         print("[Worker] [WS] Skipping task: missing task_id")
+        return False
+    if validation_error or transfer_plan is None:
+        reason = f"invalid_offer:{validation_error or 'missing_transfer_endpoints'}"
+        await ws_send_task_reject(websocket, state, task_id, reason, offer_id=offer_id)
+        print(
+            f"[Worker] [WS] Rejected task {task_label(task_id)} offer={task_label(offer_id)}: "
+            f"{reason}"
+        )
         return False
 
     capacity_error = try_reserve_ws_capacity(state, task_key, estimated_bytes)
@@ -1726,12 +1988,6 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
     reserved_capacity = True
 
     try:
-        if not has_transfer_endpoints(execution_context):
-            print(
-                "[Worker] [WS] Skipping task: missing gateway_url/destination_url and no presigned URLs"
-            )
-            return False
-
         remaining_sec = remaining_deadline_seconds(deadline_us)
         if remaining_sec is not None and remaining_sec < 5:
             print(f"[Worker] [WS] Skipping task: deadline too close ({remaining_sec:.1f}s)")
@@ -1766,7 +2022,7 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
             state,
             task_id,
             task,
-            execution_context,
+            transfer_plan,
             deadline_us,
             log_prefix="[Worker] [WS]",
         )
@@ -1792,10 +2048,6 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
                 state,
                 task_id,
                 offer_id,
-                result.bytes_transferred,
-                result.bandwidth_mbps,
-                result.start_time_us,
-                result.end_time_us,
                 chunk_hash=result.chunk_hash,
             )
 
@@ -1891,7 +2143,7 @@ async def websocket_loop(state: WorkerState):
                                         f"reason={message.get('reason', 'unknown')}"
                                     )
 
-                            elif msg_type == "task_result_summary_ack":
+                            elif msg_type in ("task_result_ack", "task_result_summary_ack"):
                                 ack_task_id = message.get("task_id")
                                 ack_offer_id = message.get("offer_id") or ack_task_id
                                 received = bool(message.get("received", False))
@@ -1913,7 +2165,7 @@ async def websocket_loop(state: WorkerState):
                                         future.set_result(ack)
                                 if not received:
                                     print(
-                                        f"[Worker] [WS] Gateway rejected task_result_summary: "
+                                        f"[Worker] [WS] Gateway rejected task_result: "
                                         f"task={task_label(ack_task_id)} offer={task_label(ack_offer_id)}"
                                     )
 
