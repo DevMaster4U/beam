@@ -25,12 +25,25 @@ beam_require_unit() {
   fi
 }
 
-beam_python() {
-  local py="${BEAM_ROOT}/venv/bin/python"
-  if [[ ! -x "$py" ]]; then
-    py="python3"
+beam_resolve_venv() {
+  if [[ -x "${BEAM_ROOT}/venv/bin/python" ]]; then
+    printf '%s\n' "${BEAM_ROOT}/venv"
+    return 0
   fi
-  printf '%s' "$py"
+  if [[ -x "${BEAM_ROOT}/.venv/bin/python" ]]; then
+    printf '%s\n' "${BEAM_ROOT}/.venv"
+    return 0
+  fi
+  return 1
+}
+
+beam_python() {
+  local venv_root
+  if venv_root="$(beam_resolve_venv)"; then
+    printf '%s' "${venv_root}/bin/python"
+    return 0
+  fi
+  printf '%s' "python3"
 }
 
 beam_list_instances_from_dir() {
@@ -48,10 +61,6 @@ beam_list_worker_instances() {
 
 beam_list_orchestrator_instances() {
   beam_list_instances_from_dir "${BEAM_ROOT}/config/orchestrators"
-}
-
-beam_list_gateway_instances() {
-  beam_list_instances_from_dir "${BEAM_ROOT}/config/gateways"
 }
 
 beam_sync_target() {
@@ -82,8 +91,16 @@ EOF
 
   beam_systemctl daemon-reload
   beam_systemctl enable "$target_name"
+}
+
+beam_enable_service_instances() {
+  local unit_prefix="$1"
+  shift
+  local instances=("$@")
+  local instance
 
   for instance in "${instances[@]}"; do
+    [[ -z "$instance" ]] && continue
     beam_systemctl enable "${unit_prefix}@${instance}.service"
   done
 }
@@ -114,17 +131,45 @@ beam_sync_orchestrators() {
   beam_sync_target "beam-orchestrators.target" "beam-orchestrator" "${instances[@]}"
 }
 
-beam_sync_gateways() {
-  local instances=()
-  local instance
+beam_read_env_value() {
+  local env_file="$1"
+  local key="$2"
+  grep -E "^${key}=" "$env_file" | tail -n1 | cut -d= -f2- || true
+}
 
-  mapfile -t instances < <(beam_list_gateway_instances)
-  if [[ "${#instances[@]}" -eq 0 ]]; then
-    echo "No gateway env files in ${BEAM_ROOT}/config/gateways/*.env" >&2
-    return 1
-  fi
+beam_validate_orchestrator_configs() {
+  local config_dir="${BEAM_ROOT}/config/orchestrators"
+  local env_file
+  declare -A seen_ports=()
+  declare -A seen_hotkeys=()
+  local port hotkey wallet_name instance
 
-  beam_sync_target "beam-gateways.target" "beam-worker-gateway" "${instances[@]}"
+  for env_file in "${config_dir}/"*.env; do
+    [[ -f "$env_file" ]] || continue
+    instance="$(basename "$env_file" .env)"
+    port="$(beam_read_env_value "$env_file" "API_PORT")"
+    wallet_name="$(beam_read_env_value "$env_file" "WALLET_NAME")"
+    hotkey="$(beam_read_env_value "$env_file" "WALLET_HOTKEY")"
+
+    if [[ -z "$port" ]]; then
+      port="9000"
+    fi
+
+    if [[ -n "${seen_ports[$port]:-}" ]]; then
+      echo "Duplicate API_PORT=${port} in ${instance}.env and ${seen_ports[$port]}.env" >&2
+      exit 1
+    fi
+    seen_ports[$port]="$instance"
+
+    if [[ -n "$wallet_name" && -n "$hotkey" ]]; then
+      local wallet_key="${wallet_name}/${hotkey}"
+      if [[ -n "${seen_hotkeys[$wallet_key]:-}" ]]; then
+        echo "Duplicate wallet ${wallet_key} in ${instance}.env and ${seen_hotkeys[$wallet_key]}.env" >&2
+        exit 1
+      fi
+      seen_hotkeys[$wallet_key]="$instance"
+    fi
+  done
 }
 
 beam_ensure_worker_instance() {
@@ -139,6 +184,7 @@ beam_ensure_worker_instance() {
 
   beam_require_unit "beam-worker@.service"
   beam_sync_workers
+  beam_systemctl enable "beam-worker@${instance}.service"
 }
 
 beam_ensure_orchestrator_instance() {
@@ -152,19 +198,7 @@ beam_ensure_orchestrator_instance() {
   fi
 
   beam_require_unit "beam-orchestrator@.service"
+  beam_validate_orchestrator_configs
   beam_sync_orchestrators
-}
-
-beam_ensure_gateway_instance() {
-  local instance="$1"
-  local env_file="${BEAM_ROOT}/config/gateways/${instance}.env"
-
-  if [[ ! -f "$env_file" ]]; then
-    echo "Missing env file: ${env_file}" >&2
-    echo "Copy config/gateways/${instance}.env.example and customize it." >&2
-    exit 1
-  fi
-
-  beam_require_unit "beam-worker-gateway@.service"
-  beam_sync_gateways
+  beam_systemctl enable "beam-orchestrator@${instance}.service"
 }

@@ -76,16 +76,12 @@ This repository is **off-chain node software** (orchestrator, worker, validator)
 ```
 Clients / Validators                Orchestrators
          │ HTTP                           │ WebSocket
-  ┌──────▼────────┐                 ┌─────▼───────┐
-  │  core-server  │  :8000          │orch-gateway │  :8002
-  │ API + Control │◄─WS relay──────►│ Orch WS edge│
-  └──────┬────────┘                 └─────────────┘
-         │ HTTP (internal)
-  ┌──────▼────────┐
-  │worker-gateway │  :8001  Worker WebSocket edge
-  └──────┬────────┘
-         │ WebSocket
-      Workers
+  ┌──────▼────────┐                 ┌─────▼───────────────────┐
+  │  core-server  │  :8000          │ orchestrator + worker   │
+  │ API + Control │◄─WS relay──────►│ gateway (/ws/{worker})  │
+  └───────────────┘                 └───────────┬─────────────┘
+                                                │ WebSocket
+                                             Workers
 
    ops-scheduler   — background maintenance (no execution ownership)
 ```
@@ -94,7 +90,7 @@ Clients / Validators                Orchestrators
 | ----- | ---- |
 | **core-server** | Public HTTP API, control plane, transfer and task lifecycle (your `CORE_SERVER_URL` / `BEAM_VALIDATOR_*` URLs point here) |
 | **orch-gateway** | Orchestrator WebSocket edge; upstream relay to core-server (`ORCH_GATEWAY_URL`) |
-| **worker-gateway** | Worker WebSocket edge; task offers and sessions (`WORKER_GATEWAY_URL` — **worker-gateway origin**, not core-server) |
+| **orchestrator worker gateway** | In-process WebSocket at `/ws/{worker_id}` on orchestrator `API_PORT` (`ORCHESTRATOR_WORKER_GATEWAY_URL` / `WORKER_GATEWAY_URL`) |
 | **ops-scheduler** | PRISM refresh, payment verification, cleanup jobs |
 
 **Invariants:** PostgreSQL holds authoritative execution state; control-plane loops advance task lifecycle; **object bytes do not flow through** BeamCore (workers read/write storage directly).
@@ -107,11 +103,11 @@ Clients / Validators                Orchestrators
 
 1. **Clients** create transfers via BeamCore HTTP API or SDK (core-server).
 2. **Orchestrators** register over HTTP and keep a **persistent orch-gateway WebSocket** for assignments and control messages — not HTTP polling.
-3. **Workers** register over HTTP, then receive chunk **offers** over **worker-gateway** WebSockets (Beam-hosted gateway and/or an orchestrator-owned gateway, depending on configuration).
+3. **Workers** register over HTTP, then receive chunk **offers** over the orchestrator's in-process worker gateway WebSocket (`/ws/{worker_id}` on `API_PORT`).
 4. **Workers** move data directly between source and destination connectors; they submit **payment / PoB evidence** to BeamCore HTTP.
 5. **Validators** read scores and PRISM inputs from BeamCore HTTP and set weights on Bittensor.
 
-> **Note:** `WORKER_GATEWAY_URL` / worker env must target the **worker-gateway** base URL. BeamCore HTTP (`CORE_SERVER_URL`) is orthogonal (registration, REST, evidence POSTs).
+> **Note:** `WORKER_GATEWAY_URL` must target the orchestrator HTTP origin that hosts `/ws/{worker_id}`. BeamCore HTTP (`CORE_SERVER_URL`) is orthogonal (registration, REST, evidence POSTs).
 
 For operator-level connection maps and env naming, use the BeamCore operator documentation published for your target network.
 
@@ -131,7 +127,7 @@ This repository contains the code for running orchestrators, workers, and valida
 
 - [Orchestrator Guide](docs/orchestrator.md) — Run a miner node that coordinates bandwidth work
 - [Worker Guide](docs/worker.md) — Run a worker node that executes transfer tasks
-- [Worker Gateway Guide](docs/worker-gateway.md) — Option 1: orchestrator-direct with a dedicated worker gateway
+- [Worker Gateway Guide](docs/worker-gateway.md) — In-process worker gateway on the orchestrator
 - [Validator Guide](docs/validator.md) — Run a validator that verifies proofs and sets weights
 
 ### Network Information

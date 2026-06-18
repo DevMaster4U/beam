@@ -43,7 +43,7 @@ class TaskScheduler:
         """No-op under BeamCore.
 
         BeamCore creates tasks server-side from the orchestrator's WS
-        ``chunk_assignments`` message (see orchestrator-ws.ts and
+        BeamCore task offer batch message and
         queueTransferTaskAssignments). Orchestrators no longer write task
         records via HTTP. Kept as a no-op so existing call sites remain
         intact.

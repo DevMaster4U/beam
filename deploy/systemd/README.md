@@ -1,6 +1,6 @@
 # BEAM systemd units
 
-Production services for orchestrator, worker-gateway, and workers.
+Production services for orchestrator and workers.
 
 All commands run from the **repo root**.
 
@@ -15,7 +15,6 @@ Each service type uses the same multi-instance pattern: one env file per instanc
 ./scripts/install-systemd.sh --enable
 
 # Enable instances after creating env files
-./scripts/install-systemd.sh --enable-gateways
 ./scripts/install-systemd.sh --enable-orchestrators
 ./scripts/install-systemd.sh --enable-workers
 ```
@@ -26,7 +25,6 @@ Enable only specific instances:
 
 ```bash
 ./scripts/install-systemd.sh --enable-orchestrators --instances orch1,orch2
-./scripts/install-systemd.sh --enable-gateways --instances gateway1,gateway2
 ./scripts/install-systemd.sh --enable-workers --instances worker1,worker2
 ```
 
@@ -38,6 +36,8 @@ Enable only specific instances:
 | -------- | ------------ | --- |
 | `config/orchestrators/orch1.env` | `beam-orchestrator@orch1.service` | `logs/orchestrators/orch1.log` |
 | `config/orchestrators/orch2.env` | `beam-orchestrator@orch2.service` | `logs/orchestrators/orch2.log` |
+
+Each orchestrator hosts the worker WebSocket gateway at `/ws/{worker_id}` on `API_PORT`. Set `ORCHESTRATOR_WORKER_GATEWAY_URL` and `WORKER_GATEWAY_WORKER_SECRET` in the orchestrator env; workers use matching `WORKER_GATEWAY_URL` and secret.
 
 ### Install (first time)
 
@@ -87,65 +87,6 @@ sudo systemctl stop beam-orchestrator@orch1
 sudo systemctl status beam-orchestrator@orch1
 journalctl -u beam-orchestrator@orch1 -f
 ```
-
----
-
-## Gateways
-
-| Env file | Systemd unit | Log |
-| -------- | ------------ | --- |
-| `config/gateways/gateway1.env` | `beam-worker-gateway@gateway1.service` | `logs/gateways/gateway1.log` |
-| `config/gateways/gateway2.env` | `beam-worker-gateway@gateway2.service` | `logs/gateways/gateway2.log` |
-
-### Install (first time)
-
-```bash
-cp config/gateways/gateway1.env.example config/gateways/gateway1.env
-# edit gateway1.env — unique GATEWAY_PORT and secrets per instance
-
-./scripts/install-systemd.sh --enable-gateways
-./scripts/run-gateways.sh start
-```
-
-### All gateways
-
-| Action | Command |
-| ------ | ------- |
-| Start all | `./scripts/run-gateways.sh start` |
-| Restart all | `./scripts/run-gateways.sh restart` |
-| Stop all | `./scripts/run-gateways.sh stop` |
-| Status all | `./scripts/run-gateways.sh status` |
-
-Via systemd:
-
-```bash
-sudo systemctl start beam-gateways.target
-sudo systemctl restart beam-gateways.target
-sudo systemctl stop beam-gateways.target
-sudo systemctl status beam-gateways.target
-```
-
-### One gateway
-
-| Action | Command |
-| ------ | ------- |
-| Start | `./scripts/run-worker-gateway.sh gateway1` |
-| Restart | `./scripts/run-worker-gateway.sh gateway1 --restart` |
-| Stop | `./scripts/run-worker-gateway.sh gateway1 --stop` |
-| Status | `./scripts/run-worker-gateway.sh gateway1 --status` |
-| Logs | `tail -f logs/gateways/gateway1.log` |
-| Debug (foreground) | `./scripts/run-worker-gateway.sh gateway1 --foreground` |
-
-Via systemd:
-
-```bash
-sudo systemctl start beam-worker-gateway@gateway1
-sudo systemctl restart beam-worker-gateway@gateway1
-sudo systemctl stop beam-worker-gateway@gateway1
-sudo systemctl status beam-worker-gateway@gateway1
-```
-
-Required per gateway env: `GATEWAY_CONTROL_SECRET` and `GATEWAY_WORKER_SECRET` (or `WORKER_GATEWAY_*` variants).
 
 ---
 
@@ -225,9 +166,6 @@ cp config/workers/worker1.env.example config/workers/worker3.env
 ```bash
 ./scripts/install-systemd.sh --enable
 
-./scripts/install-systemd.sh --enable-gateways
-./scripts/run-gateways.sh start
-
 ./scripts/install-systemd.sh --enable-orchestrators
 ./scripts/run-orchestrators.sh start
 
@@ -244,26 +182,21 @@ cp config/workers/worker1.env.example config/workers/worker3.env
 ./scripts/install-systemd.sh --enable
 
 # Enable + start (after creating env files)
-./scripts/install-systemd.sh --enable-gateways && ./scripts/run-gateways.sh start
 ./scripts/install-systemd.sh --enable-orchestrators && ./scripts/run-orchestrators.sh start
 ./scripts/install-systemd.sh --enable-workers && ./scripts/run-workers.sh start
 
 # Restart
 ./scripts/run-orchestrators.sh restart
-./scripts/run-gateways.sh restart
 ./scripts/run-workers.sh restart
 ./scripts/run-orchestrator.sh orch1 --restart
-./scripts/run-worker-gateway.sh gateway1 --restart
 ./scripts/run-worker.sh worker1 --restart
 
 # Stop
 ./scripts/run-orchestrators.sh stop
-./scripts/run-gateways.sh stop
 ./scripts/run-workers.sh stop
 
 # Status
 ./scripts/run-orchestrators.sh status
-./scripts/run-gateways.sh status
 ./scripts/run-workers.sh status
 ```
 
@@ -276,7 +209,6 @@ Use `--foreground` on any per-instance run script to bypass systemd for debuggin
 | Service | Log path |
 | ------- | -------- |
 | Orchestrator `@instance` | `logs/orchestrators/<instance>.log` |
-| Worker gateway `@instance` | `logs/gateways/<instance>.log` |
 | Worker `@instance` | `logs/workers/<instance>.log` |
 
 Startup errors for orchestrators also appear in the journal:

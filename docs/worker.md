@@ -7,7 +7,7 @@ Run a worker on BEAM mainnet.
 | Service | Environment variable | URL |
 | ------- | -------------------- | --- |
 | Core server | `CORE_SERVER_URL` | `https://beamcore.b1m.ai` |
-| Worker gateway | `WORKER_GATEWAY_URL` | `https://public-worker-gateway.b1m.ai` |
+| Worker gateway | `WORKER_GATEWAY_URL` | Your orchestrator HTTP origin (in-process gateway on `API_PORT`) |
 
 ## Requirements
 
@@ -40,7 +40,8 @@ Create or export the worker environment before starting the process:
 
 ```bash
 CORE_SERVER_URL=https://beamcore.b1m.ai
-WORKER_GATEWAY_URL=https://public-worker-gateway.b1m.ai
+WORKER_GATEWAY_URL=https://your-orchestrator.example.com
+WORKER_GATEWAY_WORKER_SECRET=your-long-random-worker-secret
 SUBTENSOR_NETWORK=finney
 NETUID=105
 ```
@@ -65,7 +66,7 @@ Each worker needs a **unique registered hotkey** and its own resource limits. Sh
 cp config/workers/worker1.env.example config/workers/worker1.env
 cp config/workers/worker2.env.example config/workers/worker2.env
 
-# 2. Enable workers (after orchestrator/gateway: ./scripts/install-systemd.sh --enable-orchestrators / --enable-gateways)
+# 2. Enable workers (after orchestrator: ./scripts/install-systemd.sh --enable-orchestrators)
 ./scripts/install-systemd.sh --enable-workers
 ./scripts/run-workers.sh start
 
@@ -91,7 +92,7 @@ Layout:
 
 | Path | Purpose |
 | ---- | ------- |
-| `.env` | Shared: `CORE_SERVER_URL`, `WORKER_GATEWAY_URL`, `SUBTENSOR_NETWORK` |
+| `.env` | Shared: `CORE_SERVER_URL`, `SUBTENSOR_NETWORK` |
 | `config/workers/worker1.env` | Instance 1: wallet hotkey, concurrency limits |
 | `config/workers/worker2.env` | Instance 2: unique hotkey and limits |
 | `logs/workers/worker1.log` | Instance 1 log (`beam-worker@worker1.service`) |
@@ -195,6 +196,7 @@ WORKER_PREWARM_MAX_ORIGINS=32
 ## Troubleshooting
 
 - Verify the hotkey is registered on subnet 105.
-- Verify `WORKER_GATEWAY_URL=https://public-worker-gateway.b1m.ai`.
+- Verify `WORKER_GATEWAY_URL` matches the orchestrator's `ORCHESTRATOR_WORKER_GATEWAY_URL`.
+- Verify `WORKER_GATEWAY_WORKER_SECRET` matches the orchestrator when using secret auth.
 - Verify `CORE_SERVER_URL=https://beamcore.b1m.ai`.
 - If the worker starts but receives no tasks, keep it connected and confirm the gateway URL is reachable from the host.

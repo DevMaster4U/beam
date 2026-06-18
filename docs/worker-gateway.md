@@ -1,108 +1,41 @@
-# Option 1 vs Option 2 — Worker Gateway Mode
+# In-process worker gateway
 
-Control the orchestrator worker-pool topology with **`WORKER_GATEWAY_MODE`**:
+The orchestrator hosts the worker WebSocket gateway at `/ws/{worker_id}` on `API_PORT`.
+Workers connect to the orchestrator directly; no separate gateway process is required.
 
-| Mode | Value | Option | Worker pool | Task path |
-|------|-------|--------|-------------|-----------|
-| **Public** (default) | `public` | Option 2 | `list_public_workers` from BeamCore | BeamCore public gateway |
-| **Dedicated** | `dedicated` | Option 1 | Local worker-gateway sessions | Orchestrator relay via control WS |
-
-`WORKER_GATEWAY_PUBLIC_URL` alone does **not** switch modes. It is only used when `WORKER_GATEWAY_MODE=dedicated`.
-
----
-
-## Option 2 — Public gateway (default)
+## Orchestrator
 
 ```bash
-# neurons/orchestrator/.env
-WORKER_GATEWAY_MODE=public   # or omit (default)
+# config/orchestrators/orch1.env
+ORCHESTRATOR_WORKER_GATEWAY_URL=https://your-orchestrator.example.com
+WORKER_GATEWAY_WORKER_SECRET=your-long-random-worker-secret
+API_PORT=9000
+READY=true
 ORCH_GATEWAY_URL=https://orch-gateway.b1m.ai
 CORE_SERVER_URL=https://beamcore.b1m.ai
-READY=true
 ```
 
-```bash
-# worker
-WORKER_GATEWAY_URL=https://public-worker-gateway.b1m.ai
-CORE_SERVER_URL=https://beamcore.b1m.ai
-```
-
-No worker-gateway process required.
-
----
-
-## Option 1 — Dedicated worker-gateway
-
-### 1. Start worker-gateway
+## Worker
 
 ```bash
-cd worker-gateway
-export GATEWAY_CONTROL_SECRET=your-long-random-control-secret
-export GATEWAY_WORKER_SECRET=your-long-random-worker-secret
-python main.py
-```
-
-Or from the repo root (systemd, multi-instance):
-
-```bash
-cp config/gateways/gateway1.env.example config/gateways/gateway1.env
-./scripts/install-systemd.sh --enable
-./scripts/install-systemd.sh --enable-gateways
-./scripts/run-worker-gateway.sh gateway1
-./scripts/run-worker-gateway.sh gateway1 --status
-```
-
-### 2. Orchestrator
-
-```bash
-WORKER_GATEWAY_MODE=dedicated
-WORKER_GATEWAY_PUBLIC_URL=https://gateway.example.com
-WORKER_GATEWAY_CONTROL_URL=ws://localhost:8001/control
-WORKER_GATEWAY_CONTROL_SECRET=your-long-random-secret
-
-ORCH_GATEWAY_URL=https://orch-gateway.b1m.ai
-CORE_SERVER_URL=https://beamcore.b1m.ai
-READY=true
-```
-
-### 3. Worker
-
-```bash
-WORKER_GATEWAY_URL=https://gateway.example.com
+# config/workers/worker1.env
+WORKER_GATEWAY_URL=https://your-orchestrator.example.com
 WORKER_GATEWAY_WORKER_SECRET=your-long-random-worker-secret
 WORKER_REQUIRED_PAYMENT=false
 CORE_SERVER_URL=https://beamcore.b1m.ai
 ```
 
-Workers still register and submit PoB to BeamCore HTTP.
+`WORKER_GATEWAY_URL` must match `ORCHESTRATOR_WORKER_GATEWAY_URL`.
 
----
+Workers authenticate with both BeamCore `api_key` and `worker_secret` when configured.
 
-## Protocol reference
+The orchestrator opens a control WebSocket to its own in-process gateway using `control_secret` (defaults to `ws://127.0.0.1:<API_PORT>/ws/<hotkey>?...`).
 
-Shared message types and field normalization live in `neurons/shared/gateway_protocol.py`, aligned with:
+## Multi-instance
 
-- [Workers guide](https://data.b1m.ai/guide/workers)
-- [Orchestrators — dedicated gateway](https://data.b1m.ai/guide/orchestrators#running-your-own-worker-gateway)
-- [BeamCore assignment engine](https://github.com/Beam-Network/beam-core-public)
+```bash
+./scripts/run-orchestrator.sh orch1
+./scripts/run-worker.sh worker1
+```
 
-Key behaviors by mode:
-
-| Message | Option 2 (public) | Option 1 (dedicated) |
-|---------|-------------------|----------------------|
-| `transfer_assigned` | `list_public_workers` → `chunk_assignments` | Gateway `list_workers` → `chunk_assignments` |
-| `worker_task_offer` / `worker_task_offer_batch` | Ignored (public gateway delivers) | Relayed to worker-gateway → worker |
-| `task_accept` / `task_reject` | N/A (public gateway relays) | Worker → gateway → orchestrator → BeamCore |
-| `task_result` | BeamCore push to orchestrator | Worker → gateway → orchestrator → BeamCore |
-| WS `register` `gateway_url` | Not sent | `WORKER_GATEWAY_PUBLIC_URL` |
-
----
-
-## Validation rules
-
-Startup fails fast when:
-
-- `WORKER_GATEWAY_MODE=dedicated` but any of `WORKER_GATEWAY_PUBLIC_URL`, `WORKER_GATEWAY_CONTROL_URL`, or `WORKER_GATEWAY_CONTROL_SECRET` is missing
-- `WORKER_GATEWAY_MODE=public` but control URL/secret are set (misconfiguration)
-
-See also [worker-gateway/README.md](../worker-gateway/README.md).
+See also [Orchestrator guide](orchestrator.md) and [Worker guide](worker.md).

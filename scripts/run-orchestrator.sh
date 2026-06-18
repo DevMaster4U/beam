@@ -136,6 +136,8 @@ if ! grep -qE '^WALLET_HOTKEY=' "$ENV_FILE"; then
   exit 1
 fi
 
+beam_validate_orchestrator_configs
+
 PY="$(beam_python)"
 CMD=(
   "$PY" main.py

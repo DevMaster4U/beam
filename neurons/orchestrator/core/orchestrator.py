@@ -54,18 +54,12 @@ from typing import Any, Dict, List, Optional, Set
 
 import bittensor as bt
 
-from neurons.shared.gateway_protocol import (
-    parse_task_result_ack,
-    parse_worker_response_ack,
-)
-
 from .config import OrchestratorSettings, get_settings
 from .epoch_manager import EpochManager
-from .proof_aggregator import ProofAggregator
 from .reward_manager import RewardManager
 from .task_scheduler import TaskScheduler
+from .worker_gateway import WorkerGateway
 from .worker_manager import WorkerManager
-from notifications.slack import SlackNotifier
 
 # BlindWorkerManager removed
 # GatewayManager removed
@@ -277,42 +271,6 @@ class PendingOffer:
 
 
 @dataclass
-class BandwidthProof:
-    """Proof of bandwidth work completed by a worker."""
-
-    task_id: str
-    worker_id: str
-    worker_hotkey: str
-
-    # Timing (microseconds)
-    start_time_us: int
-    end_time_us: int
-
-    # Metrics
-    bytes_relayed: int
-    bandwidth_mbps: float
-
-    # Verification
-    chunk_hash: str
-    canary_proof: str
-
-    # Signatures
-    worker_signature: str = ""
-    orchestrator_signature: str = ""
-    worker_coldkey: str = ""
-
-    # Metadata
-    source_region: str = ""
-    dest_region: str = ""
-    timestamp: datetime = field(default_factory=datetime.utcnow)
-
-    @property
-    def duration_ms(self) -> float:
-        """Task duration in milliseconds."""
-        return (self.end_time_us - self.start_time_us) / 1000
-
-
-@dataclass
 class EpochSummary:
     """Aggregated work summary for a validation epoch."""
 
@@ -368,12 +326,12 @@ class Orchestrator:
         self._worker_mgr = WorkerManager(
             self.settings,
             lambda: self.subnet_core_client,
-            lambda: self.gateway_control_client,
+            worker_gateway_ref=lambda: self.worker_gateway,
+            gateway_control_client_ref=lambda: self.gateway_control_client,
         )
         self._task_sched = TaskScheduler(
             self.settings, self._worker_mgr, get_subnet_core_client=lambda: self.subnet_core_client
         )
-        self._proof_agg = ProofAggregator(self.settings)
         self._reward_mgr = RewardManager(self.settings)
         self._epoch_mgr = EpochManager(self.settings)
         # BlindWorkerManager removed
@@ -392,10 +350,6 @@ class Orchestrator:
         self.pending_offers = self._task_sched.pending_offers
         self._offer_lock = self._task_sched._offer_lock
 
-        # Proof state (from ProofAggregator)
-        self.pending_proofs = self._proof_agg.pending_proofs
-        self.epoch_proofs = self._proof_agg.epoch_proofs
-
         # Epoch tracking
         self.current_epoch: int = 0
         self.epoch_start_time: datetime = datetime.utcnow()
@@ -412,10 +366,14 @@ class Orchestrator:
 
         # SubnetCoreClient for API-based data operations
         self.subnet_core_client: Optional[Any] = None
+
+        # Loopback client for in-process worker gateway control channel
         self.gateway_control_client: Optional[Any] = None
-        self._slack_notifier = SlackNotifier(self.settings.slack_notification_url)
-        self._pending_worker_connect_slack: dict[str, dict[str, Any]] = {}
-        self._worker_connect_slack_delay_seconds = 5.0
+
+        # In-process worker gateway (workers dial /ws/{worker_id})
+        self.worker_gateway: WorkerGateway = WorkerGateway(
+            on_ready_change=self._on_worker_gateway_ready_change,
+        )
 
         # Async control
         self._running: bool = False
@@ -449,6 +407,18 @@ class Orchestrator:
     def total_rewards_distributed(self, value: float):
         self._reward_mgr.total_rewards_distributed = value
 
+    def _on_worker_gateway_ready_change(self, ready: bool) -> None:
+        """Toggle orchestrator readiness when the first/last worker connects."""
+        if self.subnet_core_client is None:
+            return
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.create_task(self.subnet_core_client.set_ready(ready))
+        except Exception as exc:
+            logger.warning("ready-change signal failed: %s", exc)
+
     # =========================================================================
     # Lifecycle
     # =========================================================================
@@ -477,15 +447,19 @@ class Orchestrator:
             self.hotkey = self.wallet.hotkey.ss58_address
             logger.info(f"Orchestrator wallet: {self.hotkey}")
 
-            self._initialize_subtensor_and_metagraph_with_retry()
+            if self.settings.uid is not None:
+                # UID pre-configured via ORCHESTRATOR_UID — skip slow subtensor init
+                self.our_uid = self.settings.uid
+                self.subtensor = None
+                self.metagraph = None
+                logger.info("Using configured orchestrator UID %s — skipping subtensor init", self.our_uid)
+            else:
+                self._initialize_subtensor_and_metagraph_with_retry()
 
-            # Find our UID in the metagraph
-            self._find_our_uid()
+                # Find our UID in the metagraph
+                self._find_our_uid()
 
         # Initialize SubnetCoreClient for API-based data operations
-        await self._slack_notifier.start()
-        if self._slack_notifier.enabled:
-            logger.info("Slack notifications enabled")
         await self._init_subnet_core_client()
 
         # Skip chain-dependent initialization in local mode
@@ -565,15 +539,7 @@ class Orchestrator:
             asyncio.create_task(self._metagraph_sync_loop()),
             asyncio.create_task(self._worker_mgr.worker_health_loop(running)),
             asyncio.create_task(self._worker_mgr.worker_sync_loop(running, interval_seconds=60)),
-            asyncio.create_task(
-                self._proof_agg.proof_aggregation_loop(
-                    running,
-                    subnet_core_client_ref=lambda: self.subnet_core_client,
-                )
-            ),
-            # Removed: validator_report_loop - BeamCore handles PoB centrally, validators read from BeamCore
             asyncio.create_task(self._epoch_management_loop()),
-            # Removed: _stale_task_reassignment_loop - deprecated endpoint replaced by WebSocket push
         ]
         logger.info("Worker sync loop started (syncs from SubnetCore every 60s)")
 
@@ -590,11 +556,6 @@ class Orchestrator:
             except asyncio.CancelledError:
                 pass
 
-        if self.gateway_control_client:
-            await self.gateway_control_client.stop()
-            self.gateway_control_client = None
-            logger.info("GatewayControlClient closed")
-
         if SUBNET_CORE_CLIENT_AVAILABLE and self.subnet_core_client:
             # Stop HTTP polling
             if hasattr(self.subnet_core_client, "stop_polling"):
@@ -602,7 +563,9 @@ class Orchestrator:
             await close_subnet_core_client()
             logger.info("SubnetCoreClient closed")
 
-        await self._slack_notifier.stop()
+        if self.gateway_control_client:
+            await self.gateway_control_client.stop()
+            self.gateway_control_client = None
 
         logger.info("Orchestrator stopped")
 
@@ -622,13 +585,6 @@ class Orchestrator:
 
     async def deregister_worker(self, worker_id):
         return await self._worker_mgr.deregister_worker(worker_id)
-
-    async def apply_worker_stats_snapshot(
-        self, worker_id, bandwidth_mbps, active_tasks, bytes_relayed=0
-    ):
-        return await self._worker_mgr.apply_worker_stats_snapshot(
-            worker_id, bandwidth_mbps, active_tasks, bytes_relayed
-        )
 
     def get_worker(self, worker_id):
         return self._worker_mgr.get_worker(worker_id)
@@ -774,226 +730,6 @@ class Orchestrator:
 
     async def _notify_offer_result(self, offer_id, winner_id, status):
         return await self._task_sched._notify_offer_result(offer_id, winner_id, status)
-
-    # =========================================================================
-    # Cross-cutting: Task Completion & Relay Results
-    # =========================================================================
-
-    async def complete_task(
-        self,
-        task_id: str,
-        bytes_relayed: int,
-        bandwidth_mbps: float,
-        start_time_us: int,
-        end_time_us: int,
-        canary_proof: str,
-        worker_signature: str,
-    ) -> Optional[BandwidthProof]:
-        """Record task completion and generate proof."""
-        logger.info(f"complete_task called: task_id={task_id[:20]}..., bytes={bytes_relayed}")
-        task = self.active_tasks.get(task_id)
-        if not task:
-            logger.warning(f"Unknown task: {task_id[:16]}...")
-            return None
-
-        worker = self.workers.get(task.worker_id)
-        worker_hotkey = None
-        worker_region = ""
-        logger.info(
-            f"complete_task: worker_id={task.worker_id}, in_memory={worker is not None}, client={self.subnet_core_client is not None}"
-        )
-        if worker:
-            worker_hotkey = worker.hotkey
-            worker_region = getattr(worker, "region", "") or task.source_region or ""
-            logger.info(f"complete_task: using in-memory worker hotkey={worker_hotkey[:16]}...")
-        elif self.subnet_core_client:
-            # Fall back to database lookup
-            try:
-                logger.info(f"complete_task: looking up worker {task.worker_id} from SubnetCore...")
-                worker_data = await self.subnet_core_client.get_worker(task.worker_id)
-                worker_hotkey = worker_data.get("hotkey", "")
-                worker_region = worker_data.get("region", "") or task.source_region or ""
-                logger.info(
-                    f"complete_task: got worker_hotkey={worker_hotkey[:16] if worker_hotkey else 'None'}..."
-                )
-            except Exception as e:
-                logger.warning(f"Worker lookup failed for task {task_id[:16]}...: {e}")
-
-        if not worker_hotkey:
-            logger.warning(f"Worker not found for task: {task_id[:16]}... (no hotkey)")
-            return None
-
-        # Update task
-        task.status = "completed"
-        task.completed_at = time.time()
-        task.bytes_relayed = bytes_relayed
-        task.bandwidth_mbps = bandwidth_mbps
-        task.latency_ms = (end_time_us - start_time_us) / 1000
-
-        # Update worker stats (only if worker is in memory)
-        if worker:
-            worker.active_tasks = max(0, worker.active_tasks - 1)
-            worker.successful_tasks += 1
-            worker.bytes_relayed_total += bytes_relayed
-            worker.bytes_relayed_epoch += bytes_relayed
-            worker.update_bandwidth_ema(bandwidth_mbps)
-            worker.update_success_rate()
-            worker.trust_score = min(1.0, worker.trust_score + 0.001)
-
-        # Move to completed
-        del self.active_tasks[task_id]
-        self.completed_tasks[task_id] = task
-
-        # Update global stats
-        self.total_bytes_relayed += bytes_relayed
-        self.total_tasks_completed += 1
-
-        # Generate proof
-        proof = BandwidthProof(
-            task_id=task_id,
-            worker_id=task.worker_id,
-            worker_hotkey=worker_hotkey,
-            start_time_us=start_time_us,
-            end_time_us=end_time_us,
-            bytes_relayed=bytes_relayed,
-            bandwidth_mbps=bandwidth_mbps,
-            chunk_hash=task.chunk_hash,
-            canary_proof=canary_proof,
-            worker_signature=worker_signature,
-            source_region=task.source_region or worker_region,
-            dest_region=task.dest_region or worker_region,
-        )
-
-        proof.orchestrator_signature = self._sign_proof(proof)
-
-        # BeamCore manages task lifecycle server-side: tasks are queued
-        # from WS chunk_assignments and completion is reflected from worker
-        # task_result_summary pushes (see task-lifecycle.ts). No HTTP write needed.
-
-        # Add to aggregation queue
-        self.pending_proofs.append(proof)
-        self.epoch_proofs[self.current_epoch].append(proof)
-
-        # Persist proof
-        await self._proof_agg.persist_bandwidth_proof(
-            proof, self.current_epoch, self.subnet_core_client
-        )
-
-        # NOTE: Worker ALPHA payments are intentionally NOT triggered here.
-        # This orchestrator no longer pays workers; it only records emission
-        # share / bandwidth stats and publishes PoB. See plan
-        # `remove_orch_payment_machinery_30534c30`.
-
-        logger.info(
-            f"Task {task_id[:16]}... completed: "
-            f"{bytes_relayed} bytes @ {bandwidth_mbps:.2f} Mbps"
-        )
-        return proof
-
-    async def record_relay_result(
-        self,
-        worker_id: str,
-        task_id: str,
-        success: bool,
-        bytes_relayed: int,
-        bandwidth_mbps: float,
-        chunks_relayed: int,
-        latency_ms: float,
-        proof_of_bandwidth: dict,
-    ) -> Optional[BandwidthProof]:
-        """Record a relay result from a worker (P2P transfer)."""
-        worker = self.workers.get(worker_id)
-        worker_hotkey = None
-        worker_region = ""
-        if worker:
-            worker_hotkey = worker.hotkey
-            worker_region = getattr(worker, "region", "")
-        elif self.subnet_core_client:
-            try:
-                worker_data = await self.subnet_core_client.get_worker(worker_id)
-                worker_hotkey = worker_data.get("hotkey", "")
-                worker_region = worker_data.get("region", "")
-            except Exception as e:
-                logger.warning(f"Worker lookup failed for relay result {worker_id}: {e}")
-
-        if not worker_hotkey:
-            logger.warning(f"Unknown worker {worker_id} sent relay result (no hotkey)")
-            return None
-
-        if not success:
-            if worker:
-                worker.failed_tasks += 1
-                worker.update_success_rate()
-            return None
-
-        # Update worker stats (only if worker is in memory)
-        if worker:
-            worker.successful_tasks += 1
-            worker.bytes_relayed_total += bytes_relayed
-            worker.bytes_relayed_epoch += bytes_relayed
-            if bandwidth_mbps > 0:
-                worker.update_bandwidth_ema(bandwidth_mbps)
-            worker.update_success_rate()
-            worker.trust_score = min(1.0, worker.trust_score + 0.001)
-
-        # Update global stats
-        self.total_bytes_relayed += bytes_relayed
-        self.total_tasks_completed += 1
-
-        # Generate proof with realistic timestamps
-        current_time_us = int(time.time() * 1_000_000)
-        if latency_ms > 0:
-            estimated_duration_us = int(latency_ms * 1000)
-        elif bandwidth_mbps > 0 and bytes_relayed > 0:
-            estimated_duration_us = int(
-                (bytes_relayed * 8) / (bandwidth_mbps * 1_000_000) * 1_000_000
-            )
-        else:
-            estimated_duration_us = 100_000
-        estimated_duration_us = max(estimated_duration_us, 10_000)
-
-        start_time_us = proof_of_bandwidth.get(
-            "start_time_us", current_time_us - estimated_duration_us
-        )
-        end_time_us = proof_of_bandwidth.get("end_time_us", current_time_us)
-
-        proof = BandwidthProof(
-            task_id=task_id or f"relay-{worker_id}-{int(time.time())}",
-            worker_id=worker_id,
-            worker_hotkey=worker_hotkey,
-            start_time_us=start_time_us,
-            end_time_us=end_time_us,
-            bytes_relayed=bytes_relayed,
-            bandwidth_mbps=bandwidth_mbps,
-            chunk_hash=proof_of_bandwidth.get("transfer_id", ""),
-            canary_proof="",
-            worker_signature=proof_of_bandwidth.get("signature", ""),
-            source_region=worker_region,
-            dest_region="local",
-        )
-
-        if hasattr(self, "_sign_proof"):
-            proof.orchestrator_signature = self._sign_proof(proof)
-
-        # BeamCore manages task lifecycle server-side: tasks are queued
-        # from WS chunk_assignments and completion is reflected from worker
-        # task_result_summary pushes (see task-lifecycle.ts). No HTTP write needed.
-
-        self.pending_proofs.append(proof)
-        self.epoch_proofs[self.current_epoch].append(proof)
-
-        await self._proof_agg.persist_bandwidth_proof(
-            proof, self.current_epoch, self.subnet_core_client
-        )
-
-        # NOTE: Worker ALPHA payments are intentionally NOT triggered here.
-        # See `complete_task` for the same rationale.
-
-        logger.info(
-            f"Recorded relay result from worker {worker_id}: "
-            f"{bytes_relayed} bytes at {bandwidth_mbps:.1f} Mbps"
-        )
-        return proof
 
     async def fail_task(self, task_id: str, reason: str) -> None:
         """Record task failure."""
@@ -1217,14 +953,35 @@ class Orchestrator:
             f"(previous epoch {prev_epoch}: {tasks} tasks, {bytes_relayed} bytes)"
         )
 
-    # Stale-task reassignment is owned by BeamCore server-side.
+    # BeamCore owns stalled chunk recovery server-side.
 
     # =========================================================================
     # State & Metrics
     # =========================================================================
 
     def _build_epoch_summary(self) -> EpochSummary:
-        return self._proof_agg.build_epoch_summary(self.current_epoch, self.epoch_start_time)
+        workers = list(self.workers.values())
+        active_workers = [worker for worker in workers if worker.bytes_relayed_epoch > 0]
+        total_bytes = sum(worker.bytes_relayed_epoch for worker in workers)
+        total_tasks = sum(worker.successful_tasks for worker in workers)
+        failed_tasks = sum(worker.failed_tasks for worker in workers)
+        total_completed = total_tasks + failed_tasks
+
+        return EpochSummary(
+            epoch=self.current_epoch,
+            start_time=self.epoch_start_time,
+            end_time=datetime.utcnow(),
+            total_tasks=total_completed,
+            successful_tasks=total_tasks,
+            failed_tasks=failed_tasks,
+            total_bytes_relayed=total_bytes,
+            active_workers=len(active_workers),
+            worker_contributions={
+                worker.worker_id: worker.bytes_relayed_epoch
+                for worker in active_workers
+            },
+            success_rate=(total_tasks / total_completed) if total_completed else 0.0,
+        )
 
     def get_state(self) -> dict:
         """Get current Orchestrator state."""
@@ -1246,10 +1003,8 @@ class Orchestrator:
                 for status in WorkerStatus
             },
             "active_tasks": len(self.active_tasks),
-            "pending_proofs": len(self.pending_proofs),
             "total_bytes_relayed": self.total_bytes_relayed,
             "total_tasks_completed": self.total_tasks_completed,
-            # validators_known removed - BeamCore handles PoB centrally
         }
 
     def get_worker_stats(self) -> List[dict]:
@@ -1304,22 +1059,6 @@ class Orchestrator:
         data = f"{hotkey}:{ip}:{port}:{time.time()}"
         return hashlib.sha256(data.encode()).hexdigest()[:16]
 
-    def _sign_proof(self, proof: BandwidthProof) -> str:
-        """Sign a proof with orchestrator key."""
-        message = f"{proof.task_id}:{proof.worker_id}:{proof.bytes_relayed}"
-
-        if self.wallet is None:
-            import hashlib
-
-            return hashlib.sha256(message.encode()).hexdigest()
-
-        signature = self.wallet.hotkey.sign(message.encode())
-        return signature.hex() if isinstance(signature, bytes) else str(signature)
-
-    # =========================================================================
-    # Initialization Helpers
-    # =========================================================================
-
     async def _init_subnet_core_client(self) -> None:
         """Initialize SubnetCoreClient for API-based data operations."""
         if not SUBNET_CORE_CLIENT_AVAILABLE:
@@ -1355,14 +1094,53 @@ class Orchestrator:
                 self.settings.orch_gateway_url,
             )
 
-            # WS push handlers. Transfer assignments are owned by the client
-            # itself (`_handle_transfer_assigned` -> WS chunk_assignments) per
-            # the BeamCore contract.
-            self.subnet_core_client.set_task_completion_handler(
-                self._handle_task_completion_notification
-            )
-            self.subnet_core_client.set_worker_update_handler(self._handle_worker_update_with_slack)
-            self.subnet_core_client.set_slack_notifier(self._slack_notifier)
+            # WS push handlers. BeamCore task offer batches drive worker routing.
+            self.subnet_core_client.set_worker_update_handler(self._worker_mgr.handle_worker_update)
+
+            # Wire the in-process worker gateway.
+            self.subnet_core_client.set_worker_gateway(self.worker_gateway)
+
+            if self.settings.worker_gateway_control_secret:
+                from clients.gateway_control_client import (
+                    GatewayControlClient,
+                    build_local_control_ws_url,
+                )
+
+                control_base = self.settings.worker_gateway_control_url
+                if not control_base:
+                    import socket as _socket
+
+                    try:
+                        _s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+                        _s.connect(("8.8.8.8", 80))
+                        local_ip = self.settings.external_ip or _s.getsockname()[0]
+                        _s.close()
+                    except Exception:
+                        local_ip = self.settings.external_ip or "127.0.0.1"
+                    session_id = self.hotkey or "orchestrator"
+                    control_base = build_local_control_ws_url(
+                        host=local_ip,
+                        port=self.settings.api_port,
+                        session_id=session_id,
+                    )
+
+                async def _control_api_key() -> Optional[str]:
+                    if self.subnet_core_client is None:
+                        return None
+                    return await self.subnet_core_client._ensure_api_key()
+
+                self.gateway_control_client = GatewayControlClient(
+                    control_url=control_base,
+                    control_secret=self.settings.worker_gateway_control_secret,
+                    api_key_provider=_control_api_key,
+                )
+                self.gateway_control_client.set_event_handler(self._handle_gateway_control_event)
+                self.subnet_core_client.enable_gateway_control(self.gateway_control_client)
+                await self.gateway_control_client.start()
+                logger.info(
+                    "In-process worker gateway control channel started: %s",
+                    control_base,
+                )
 
             # Configure registration message sent on every WS connect
             import socket as _socket
@@ -1375,10 +1153,11 @@ class Orchestrator:
             except Exception:
                 local_ip = self.settings.external_ip or "127.0.0.1"
             orch_url = f"http://{local_ip}:{self.settings.api_port}"
-            registration_gateway_url = (
-                self.settings.worker_gateway_public_url
-                if self.settings.dedicated_gateway_enabled
-                else None
+            # gateway_url: explicit orchestrator-owned worker gateway override takes priority;
+            # otherwise derive from the orchestrator's own HTTP address.
+            gateway_url = (
+                self.settings.worker_gateway_url
+                or f"http://{local_ip}:{self.settings.api_port}"
             )
             self.subnet_core_client.set_registration_config(
                 url=orch_url,
@@ -1386,505 +1165,51 @@ class Orchestrator:
                 max_workers=self.settings.max_workers,
                 uid=self.our_uid,
                 fee_percentage=self.settings.fee_percentage,
-                gateway_url=registration_gateway_url,
+                gateway_url=gateway_url,
             )
-            logger.info("Worker gateway mode: %s", self.settings.gateway_mode.value)
-            if (
-                self.settings.public_gateway_enabled
-                and self.settings.worker_gateway_public_url
-            ):
-                logger.info(
-                    "WORKER_GATEWAY_PUBLIC_URL is set but ignored in public mode; "
-                    "set WORKER_GATEWAY_MODE=dedicated to use worker-gateway (Option 1)"
-                )
             self.subnet_core_client.prime_ready_state(bool(self.settings.ready))
             logger.info(
-                f"WS registration config set: url={orch_url}, region={self.settings.region}"
+                "WS registration config set: url=%s region=%s gateway_url=%s",
+                orch_url,
+                self.settings.region,
+                gateway_url,
             )
-
-            if self.settings.dedicated_gateway_enabled:
-                from clients.gateway_control_client import GatewayControlClient
-
-                self.gateway_control_client = GatewayControlClient(
-                    control_url=self.settings.worker_gateway_control_url,
-                    control_secret=self.settings.worker_gateway_control_secret,
-                )
-                self.gateway_control_client.set_event_handler(self._handle_gateway_control_event)
-                self.subnet_core_client.enable_dedicated_gateway(self.gateway_control_client)
-                await self.gateway_control_client.start()
-                logger.info(
-                    "Dedicated gateway control channel started: %s",
-                    self.settings.worker_gateway_control_url,
-                )
 
             # Start WebSocket connection for real-time notifications and
             # orchestrator control-plane requests.
             await self.subnet_core_client.start_polling()
             logger.info("SubnetCore WebSocket connection started")
 
-            if self.settings.dedicated_gateway_enabled and self.settings.worker_gateway_public_url:
-                try:
-                    await self.subnet_core_client.update_worker_gateway(
-                        self.settings.worker_gateway_public_url
-                    )
-                    logger.info(
-                        "Published dedicated gateway URL: %s",
-                        self.settings.worker_gateway_public_url,
-                    )
-                except Exception as exc:
-                    logger.warning("Failed to publish gateway_update: %s", exc)
-
         except Exception as e:
             logger.warning(f"Failed to initialize SubnetCoreClient: {e}")
             self.subnet_core_client = None
 
-    async def _relay_worker_task_decision(
-        self,
-        *,
-        worker_id: str,
-        task_id: str,
-        offer_id: str,
-        is_accept: bool,
-        reason: Optional[str] = None,
-        worker_version: Optional[str] = None,
-        log_label: str = "worker task decision",
-    ) -> None:
-        """Forward worker accept/reject to BeamCore and ack the worker via gateway."""
-        slack_notify: Optional[tuple[dict[str, Any], bool]] = None
-        if self._slack_notifier.enabled and task_id and worker_id:
-            client_ip, hotkey = self._worker_slack_meta(worker_id)
-            label = "Task accepted" if is_accept else "Task rejected"
-            logger.info(
-                "%s: task_id=%s worker_id=%s ip=%s hotkey=%s reason=%s",
-                label,
-                task_id,
-                worker_id,
-                client_ip,
-                hotkey,
-                reason or "",
-            )
-            slack_notify = (
-                {
-                    "task_id": task_id,
-                    "worker_id": worker_id,
-                    "client_ip": client_ip,
-                    "hotkey": hotkey,
-                    "reason": reason,
-                },
-                is_accept,
-            )
-        try:
-            if is_accept:
-                ack = await self.subnet_core_client.send_task_accept(
-                    task_id,
-                    worker_id,
-                    offer_id,
-                    worker_version=worker_version,
-                )
-            else:
-                ack = await self.subnet_core_client.send_task_reject(
-                    task_id,
-                    worker_id,
-                    offer_id,
-                    reason=reason,
-                )
-            accepted = bool(ack.get("accepted", is_accept))
-            ack_reason = ack.get("reason")
-            if self.gateway_control_client:
-                await self.gateway_control_client.send_task_accept_ack(
-                    worker_id,
-                    task_id,
-                    offer_id,
-                    accepted=accepted,
-                    reason=ack_reason,
-                )
-        except Exception as exc:
-            logger.error("Failed to relay %s: %s", log_label, exc)
-            if self.gateway_control_client:
-                await self.gateway_control_client.send_task_accept_ack(
-                    worker_id,
-                    task_id,
-                    offer_id,
-                    accepted=False,
-                    reason=str(exc),
-                )
-        if slack_notify:
-            fields, notify_accepted = slack_notify
-            asyncio.create_task(
-                self._slack_notifier.notify_task_response(
-                    accepted=notify_accepted,
-                    **fields,
-                )
-            )
-
     async def _handle_gateway_control_event(self, message: dict) -> None:
-        """Relay worker events from the worker-gateway control channel to BeamCore."""
-        if not self.subnet_core_client:
-            return
-
+        """Handle push events from the in-process worker gateway control channel."""
         msg_type = message.get("type")
+        worker_id = str(message.get("worker_id") or "")
 
         if msg_type == "worker_connected":
-            worker_id = message.get("worker_id", "")
-            if worker_id and self._slack_notifier.enabled:
-                existing = self._worker_mgr.workers.get(worker_id)
-                self._schedule_worker_connect_slack(
-                    worker_id,
-                    reconnect=existing is not None,
-                    client_ip=str(message.get("client_ip") or ""),
-                    hotkey=str(message.get("hotkey") or ""),
-                )
             await self._worker_mgr.handle_worker_update(worker_id, "connected")
             return
 
         if msg_type == "worker_disconnected":
-            worker_id = message.get("worker_id", "")
-            self._cancel_worker_connect_slack(worker_id)
             await self._worker_mgr.handle_worker_update(worker_id, "disconnected")
-            if worker_id and self._slack_notifier.enabled:
-                client_ip = str(message.get("client_ip") or self._worker_slack_meta(worker_id)[0])
-                hotkey = str(message.get("hotkey") or self._worker_slack_meta(worker_id)[1])
-                logger.info(
-                    "Worker disconnected: worker_id=%s ip=%s hotkey=%s",
-                    worker_id,
-                    client_ip,
-                    hotkey,
-                )
-                asyncio.create_task(
-                    self._slack_notifier.notify_worker_disconnected(
-                        worker_id=worker_id,
-                        client_ip=client_ip,
-                        hotkey=hotkey,
-                    )
-                )
             return
 
-        if msg_type == "worker_capacity_update":
-            worker_id = message.get("worker_id", "")
-            if worker_id:
-                await self._flush_worker_connect_slack(
-                    worker_id,
-                    client_ip=str(message.get("client_ip") or ""),
-                    hotkey=str(message.get("hotkey") or ""),
-                )
-            return
-
-        if msg_type in ("task_accept", "task_reject"):
-            worker_id = message.get("worker_id", "")
-            task_id = message.get("task_id", "")
-            offer_id = message.get("offer_id") or task_id
-            await self._relay_worker_task_decision(
-                worker_id=worker_id,
-                task_id=task_id,
-                offer_id=offer_id,
-                is_accept=msg_type == "task_accept",
-                reason=message.get("reason"),
-                worker_version=message.get("worker_version"),
-                log_label=msg_type,
-            )
-            return
-
-        if msg_type == "worker_response":
-            worker_id = message.get("worker_id", "")
-            task_id = message.get("task_id", "")
-            offer_id = message.get("offer_id") or task_id
-            decision = str(message.get("decision") or "")
-            is_accept = decision in ("task_accept", "accept")
-            await self._relay_worker_task_decision(
-                worker_id=worker_id,
-                task_id=task_id,
-                offer_id=offer_id,
-                is_accept=is_accept,
-                reason=message.get("reason"),
-                worker_version=message.get("worker_version"),
-                log_label="worker_response",
-            )
-            return
-
-        if msg_type in ("task_result", "task_result_summary"):
-            worker_id = message.get("worker_id", "")
-            task_id = message.get("task_id", "")
-            offer_id = message.get("offer_id") or task_id
-            try:
-                ack = await self.subnet_core_client.send_task_result(message)
-                received, completed, reason = parse_task_result_ack(ack)
-                if self.gateway_control_client:
-                    await self.gateway_control_client.send_task_result_ack(
-                        worker_id,
-                        task_id,
-                        offer_id,
-                        received=received,
-                        completed=completed,
-                        reason=reason,
-                    )
-                if received:
-                    asyncio.create_task(self._handle_task_completion_notification(message))
-            except Exception as exc:
-                logger.error("Failed to relay task_result: %s", exc)
-                if self.gateway_control_client:
-                    await self.gateway_control_client.send_task_result_ack(
-                        worker_id,
-                        task_id,
-                        offer_id,
-                        received=False,
-                        reason=str(exc),
-                    )
-
-    @staticmethod
-    def _normalize_slack_ip(ip: Optional[str]) -> str:
-        value = str(ip or "").strip()
-        if not value or value in ("unknown", "0.0.0.0"):
-            return ""
-        return value
-
-    @staticmethod
-    def _normalize_slack_hotkey(hotkey: Optional[str]) -> str:
-        value = str(hotkey or "").strip()
-        if not value or value == "unknown":
-            return ""
-        return value
-
-    def _cancel_worker_connect_slack(self, worker_id: str) -> None:
-        pending = self._pending_worker_connect_slack.pop(worker_id, None)
-        if not pending:
-            return
-        task = pending.get("task")
-        if task and not task.done():
-            task.cancel()
-
-    def _schedule_worker_connect_slack(
-        self,
-        worker_id: str,
-        *,
-        reconnect: bool,
-        client_ip: str = "",
-        hotkey: str = "",
-    ) -> None:
-        if not self._slack_notifier.enabled or not worker_id:
-            return
-
-        self._cancel_worker_connect_slack(worker_id)
-        pending: dict[str, Any] = {
-            "reconnect": reconnect,
-            "client_ip": self._normalize_slack_ip(client_ip),
-            "hotkey": self._normalize_slack_hotkey(hotkey),
-        }
-
-        async def _delayed_send() -> None:
-            try:
-                await asyncio.sleep(self._worker_connect_slack_delay_seconds)
-            except asyncio.CancelledError:
-                return
-            await self._flush_worker_connect_slack(worker_id)
-
-        pending["task"] = asyncio.create_task(_delayed_send())
-        self._pending_worker_connect_slack[worker_id] = pending
-
-    async def _flush_worker_connect_slack(
-        self,
-        worker_id: str,
-        *,
-        client_ip: str = "",
-        hotkey: str = "",
-    ) -> None:
-        pending = self._pending_worker_connect_slack.pop(worker_id, None)
-        if not pending:
-            return
-
-        task = pending.get("task")
-        if task and not task.done():
-            task.cancel()
-        if client_ip:
-            pending["client_ip"] = self._normalize_slack_ip(client_ip) or pending["client_ip"]
-        if hotkey:
-            pending["hotkey"] = self._normalize_slack_hotkey(hotkey) or pending["hotkey"]
-
-        if not self._slack_notifier.enabled:
-            return
-
-        meta_ip, meta_hotkey = self._worker_slack_meta(worker_id)
-        resolved_ip = pending.get("client_ip") or self._normalize_slack_ip(meta_ip) or "unknown"
-        resolved_hotkey = pending.get("hotkey") or self._normalize_slack_hotkey(meta_hotkey) or "unknown"
-        reconnect = bool(pending.get("reconnect"))
-        event_label = "Worker reconnected" if reconnect else "New worker connected"
-        logger.info(
-            "%s: worker_id=%s ip=%s hotkey=%s",
-            event_label,
-            worker_id,
-            resolved_ip,
-            resolved_hotkey,
-        )
-        await self._slack_notifier.notify_worker_connected(
-            worker_id=worker_id,
-            client_ip=resolved_ip,
-            hotkey=resolved_hotkey,
-            reconnect=reconnect,
-        )
-
-    def _worker_slack_meta(self, worker_id: str) -> tuple[str, str]:
-        if self.gateway_control_client:
-            for worker in self.gateway_control_client.get_local_workers():
-                if worker.get("worker_id") == worker_id:
-                    return (
-                        str(worker.get("client_ip") or "unknown"),
-                        str(worker.get("hotkey") or "unknown"),
-                    )
-
-        worker = self._worker_mgr.workers.get(worker_id)
-        if worker:
-            ip = self._normalize_slack_ip(worker.ip) or "unknown"
-            hotkey = self._normalize_slack_hotkey(worker.hotkey) or "unknown"
-            return ip, hotkey
-        return "unknown", "unknown"
-
-    async def _handle_worker_update_with_slack(self, worker_id: str, event: str) -> None:
-        """Public-gateway worker connect/disconnect push events with Slack alerts."""
-        if event == "connected" and self._slack_notifier.enabled:
-            reconnect = worker_id in self._worker_mgr.workers
-            await self._worker_mgr.handle_worker_update(worker_id, event)
-            client_ip, hotkey = self._worker_slack_meta(worker_id)
-            self._schedule_worker_connect_slack(
-                worker_id,
-                reconnect=reconnect,
-                client_ip=client_ip,
-                hotkey=hotkey,
-            )
-            return
-
-        if event == "disconnected" and self._slack_notifier.enabled:
-            self._cancel_worker_connect_slack(worker_id)
-            client_ip, hotkey = self._worker_slack_meta(worker_id)
-            await self._worker_mgr.handle_worker_update(worker_id, event)
-            asyncio.create_task(
-                self._slack_notifier.notify_worker_disconnected(
-                    worker_id=worker_id,
-                    client_ip=client_ip,
-                    hotkey=hotkey,
-                )
-            )
-            return
-
-        await self._worker_mgr.handle_worker_update(worker_id, event)
-
-    async def _handle_task_completion_notification(self, message: dict) -> bool:
-        """
-        Handle task completion notifications from SubnetCore.
-
-        Verifies the completion (worker match + bytes sanity) and updates
-        local task / per-worker stats. Returning True triggers the
-        ``acknowledge_task_completions`` ack in
-        ``SubnetCoreClient._handle_ws_message`` (BeamCore task lifecycle).
-
-        Worker payment management is operator-defined.
-        This handler updates local task and worker accounting.
-
-        Args:
-            message: Task completion message with task_id, worker_id, bytes, etc.
-
-        Returns:
-            True if verified and should be acknowledged, False otherwise
-        """
-        task_id = message.get("task_id")
-        worker_id = message.get("worker_id")
-        bytes_transferred = message.get("bytes_relayed", 0) or message.get("bytes_transferred", 0)
-        bandwidth_mbps = message.get("bandwidth_mbps", 0.0)
-
-        logger.info(
-            "Verifying task completion: task=%s worker=%s bytes=%s",
-            task_id or "none",
-            worker_id or "none",
-            bytes_transferred,
-        )
-
-        task = self.active_tasks.get(task_id) or self.completed_tasks.get(task_id)
-
-        # Get reassigned_worker_id (set by BeamCore when task was reassigned)
-        # worker_id = original assignee, reassigned_worker_id = new worker after reassignment
-        reassigned_worker_id = message.get("reassigned_worker_id")
-
-        if task:
-            worker_matches = task.worker_id == worker_id or (
-                reassigned_worker_id and reassigned_worker_id == worker_id
-            )
-            if not worker_matches:
-                logger.warning(
-                    f"Worker mismatch for task {task_id}: expected {task.worker_id} "
-                    f"or reassigned={reassigned_worker_id}, got {worker_id}"
-                )
-                return False
-
-            if task.chunk_size:
-                expected_bytes = task.chunk_size
-                tolerance = expected_bytes * 0.2
-                if abs(bytes_transferred - expected_bytes) > tolerance:
-                    logger.warning(
-                        f"Bytes mismatch for task {task_id}: expected ~{expected_bytes}, "
-                        f"got {bytes_transferred}"
-                    )
-
-            if task_id in self.active_tasks:
-                task.status = "completed"
-                task.completed_at = time.time()
-                task.bytes_relayed = bytes_transferred
-                task.bandwidth_mbps = bandwidth_mbps
-                del self.active_tasks[task_id]
-                self.completed_tasks[task_id] = task
-                self.total_bytes_relayed += bytes_transferred
-                self.total_tasks_completed += 1
-                logger.info("Task marked completed via SubnetCore notification: task_id=%s", task_id)
-        else:
-            logger.info(
-                "Task not in memory, recording stats from SubnetCore data: task_id=%s",
-                task_id,
-            )
-            self.total_bytes_relayed += bytes_transferred
-            self.total_tasks_completed += 1
-
-        if self._slack_notifier.enabled and task_id and worker_id:
-            client_ip, hotkey = self._worker_slack_meta(worker_id)
-            assignment_id = message.get("assignment_id") or ""
-            if not assignment_id and task_id in self.completed_tasks:
-                assignment_id = getattr(self.completed_tasks[task_id], "assignment_id", "") or ""
-            logger.info(
-                "Task complete: task_id=%s assignment_id=%s worker_id=%s ip=%s hotkey=%s "
-                "bytes=%s bandwidth_mbps=%s",
-                task_id,
-                assignment_id or "unknown",
-                worker_id,
-                client_ip,
-                hotkey,
-                bytes_transferred,
-                bandwidth_mbps,
-            )
-            asyncio.create_task(
-                self._slack_notifier.notify_task_complete(
-                    task_id=task_id,
-                    worker_id=worker_id,
-                    assignment_id=str(assignment_id),
-                    client_ip=client_ip,
-                    hotkey=hotkey,
-                    bytes_transferred=int(bytes_transferred or 0),
-                    bandwidth_mbps=float(bandwidth_mbps or 0.0),
-                )
-            )
-
-        return True
-
-    # Transfer notification + chunk assignment is handled inside
-    # SubnetCoreClient._handle_transfer_assigned (BeamCore WS push):
-    # the client receives transfer_assigned, requests workers via WS
-    # list_workers, and submits WS chunk_assignments. No HTTP path needed.
+    # SubnetCoreClient receives BeamCore task offer batches and routes them
+    # to connected local workers.
 
     async def _init_orch_manager(self) -> None:
         """Initialize the orchestrator manager for incentive mechanism."""
         try:
-            try:
-                from beam.orchestrator import OrchestratorManager
-            except ImportError:
-                from core.orch_manager import OrchestratorManager
+            from beam.orchestrator import OrchestratorManager
 
             self.orch_manager = OrchestratorManager()
             logger.info("Orchestrator manager initialized (in-memory mode)")
+        except ImportError:
+            # OrchestratorManager is optional - not needed for normal operation
+            self.orch_manager = None
         except Exception as e:
             logger.error(f"Failed to initialize orchestrator manager: {e}")
             self.orch_manager = None

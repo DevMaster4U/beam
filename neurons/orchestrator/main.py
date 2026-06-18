@@ -20,95 +20,15 @@ Architecture:
 │                                                                    │
 └────────────────────────────────────────────────────────────────────┘
 
-Transfer execution happens on workers that dial the **worker-gateway** endpoints advertised by BeamCore.
+Transfer execution happens on workers that dial the orchestrator-owned worker gateways advertised to BeamCore.
 Orchestrators still coordinate exclusively through BeamCore APIs rather than talking to arbitrary workers directly.
 """
-
-from __future__ import annotations
 
 import logging
 import os
 import socket
-import sys
 import time
 from contextlib import asynccontextmanager
-from pathlib import Path
-from typing import Optional
-
-_WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
-
-
-def _extract_env_file_arg(argv: list[str]) -> tuple[Optional[Path], list[str]]:
-    """Pull --env-file from argv before other startup logic runs."""
-    cleaned: list[str] = []
-    env_file: Optional[Path] = None
-    idx = 0
-    while idx < len(argv):
-        arg = argv[idx]
-        if arg == "--env-file":
-            if idx + 1 >= len(argv):
-                print("Error: --env-file requires a path argument", file=sys.stderr)
-                sys.exit(2)
-            env_file = Path(argv[idx + 1]).expanduser()
-            idx += 2
-            continue
-        if arg.startswith("--env-file="):
-            env_file = Path(arg.split("=", 1)[1]).expanduser()
-            idx += 1
-            continue
-        cleaned.append(arg)
-        idx += 1
-    return env_file, cleaned
-
-
-def _resolve_orchestrator_env_file() -> Optional[Path]:
-    cli_file, _ = _extract_env_file_arg(sys.argv[1:])
-    if cli_file is not None:
-        return cli_file
-
-    env_path = os.environ.get("ORCHESTRATOR_ENV_FILE", "").strip()
-    if env_path:
-        return Path(env_path).expanduser()
-    return None
-
-
-def _resolve_env_path(path: Path) -> Path:
-    if path.is_absolute():
-        return path
-    return _WORKSPACE_ROOT / path
-
-
-def _orchestrator_instance_name() -> Optional[str]:
-    orch_env = _resolve_orchestrator_env_file()
-    if orch_env is None:
-        return None
-    return _resolve_env_path(orch_env).stem
-
-
-def _load_workspace_env() -> None:
-    """Load shared .env, then optional per-orchestrator env (override)."""
-    try:
-        from dotenv import load_dotenv
-    except ImportError:
-        return
-
-    shared_env = _WORKSPACE_ROOT / ".env"
-    if shared_env.exists():
-        load_dotenv(shared_env, override=False)
-
-    orch_env = _resolve_orchestrator_env_file()
-    if orch_env is None:
-        return
-
-    orch_env = _resolve_env_path(orch_env)
-    if orch_env.exists():
-        load_dotenv(orch_env, override=True)
-    else:
-        print(f"Error: orchestrator env file not found: {orch_env}", file=sys.stderr)
-        sys.exit(2)
-
-
-_load_workspace_env()
 
 import uvicorn
 from fastapi import FastAPI
@@ -118,46 +38,31 @@ from core.config import get_settings
 from core.orchestrator import Orchestrator, get_orchestrator
 from middleware.metrics import MetricsMiddleware, get_metrics_collector, get_metrics_response
 from middleware.rate_limiting import RateLimitMiddleware, get_rate_limiter
-from routes import health, orchestrators
+from routes import health, orchestrators, workers
 
 # WebSocket registration, keepalive, and transfer flow are owned by
 # SubnetCoreClient. main.py only wires lifespan + FastAPI routes.
 
 
-def _configure_logging() -> logging.Logger:
-    """Write orchestrator output to logs/orchestrators/<instance>.log when configured."""
-    log_root = Path(os.environ.get("LOG_DIR", _WORKSPACE_ROOT / "logs"))
-    instance = _orchestrator_instance_name()
-    if instance:
-        log_dir = log_root / "orchestrators"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = log_dir / f"{instance}.log"
-    else:
-        log_root.mkdir(parents=True, exist_ok=True)
-        log_file = log_root / "miner.log"
+# Configure logging - both console and file
+LOG_DIR = os.environ.get("LOG_DIR", "/tmp/beam_logs")
+os.makedirs(LOG_DIR, exist_ok=True)
 
-    log_format = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-    log_datefmt = "%Y-%m-%d %H:%M:%S"
-    formatter = logging.Formatter(log_format, datefmt=log_datefmt)
+log_format = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+log_datefmt = "%Y-%m-%d %H:%M:%S"
 
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setFormatter(formatter)
+logging.basicConfig(
+    level=logging.INFO,
+    format=log_format,
+    datefmt=log_datefmt,
+)
 
-    handlers: list[logging.Handler] = [file_handler]
-    if sys.stderr.isatty():
-        stream_handler = logging.StreamHandler()
-        stream_handler.setFormatter(formatter)
-        handlers.append(stream_handler)
+# Add file handler for log viewer
+file_handler = logging.FileHandler(f"{LOG_DIR}/orchestrator.log")
+file_handler.setFormatter(logging.Formatter(log_format, datefmt=log_datefmt))
+logging.getLogger().addHandler(file_handler)
 
-    logging.basicConfig(
-        level=logging.INFO,
-        handlers=handlers,
-        force=True,
-    )
-    return logging.getLogger(__name__)
-
-
-logger = _configure_logging()
+logger = logging.getLogger(__name__)
 
 # Global instances
 orchestrator: Orchestrator = None
@@ -285,14 +190,14 @@ app = FastAPI(
 BEAM Orchestrator - Decentralized bandwidth mining coordinator.
 
 The Orchestrator connects to BeamCore and:
-- Registers with BeamCore on startup
-- Maintains a live WebSocket control-plane session
-- Receives transfer assignments from BeamCore
-- Manages local worker pools and task distribution
-- Submits proof-of-bandwidth to BeamCore
+- Maintains a live orch-gateway WebSocket control-plane session
+- Advertises an orchestrator-owned worker gateway
+- Receives task offer batches from BeamCore
+- Routes task offers to connected local workers
+- Relays worker decisions and task results upstream
 
-All worker registration, transfer coordination, and validator communication
-is handled centrally by BeamCore.
+Workers register with BeamCore for identity and API keys, then connect to
+the advertised worker gateway for runtime task delivery.
 
 ## Endpoints
 
@@ -326,6 +231,7 @@ if _cors_origins:
 # Mount route modules
 app.include_router(health.router)
 app.include_router(orchestrators.router)
+app.include_router(workers.router)
 
 
 # =============================================================================
@@ -414,7 +320,9 @@ def main():
         import threading
         import webbrowser
 
-        log_viewer_url = os.environ.get("LOG_VIEWER_URL", "https://beamcore.b1m.ai/logs/")
+        log_viewer_url = os.environ.get("LOG_VIEWER_URL")
+        if not log_viewer_url:
+            raise RuntimeError("LOG_VIEWER_URL is required when OPEN_LOG_VIEWER is enabled")
 
         def open_logs():
             time.sleep(1.5)  # Wait for server to start

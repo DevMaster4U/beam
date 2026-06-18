@@ -11,8 +11,6 @@ from typing import List, Optional
 from pydantic import Field
 from pydantic_settings import BaseSettings
 
-from neurons.shared.gateway_protocol import GatewayMode, parse_gateway_mode
-
 
 class OrchestratorSettings(BaseSettings):
     """Orchestrator configuration settings."""
@@ -21,7 +19,7 @@ class OrchestratorSettings(BaseSettings):
     # API Settings
     # ==========================================================================
     api_host: str = Field(default="0.0.0.0", env="ORCHESTRATOR_HOST")
-    api_port: int = Field(default=9000, env="API_PORT")  # Also accepts ORCHESTRATOR_PORT
+    api_port: int = Field(default=8000, env="API_PORT")  # Also accepts ORCHESTRATOR_PORT
     log_level: str = Field(default="INFO", env="LOG_LEVEL")
 
     # Local mode - skip Bittensor wallet/subtensor initialization for development
@@ -94,13 +92,6 @@ class OrchestratorSettings(BaseSettings):
     chunk_size_bytes: int = Field(default=1024 * 1024, env="CHUNK_SIZE")  # 1 MB
 
     # ==========================================================================
-    # Proof Aggregation
-    # ==========================================================================
-    proof_batch_size: int = Field(default=100, env="PROOF_BATCH_SIZE")
-    proof_aggregation_interval: int = Field(default=60, env="PROOF_AGGREGATION_INTERVAL")
-    min_proofs_for_epoch: int = Field(default=10, env="MIN_PROOFS_FOR_EPOCH")
-
-    # ==========================================================================
     # Anti-Fraud Settings
     # ==========================================================================
     enable_geo_verification: bool = Field(default=True, env="ENABLE_GEO_VERIFICATION")
@@ -108,40 +99,28 @@ class OrchestratorSettings(BaseSettings):
     max_suspicious_score: float = Field(default=0.3, env="MAX_SUSPICIOUS_SCORE")
 
     # ==========================================================================
-    # BeamCore API (for internal data storage)
+    # BeamCore API
     # ==========================================================================
     core_server_url: str = Field(default="https://beamcore.b1m.ai", env="CORE_SERVER_URL")
 
     orch_gateway_url: Optional[str] = Field(default=None, env="ORCH_GATEWAY_URL")
 
-    # Orch-gateway WebSocket transport (high-latency / WSL / cross-region: increase these)
+    # Orch-gateway WebSocket transport (high-latency / cross-region: increase these)
     orch_ws_open_timeout: float = Field(default=60.0, env="ORCH_WS_OPEN_TIMEOUT")
     orch_ws_close_timeout: float = Field(default=20.0, env="ORCH_WS_CLOSE_TIMEOUT")
     orch_ws_ping_interval: float = Field(default=30.0, env="ORCH_WS_PING_INTERVAL")
     orch_ws_ping_timeout: float = Field(default=45.0, env="ORCH_WS_PING_TIMEOUT")
 
-    # Option 2 (default): public BeamCore worker gateway — list_public_workers, no relay.
-    # Option 1: dedicated worker-gateway — local worker pool + control-channel relay.
-    worker_gateway_mode: str = Field(default="public", env="WORKER_GATEWAY_MODE")
-    worker_gateway_public_url: Optional[str] = Field(default=None, env="WORKER_GATEWAY_PUBLIC_URL")
-    worker_gateway_control_url: Optional[str] = Field(
-        default=None, env="WORKER_GATEWAY_CONTROL_URL"
+    worker_gateway_url: Optional[str] = Field(default=None, env="ORCHESTRATOR_WORKER_GATEWAY_URL")
+    worker_gateway_worker_secret: Optional[str] = Field(
+        default=None, env="WORKER_GATEWAY_WORKER_SECRET"
     )
     worker_gateway_control_secret: Optional[str] = Field(
         default=None, env="WORKER_GATEWAY_CONTROL_SECRET"
     )
-
-    @property
-    def gateway_mode(self) -> GatewayMode:
-        return parse_gateway_mode(self.worker_gateway_mode)
-
-    @property
-    def dedicated_gateway_enabled(self) -> bool:
-        return self.gateway_mode == GatewayMode.DEDICATED
-
-    @property
-    def public_gateway_enabled(self) -> bool:
-        return self.gateway_mode == GatewayMode.PUBLIC
+    worker_gateway_control_url: Optional[str] = Field(
+        default=None, env="WORKER_GATEWAY_CONTROL_URL"
+    )
 
     # ==========================================================================
     # Worker Scoring Weights (for selection)
@@ -222,23 +201,15 @@ class OrchestratorSettings(BaseSettings):
         if not self.orch_gateway_url:
             raise ValueError("ORCH_GATEWAY_URL is required")
 
-        if self.dedicated_gateway_enabled:
-            missing = []
-            if not self.worker_gateway_public_url:
-                missing.append("WORKER_GATEWAY_PUBLIC_URL")
-            if not self.worker_gateway_control_url:
-                missing.append("WORKER_GATEWAY_CONTROL_URL")
-            if not self.worker_gateway_control_secret:
-                missing.append("WORKER_GATEWAY_CONTROL_SECRET")
-            if missing:
-                raise ValueError(
-                    f"WORKER_GATEWAY_MODE=dedicated requires: {', '.join(missing)}"
-                )
-        elif self.worker_gateway_control_url or self.worker_gateway_control_secret:
-            raise ValueError(
-                "WORKER_GATEWAY_CONTROL_URL/SECRET are only used when "
-                "WORKER_GATEWAY_MODE=dedicated; set WORKER_GATEWAY_MODE=public for Option 2"
-            )
+        if not self.worker_gateway_worker_secret:
+            alt_worker = os.environ.get("GATEWAY_WORKER_SECRET", "").strip()
+            if alt_worker:
+                object.__setattr__(self, "worker_gateway_worker_secret", alt_worker)
+
+        if not self.worker_gateway_control_secret:
+            alt_control = os.environ.get("GATEWAY_CONTROL_SECRET", "").strip()
+            if alt_control:
+                object.__setattr__(self, "worker_gateway_control_secret", alt_control)
 
     # ==========================================================================
     # Client Tiers
@@ -280,11 +251,6 @@ class OrchestratorSettings(BaseSettings):
 
     # Allowed HTTP headers (comma-separated)
     cors_allowed_headers: str = Field(default="*", env="CORS_ALLOWED_HEADERS")
-
-    # ==========================================================================
-    # Notifications
-    # ==========================================================================
-    slack_notification_url: Optional[str] = Field(default=None, env="SLACK_NOTIFICATION_URL")
 
     # ==========================================================================
     # Compliance / Audit Settings

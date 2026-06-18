@@ -2,7 +2,7 @@
 """
 Beam Network Worker
 
-Registers with BeamCore, connects to worker-gateway, and handles data transfer tasks.
+Registers with BeamCore, connects to an orchestrator-owned worker gateway, and handles data transfer tasks.
 Uses bittensor wallet for authentication.
 
 Minimum Requirements:
@@ -14,24 +14,22 @@ Minimum Requirements:
 
 Tech Stack:
     - Python 3.10+
-    - bittensor >= 6.0.0
-    - httpx >= 0.24.0
+    - bittensor >= 10.3.1,<11.0.0
+    - httpx >= 0.25.0
+    - websockets >= 12.0
 
 Installation:
     pip install bittensor httpx websockets
 
 Usage:
-    # Using default wallet (~/.bittensor/wallets/default/hotkeys/default):
-    python3 worker.py
+    # Using wallet settings from workspace .env / config/workers/<instance>.env:
+    python3 worker.py --env-file config/workers/worker1.env
 
-    # Using custom wallet:
+    # Using custom wallet via CLI (overrides env):
     python3 worker.py --wallet.name my_wallet --wallet.hotkey my_hotkey
 
     # Mainnet:
     python3 worker.py --subtensor.network finney
-
-    # Per-instance env (multi-worker on one host):
-    python3 worker.py --env-file config/workers/worker1.env
 """
 
 import argparse
@@ -47,10 +45,9 @@ import signal
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 import httpx
@@ -226,11 +223,21 @@ configure_worker_logging()
 # Configuration
 # =============================================================================
 
-# Network endpoint. Operators may override CORE_SERVER_URL if Beam publishes a new endpoint.
+# Network endpoints
 MAINNET_URL = "https://beamcore.b1m.ai"
 
 # Connection mode: worker transport is websocket-only after registration.
 CONNECTION_MODE = os.environ.get("CONNECTION_MODE", "websocket").lower()
+
+
+def resolve_worker_version() -> str:
+    try:
+        return package_version("beam")
+    except PackageNotFoundError:
+        return "0.1.0"
+
+
+WORKER_VERSION = resolve_worker_version()
 
 # WebSocket settings
 WS_RECONNECT_MIN_DELAY = 12.0  # must exceed server's 10s cooldown
@@ -242,7 +249,6 @@ WS_MAX_RECONNECT_ATTEMPTS = (
 )
 
 WS_PING_INTERVAL = 25  # seconds
-WS_STATS_SNAPSHOT_INTERVAL = 60  # seconds
 
 # Transfer settings
 DEFAULT_CHUNK_SIZE_BYTES = 4 * 1024 * 1024
@@ -255,24 +261,12 @@ MAX_IN_FLIGHT_BYTES = max(
     int(os.environ.get("WORKER_MAX_IN_FLIGHT_BYTES", str(256 * 1024 * 1024))),
 )
 FETCH_TIMEOUT = 30  # seconds
-SEND_TIMEOUT = 120  # seconds — increased to cover large uploads on slow links
+SEND_TIMEOUT = 120  # seconds — cover large uploads on slow links
 MAX_RETRIES = 3
 RETRY_BACKOFF = 1.0  # Base backoff in seconds
-FETCH_STREAM_CHUNK_SIZE = 512 * 1024  # 512 KB — was 64 KB; fewer await cycles for 20 MB transfers
-
-# Thread pool for SHA-256 hashing — keeps the event loop free during large object hashing
+FETCH_STREAM_CHUNK_SIZE = 512 * 1024
 _hash_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="hash")
 WS_TASK_RESULT_ACK_TIMEOUT = float(os.environ.get("WORKER_TASK_RESULT_ACK_TIMEOUT", "3.0"))
-
-
-def resolve_worker_version() -> str:
-    try:
-        return package_version("beam")
-    except PackageNotFoundError:
-        return "0.1.0"
-
-
-WORKER_VERSION = resolve_worker_version()
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -282,13 +276,8 @@ def _env_bool(name: str, default: bool) -> bool:
     return str(raw).strip().lower() in ("1", "true", "yes")
 
 
-PREWARM_ENABLED = _env_bool("WORKER_PREWARM_ENABLED", True)
-PREWARM_TIMEOUT = float(os.environ.get("WORKER_PREWARM_TIMEOUT", "5.0"))
-MAX_PREWARM_ORIGINS = max(4, int(os.environ.get("WORKER_PREWARM_MAX_ORIGINS", "32")))
-
-
 # Participant workers default to recording a payment obligation unless opted out.
-WORKER_REQUIRED_PAYMENT = False #_env_bool("WORKER_REQUIRED_PAYMENT", True)
+WORKER_REQUIRED_PAYMENT = False #_env_bool("WORKER_REQUIRED_PAYMENT", False)
 
 # Global semaphore for task concurrency
 task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
@@ -306,9 +295,6 @@ class WorkerState:
     api_key: Optional[str] = None
     orchestrator_hotkey: Optional[str] = None
     active_tasks: int = 0
-    bytes_relayed: int = 0
-    reported_bytes_relayed: int = 0
-    last_measured_bandwidth_mbps: float = 0.0
     running: bool = True
     http_client: Optional[httpx.AsyncClient] = None
     ws_connected: bool = False
@@ -321,8 +307,6 @@ class WorkerState:
     reserved_ws_slots: int = 0
     reserved_bytes: int = 0
     ws_send_lock: Optional[asyncio.Lock] = None
-    prewarm_origins: list[str] = field(default_factory=list)
-    prewarm_lock: Optional[asyncio.Lock] = None
 
 
 @dataclass
@@ -331,10 +315,7 @@ class TaskExecutionResult:
 
     success: bool
     bytes_transferred: int
-    bandwidth_mbps: float
     duration_ms: float
-    start_time_us: int
-    end_time_us: int
     chunk_hash: str = ""
     etag: Optional[str] = None
     error_msg: Optional[str] = None
@@ -359,7 +340,10 @@ def exception_detail(error: Exception) -> str:
     if isinstance(error, httpx.HTTPStatusError):
         request_url = str(error.request.url)
         redacted_url = redact_url(request_url)
-        body = error.response.text[:500].strip()
+        try:
+            body = error.response.text[:500].strip()
+        except httpx.ResponseNotRead:
+            body = ""
         body_detail = f" body={body!r}" if body else ""
         return (
             f"{type(error).__name__}: HTTP {error.response.status_code} "
@@ -480,13 +464,13 @@ def parse_offer_range(headers: Dict[str, str]) -> Optional[tuple[int, int, int]]
 
 
 def build_transfer_context(task: dict) -> tuple[Optional[dict], Optional[str]]:
-    """Validate and normalize a flat BeamCore task offer (worker_task_offer_batch item)."""
+    """Validate and normalize the flat worker task offer."""
     source_url = task.get("source_url")
     dest_url = task.get("dest_url")
     if not isinstance(source_url, str) or not source_url.strip():
-        return None, None
+        return None, "missing_source_url"
     if not isinstance(dest_url, str) or not dest_url.strip():
-        return None, None
+        return None, "missing_dest_url"
 
     try:
         chunk_size = int(task.get("chunk_size"))
@@ -508,7 +492,6 @@ def build_transfer_context(task: dict) -> tuple[Optional[dict], Optional[str]]:
         return None, f"range_size_mismatch:{range_size}!={chunk_size}"
 
     return {
-        "mode": "flat",
         "source_url": source_url.strip(),
         "dest_url": dest_url.strip(),
         "chunk_size": chunk_size,
@@ -519,31 +502,6 @@ def build_transfer_context(task: dict) -> tuple[Optional[dict], Optional[str]]:
         "transfer_id": str(task.get("transfer_id") or task.get("task_id") or ""),
         "etag_required": bool(task.get("etag_required")),
     }, None
-
-
-def resolve_transfer_plan(task: dict) -> tuple[Optional[dict], Optional[str]]:
-    """Resolve flat offer (BeamCore batch) or legacy execution_context plan."""
-    flat_ctx, flat_err = build_transfer_context(task)
-    if flat_ctx is not None:
-        return flat_ctx, None
-    if flat_err:
-        return None, flat_err
-
-    execution_context = task.get("execution_context") or {}
-    if isinstance(execution_context, dict) and has_transfer_endpoints(execution_context):
-        return {"mode": "legacy", "execution_context": execution_context}, None
-    return None, "missing_transfer_endpoints"
-
-
-def has_transfer_endpoints(execution_context: dict) -> bool:
-    """Return True if a task has enough routing info to move data."""
-    has_gateway_pair = bool(
-        execution_context.get("gateway_url") and execution_context.get("destination_url")
-    )
-    has_presigned_pair = bool(
-        execution_context.get("source_urls") and execution_context.get("dest_urls")
-    )
-    return has_gateway_pair or has_presigned_pair
 
 
 def remaining_deadline_seconds(deadline_us: int) -> Optional[float]:
@@ -557,7 +515,7 @@ async def execute_task_with_metrics(
     state: WorkerState,
     task_id: str,
     task: dict,
-    transfer_plan: dict,
+    transfer_context: dict,
     deadline_us: int,
     log_prefix: str = "[Worker]",
 ) -> TaskExecutionResult:
@@ -576,19 +534,11 @@ async def execute_task_with_metrics(
             if remaining_sec is not None and remaining_sec < 2:
                 error_msg = f"Deadline expired while waiting ({remaining_sec:.1f}s)"
                 print(f"{log_prefix} {error_msg}")
-            elif transfer_plan.get("mode") == "flat":
-                bytes_transferred, success, error_msg, chunk_hash, etag = await execute_flat_transfer(
-                    state,
-                    task_id,
-                    transfer_plan,
-                    task,
-                    deadline_us,
-                )
             else:
                 bytes_transferred, success, error_msg, chunk_hash, etag = await execute_transfer(
                     state,
                     task_id,
-                    transfer_plan.get("execution_context", {}),
+                    transfer_context,
                     task,
                     deadline_us,
                 )
@@ -600,16 +550,10 @@ async def execute_task_with_metrics(
 
     end_time = time.time()
     duration_ms = (end_time - start_time) * 1000
-    duration_sec = duration_ms / 1000
-    bandwidth_mbps = (bytes_transferred * 8 / 1_000_000) / duration_sec if duration_sec > 0 else 0
-
     return TaskExecutionResult(
         success=success,
         bytes_transferred=bytes_transferred,
-        bandwidth_mbps=round(bandwidth_mbps, 2),
         duration_ms=round(duration_ms, 1),
-        start_time_us=int(start_time * 1_000_000),
-        end_time_us=int(end_time * 1_000_000),
         chunk_hash=chunk_hash,
         etag=etag,
         error_msg=error_msg,
@@ -824,6 +768,25 @@ def is_retryable(error: Exception) -> bool:
     return False
 
 
+def is_object_storage_presigned_url(url: str) -> bool:
+    """Check if URL is an object-storage pre-signed upload URL."""
+    if not url:
+        return False
+    return (
+        "X-Amz-Signature" in url
+        or "X-Goog-Signature" in url
+        or "r2.cloudflarestorage.com" in url
+        or "storage.googleapis.com" in url
+    )
+
+
+def is_canary_destination(url: str) -> bool:
+    """Check if URL is a canary/null destination."""
+    if not url:
+        return False
+    return url.startswith(("null://", "canary://", "skip://"))
+
+
 def _build_fetch_headers(
     chunk_offset: int = None,
     chunk_size: int = None,
@@ -837,191 +800,6 @@ def _build_fetch_headers(
             range_end = chunk_offset + chunk_size - 1
         headers["Range"] = f"bytes={chunk_offset}-{range_end}"
     return headers
-
-
-def _prewarm_cache_path() -> Optional[Path]:
-    """Per-worker JSON cache of learned HTTP origins (next to worker env file)."""
-    instance = _worker_instance_name()
-    if not instance:
-        return None
-    cache_dir = _workspace_root() / "config" / "workers"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir / f"{instance}.prewarm-hosts.json"
-
-
-def _http_origin_from_url(url: str) -> Optional[str]:
-    """Return scheme://host[:port] for HTTP(S) transfer URLs."""
-    if not url or is_canary_destination(url):
-        return None
-    parsed = urlsplit(url.strip())
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        return None
-    host = parsed.hostname.lower()
-    if parsed.port and parsed.port not in (80, 443):
-        return f"{parsed.scheme}://{host}:{parsed.port}"
-    return f"{parsed.scheme}://{host}"
-
-
-def _origin_label(origin: str) -> str:
-    return urlsplit(origin).hostname or origin
-
-
-def _seed_prewarm_origins() -> list[str]:
-    """Optional static origins from WORKER_PREWARM_ORIGINS (comma-separated URLs or hosts)."""
-    raw = os.environ.get("WORKER_PREWARM_ORIGINS", "").strip()
-    if not raw:
-        return []
-    origins: list[str] = []
-    for item in raw.split(","):
-        token = item.strip()
-        if not token:
-            continue
-        if "://" not in token:
-            token = f"https://{token}"
-        origin = _http_origin_from_url(token)
-        if origin and origin not in origins:
-            origins.append(origin)
-    return origins
-
-
-def _merge_prewarm_origins(existing: Iterable[str], discovered: Iterable[str]) -> list[str]:
-    """Newest-first deduped origin list capped at MAX_PREWARM_ORIGINS."""
-    merged: list[str] = []
-    seen: set[str] = set()
-    for origin in list(discovered) + list(existing):
-        if not origin or origin in seen:
-            continue
-        seen.add(origin)
-        merged.append(origin)
-        if len(merged) >= MAX_PREWARM_ORIGINS:
-            break
-    return merged
-
-
-def _load_prewarm_cache(path: Path) -> list[str]:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return _seed_prewarm_origins()
-    except (OSError, json.JSONDecodeError) as exc:
-        print(f"[Worker] Prewarm cache load failed ({path.name}): {exc}")
-        return _seed_prewarm_origins()
-
-    origins = data.get("origins") if isinstance(data, dict) else None
-    if not isinstance(origins, list):
-        return _seed_prewarm_origins()
-
-    cleaned: list[str] = []
-    for item in origins:
-        if not isinstance(item, str):
-            continue
-        origin = _http_origin_from_url(item) or item.strip()
-        if origin and origin not in cleaned:
-            cleaned.append(origin)
-    return _merge_prewarm_origins(_seed_prewarm_origins(), cleaned)
-
-
-def _save_prewarm_cache(path: Path, origins: list[str]) -> None:
-    payload = {
-        "origins": origins,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-    try:
-        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    except OSError as exc:
-        print(f"[Worker] Prewarm cache save failed ({path.name}): {exc}")
-
-
-def _collect_transfer_origins(execution_context: dict) -> set[str]:
-    origins: set[str] = set()
-    for key in ("gateway_url", "destination_url", "source_url", "dest_url"):
-        origin = _http_origin_from_url(str(execution_context.get(key) or ""))
-        if origin:
-            origins.add(origin)
-
-    for mapping_key in ("source_urls", "dest_urls"):
-        mapping = execution_context.get(mapping_key)
-        if not isinstance(mapping, dict):
-            continue
-        for url in mapping.values():
-            origin = _http_origin_from_url(str(url or ""))
-            if origin:
-                origins.add(origin)
-    return origins
-
-
-async def _prewarm_single_origin(
-    client: httpx.AsyncClient, origin: str
-) -> tuple[str, float, Optional[str]]:
-    started = time.perf_counter()
-    try:
-        await client.head(f"{origin}/", timeout=PREWARM_TIMEOUT)
-        return origin, (time.perf_counter() - started) * 1000, None
-    except Exception as exc:
-        return origin, (time.perf_counter() - started) * 1000, str(exc)
-
-
-async def _prewarm_origins(
-    client: httpx.AsyncClient,
-    origins: Iterable[str],
-    *,
-    reason: str,
-) -> None:
-    unique = sorted({origin for origin in origins if origin})
-    if not unique:
-        return
-
-    started = time.perf_counter()
-    results = await asyncio.gather(*(_prewarm_single_origin(client, origin) for origin in unique))
-    total_ms = (time.perf_counter() - started) * 1000
-    warmed = sum(1 for _, _, err in results if err is None)
-    labels = ", ".join(_origin_label(origin) for origin in unique)
-    print(
-        f"[Worker] Prewarm {reason}: {warmed}/{len(unique)} origin(s) "
-        f"in {total_ms:.1f}ms — {labels}"
-    )
-    for origin, ms, err in results:
-        if err:
-            print(
-                f"[Worker] Prewarm {reason} note: {_origin_label(origin)} "
-                f"({ms:.1f}ms, non-fatal): {err}"
-            )
-
-
-async def prewarm_for_transfer(state: WorkerState, transfer_plan: dict, *, reason: str) -> None:
-    """Warm DNS/TLS/HTTP pool for transfer hosts; persist newly learned origins."""
-    if not PREWARM_ENABLED or not state.http_client:
-        return
-
-    if transfer_plan.get("mode") == "flat":
-        task_origins = _collect_transfer_origins(transfer_plan)
-    else:
-        task_origins = _collect_transfer_origins(transfer_plan.get("execution_context", {}))
-    if not task_origins and not state.prewarm_origins:
-        return
-
-    if state.prewarm_lock is None:
-        state.prewarm_lock = asyncio.Lock()
-
-    warm_origins = task_origins or set(state.prewarm_origins)
-    async with state.prewarm_lock:
-        previous = list(state.prewarm_origins)
-        merged = _merge_prewarm_origins(previous, task_origins)
-        added = [origin for origin in merged if origin not in previous]
-        if merged != previous:
-            state.prewarm_origins = merged
-            cache_path = _prewarm_cache_path()
-            if cache_path:
-                _save_prewarm_cache(cache_path, merged)
-                if added:
-                    added_labels = ", ".join(_origin_label(origin) for origin in added)
-                    cache_name = cache_path.name
-                    print(
-                        f"[Worker] Prewarm cache updated ({cache_name}): "
-                        f"+{len(added)} origin(s) — {added_labels}"
-                    )
-
-    await _prewarm_origins(state.http_client, warm_origins, reason=reason)
 
 
 async def fetch_and_send_chunk(
@@ -1041,6 +819,7 @@ async def fetch_and_send_chunk(
     offer_id: str = None,
     route_metadata: Optional[Dict[str, Any]] = None,
     is_canary: bool = False,
+    send_chunk_offset: int = None,
     extra_fetch_headers: Optional[Dict[str, str]] = None,
     extra_dest_headers: Optional[Dict[str, str]] = None,
 ) -> tuple[int, str, Optional[str], int, float, float]:
@@ -1058,9 +837,12 @@ async def fetch_and_send_chunk(
         if is_object_storage
         else {}
     )
+    upload_offset = (
+        send_chunk_offset if send_chunk_offset is not None else (chunk_offset or 0)
+    )
 
     for attempt in range(MAX_RETRIES):
-        queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=32)  # was 8 — larger buffer reduces producer stalls
+        queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=32)
         hasher = hashlib.sha256()
         bytes_transferred = 0
         fetch_error: Optional[BaseException] = None
@@ -1090,7 +872,6 @@ async def fetch_and_send_chunk(
 
                     loop = asyncio.get_event_loop()
                     async for part in response.aiter_bytes(chunk_size=FETCH_STREAM_CHUNK_SIZE):
-                        # Hash in thread pool so the event loop stays free during large transfers
                         await loop.run_in_executor(_hash_executor, hasher.update, part)
                         bytes_transferred += len(part)
                         if (
@@ -1134,12 +915,11 @@ async def fetch_and_send_chunk(
                 "Content-Type": "application/octet-stream",
                 "X-Transfer-ID": transfer_id,
                 "X-Chunk-ID": f"chunk_{chunk_index}",
-                "X-Offset": str(chunk_offset or 0),
+                "X-Offset": str(upload_offset),
                 "X-Length": str(expected_max_bytes or bytes_transferred or 0),
                 "X-Total-Size": str(total_size or 0),
                 "X-Chunk-SHA256": chunk_hash_header or "",
             }
-            # Sending Content-Length allows the server to preallocate and avoids chunked-transfer overhead
             if expected_max_bytes and expected_max_bytes > 0:
                 send_headers["Content-Length"] = str(expected_max_bytes)
             if extra_dest_headers:
@@ -1172,36 +952,30 @@ async def fetch_and_send_chunk(
                 )
 
             send_started = time.perf_counter()
-            # Always pipeline: fetch and upload run concurrently.
-            # This halves wall-clock time for a single chunk from O(fetch+send) to O(max(fetch,send)).
-            pipeline_send = True
-            if pipeline_send:
-                send_task = asyncio.create_task(
-                    stream_to_destination(expected_chunk_hash)
-                )
-                await producer_task
-                if fetch_error:
-                    send_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await send_task
-                    raise fetch_error
-                response = await send_task
-            else:
-                await producer_task
-                if fetch_error:
-                    raise fetch_error
-                response = await stream_to_destination(hasher.hexdigest())
+            send_task = asyncio.create_task(stream_to_destination(expected_chunk_hash))
+            await producer_task
+            if fetch_error:
+                send_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await send_task
+                raise fetch_error
+            response = await send_task
 
             response.raise_for_status()
             send_ms = (time.perf_counter() - send_started) * 1000
             chunk_hash = hasher.hexdigest()
 
-            if expected_chunk_hash and chunk_hash != expected_chunk_hash:
+            if expected_chunk_hash and chunk_hash.lower() != expected_chunk_hash.lower():
                 raise ValueError(
                     f"chunk hash mismatch: expected {expected_chunk_hash}, got {chunk_hash}"
                 )
 
             etag = response.headers.get("ETag") or response.headers.get("etag")
+            if is_object_storage:
+                print(
+                    f"[Worker] Staging PUT ok chunk={chunk_index} "
+                    f"bytes={bytes_transferred} etag={etag!r}"
+                )
             return (
                 bytes_transferred,
                 chunk_hash,
@@ -1244,214 +1018,16 @@ async def fetch_and_send_chunk(
     raise Exception("Max retries exceeded")
 
 
-def is_object_storage_presigned_url(url: str) -> bool:
-    """Check if URL is an object-storage pre-signed upload URL."""
-    if not url:
-        return False
-    return (
-        "X-Amz-Signature" in url
-        or "X-Goog-Signature" in url
-        or "r2.cloudflarestorage.com" in url
-        or "storage.googleapis.com" in url
-    )
-
-
-def is_canary_destination(url: str) -> bool:
-    """Check if URL is a canary/null destination."""
-    if not url:
-        return False
-    return url.startswith(("null://", "canary://", "skip://"))
-
-
-def estimate_task_bytes(task: dict, transfer_plan: Optional[dict] = None) -> int:
+def estimate_task_bytes(task: dict) -> int:
     """Estimate how many bytes this task can hold in memory."""
-    if transfer_plan and transfer_plan.get("mode") == "flat":
-        try:
-            return max(1, int(transfer_plan.get("chunk_size") or task.get("chunk_size") or DEFAULT_CHUNK_SIZE_BYTES))
-        except (TypeError, ValueError):
-            return DEFAULT_CHUNK_SIZE_BYTES
-
-    execution_context = (
-        transfer_plan.get("execution_context", {})
-        if transfer_plan
-        else task.get("execution_context", {})
-    )
-    chunk_indices = execution_context.get("chunk_indices") or [0]
-
-    try:
-        chunk_count = max(1, len(chunk_indices))
-    except TypeError:
-        chunk_count = 1
-
-    raw_chunk_size = (
-        execution_context.get("chunk_size") or task.get("chunk_size") or DEFAULT_CHUNK_SIZE_BYTES
-    )
+    raw_chunk_size = task.get("chunk_size") or DEFAULT_CHUNK_SIZE_BYTES
 
     try:
         chunk_size = max(1, int(raw_chunk_size))
     except (TypeError, ValueError):
         chunk_size = DEFAULT_CHUNK_SIZE_BYTES
 
-    total_size = execution_context.get("total_size")
-    chunk_offset = execution_context.get("chunk_offset")
-
-    try:
-        if total_size is not None and chunk_offset is not None:
-            remaining = max(0, int(total_size) - int(chunk_offset))
-            chunk_size = max(1, min(chunk_size, remaining or chunk_size))
-    except (TypeError, ValueError):
-        pass
-
-    return chunk_size * chunk_count
-
-
-async def execute_flat_transfer(
-    state: WorkerState,
-    task_id: str,
-    transfer_plan: dict,
-    task_message: dict,
-    deadline_us: int,
-) -> tuple:
-    """Execute a flat BeamCore offer using the pipelined fetch_and_send_chunk path."""
-    source_url = transfer_plan["source_url"]
-    destination_url = transfer_plan["dest_url"]
-    transfer_id = transfer_plan.get("transfer_id", "")
-    chunk_size = int(transfer_plan["chunk_size"])
-    range_start = int(transfer_plan["range_start"])
-    source_headers_offer = transfer_plan.get("source_headers") or {}
-    dest_headers_offer = transfer_plan.get("dest_headers") or {}
-    chunk_index = 0
-
-    chunk_hashes: dict = {}
-    if "chunk_hashes" in task_message and isinstance(task_message["chunk_hashes"], dict):
-        for k, v in task_message["chunk_hashes"].items():
-            chunk_hashes[int(k)] = v
-    elif "chunk_hash" in task_message and task_message["chunk_hash"]:
-        chunk_hashes[chunk_index] = task_message["chunk_hash"]
-
-    client = state.http_client
-    is_canary = is_canary_destination(destination_url)
-    computed_chunk_hash = ""
-    last_etag: Optional[str] = None
-    offer_id = task_message.get("offer_id") or task_id
-    hotkey = getattr(getattr(state.wallet, "hotkey", None), "ss58_address", "unknown")
-
-    await prewarm_for_transfer(state, transfer_plan, reason="task")
-
-    print(
-        f"[Worker] Transferring flat offer bytes={range_start}-{transfer_plan['range_end']} "
-        f"task={task_label(task_id)} offer={task_label(offer_id)} hotkey={hotkey[:16]}"
-    )
-
-    if deadline_us > 0:
-        now_us = time.time() * 1_000_000
-        remaining_us = deadline_us - now_us
-        if remaining_us <= 0:
-            return (
-                0,
-                False,
-                f"Deadline exceeded before chunk {chunk_index}",
-                "",
-                last_etag,
-            )
-
-    try:
-        chunk_started = time.perf_counter()
-        (
-            bytes_fetched,
-            computed_chunk_hash,
-            etag,
-            response_code,
-            fetch_ms,
-            send_ms,
-        ) = await fetch_and_send_chunk(
-            client,
-            source_url,
-            destination_url,
-            transfer_id,
-            chunk_index,
-            chunk_offset=range_start,
-            chunk_size=chunk_size,
-            total_size=chunk_size,
-            expected_max_bytes=chunk_size,
-            expected_chunk_hash=chunk_hashes.get(chunk_index),
-            task_id=task_id,
-            offer_id=offer_id,
-            is_canary=is_canary,
-            extra_fetch_headers=source_headers_offer or None,
-            extra_dest_headers=dest_headers_offer or None,
-        )
-
-        if is_canary:
-            print(f"[Worker] Chunk {chunk_index}: CANARY mode, skipping upload")
-        else:
-            if etag:
-                last_etag = etag
-
-            total_ms = (time.perf_counter() - chunk_started) * 1000
-            mbps = (bytes_fetched * 8 / 1_000_000) / (total_ms / 1000) if total_ms > 0 else 0
-            print(
-                f"[Worker] Chunk {chunk_index}: {bytes_fetched} bytes transferred "
-                f"task={task_label(task_id)} offer={task_label(offer_id)} "
-                f"fetch_ms={fetch_ms:.1f} send_ms={send_ms:.1f} "
-                f"total_ms={total_ms:.1f} mbps={mbps:.1f} response={response_code}"
-            )
-
-        if bytes_fetched != chunk_size:
-            return (
-                bytes_fetched,
-                False,
-                f"source range returned {bytes_fetched} bytes, expected {chunk_size}",
-                computed_chunk_hash,
-                last_etag,
-            )
-
-        if transfer_plan.get("etag_required") and not last_etag and not is_canary:
-            return (
-                bytes_fetched,
-                False,
-                "missing ETag from storage PUT response",
-                computed_chunk_hash or "",
-                last_etag,
-            )
-
-        print(f"[Worker] Transfer complete: {bytes_fetched} bytes")
-        return (bytes_fetched, True, None, computed_chunk_hash, last_etag)
-
-    except asyncio.TimeoutError as e:
-        detail = exception_detail(e)
-        print(
-            f"[Worker] Chunk {chunk_index} timeout "
-            f"task={task_label(task_id)} offer={task_label(offer_id)} error={detail}"
-        )
-        return (
-            0,
-            False,
-            f"Deadline exceeded at chunk {chunk_index}: {detail}",
-            "",
-            last_etag,
-        )
-    except httpx.HTTPStatusError as e:
-        detail = exception_detail(e)
-        print(
-            f"[Worker] Chunk {chunk_index} HTTP failure "
-            f"task={task_label(task_id)} offer={task_label(offer_id)} "
-            f"status={e.response.status_code} error={detail}"
-        )
-        return (
-            0,
-            False,
-            f"HTTP {e.response.status_code} at chunk {chunk_index}: {detail}",
-            "",
-            last_etag,
-        )
-    except Exception as e:
-        detail = exception_detail(e)
-        print(
-            f"[Worker] Chunk {chunk_index} failure "
-            f"task={task_label(task_id)} offer={task_label(offer_id)} error={detail}{http_status_detail(e)}"
-        )
-        return (0, False, f"Error at chunk {chunk_index}: {detail}", "", last_etag)
+    return chunk_size
 
 
 async def ws_send_task_reject(
@@ -1512,7 +1088,7 @@ def release_ws_capacity(
 async def execute_transfer(
     state: WorkerState,
     task_id: str,
-    execution_context: dict,
+    transfer_context: dict,
     task_message: dict,
     deadline_us: int,
 ) -> tuple:
@@ -1520,28 +1096,15 @@ async def execute_transfer(
 
     Returns: (bytes_transferred, success, error_message, chunk_hash, etag)
     """
-    
-    gateway_url = execution_context.get("gateway_url", "")
-    destination_url = execution_context.get("destination_url", "")
-    transfer_id = execution_context.get("transfer_id", "")
-    chunk_indices = execution_context.get("chunk_indices", [0])
-    object_id = execution_context.get("object_id")
-    chunk_offset = execution_context.get("chunk_offset")
-    chunk_size_ctx = execution_context.get("chunk_size")
-    total_size = execution_context.get("total_size", 0)
-    auth_token = execution_context.get("auth_token")
-    source_urls = execution_context.get("source_urls")
-    dest_urls = execution_context.get("dest_urls")
-    multipart_metadata = execution_context.get("multipart_metadata")
-    if not isinstance(multipart_metadata, dict):
-        multipart_metadata = {}
-    task_chunk_size = task_message.get("chunk_size")
-
-    if not chunk_indices:
-        chunk_indices = [0]
-
-    if chunk_size_ctx is None and task_chunk_size is not None:
-        chunk_size_ctx = task_chunk_size
+    source_url = transfer_context["source_url"]
+    destination_url = transfer_context["dest_url"]
+    transfer_id = transfer_context.get("transfer_id", "")
+    chunk_size = int(transfer_context["chunk_size"])
+    range_start = int(transfer_context["range_start"])
+    range_end = int(transfer_context["range_end"])
+    source_headers_offer = transfer_context.get("source_headers") or {}
+    dest_headers_offer = transfer_context.get("dest_headers") or {}
+    chunk_index = 0
 
     # Build per-chunk hash map
     chunk_hashes: dict = {}
@@ -1549,83 +1112,22 @@ async def execute_transfer(
         for k, v in task_message["chunk_hashes"].items():
             chunk_hashes[int(k)] = v
     elif "chunk_hash" in task_message and task_message["chunk_hash"]:
-        if len(chunk_indices) == 1:
-            chunk_hashes[chunk_indices[0]] = task_message["chunk_hash"]
+        chunk_hashes[chunk_index] = task_message["chunk_hash"]
 
     client = state.http_client
     total_bytes = 0
-    bool(source_urls and dest_urls)
     is_canary = is_canary_destination(destination_url)
     computed_chunk_hash = ""
     last_etag: Optional[str] = None
     offer_id = task_message.get("offer_id") or task_id
     hotkey = getattr(getattr(state.wallet, "hotkey", None), "ss58_address", "unknown")
 
-    await prewarm_for_transfer(
-        state, {"mode": "legacy", "execution_context": execution_context}, reason="task"
-    )
-
     print(
-        f"[Worker] Transferring {len(chunk_indices)} chunk(s) "
+        f"[Worker] Transferring signed range bytes={range_start}-{range_end} "
         f"task={task_label(task_id)} offer={task_label(offer_id)} hotkey={hotkey[:16]}"
     )
-    print(execution_context)
 
-    for chunk_index in chunk_indices:
-        chunk_key = str(chunk_index)
-        chunk_offset_for_fetch = chunk_offset
-
-        try:
-            chunk_size_for_fetch = int(chunk_size_ctx) if chunk_size_ctx is not None else None
-        except (TypeError, ValueError):
-            chunk_size_for_fetch = None
-
-        if object_id and chunk_offset_for_fetch is None and chunk_size_for_fetch is not None:
-            chunk_offset_for_fetch = chunk_index * chunk_size_for_fetch
-
-        try:
-            chunk_offset_for_fetch = (
-                int(chunk_offset_for_fetch) if chunk_offset_for_fetch is not None else None
-            )
-        except (TypeError, ValueError):
-            chunk_offset_for_fetch = None
-
-        expected_chunk_bytes = None
-        if chunk_size_for_fetch and chunk_size_for_fetch > 0:
-            expected_chunk_bytes = chunk_size_for_fetch
-            try:
-                total_size_int = int(total_size)
-            except (TypeError, ValueError):
-                total_size_int = 0
-            if total_size_int > 0 and chunk_offset_for_fetch is not None:
-                expected_chunk_bytes = min(
-                    chunk_size_for_fetch, max(0, total_size_int - chunk_offset_for_fetch)
-                )
-            if expected_chunk_bytes <= 0:
-                expected_chunk_bytes = chunk_size_for_fetch
-
-        # Resolve source URL
-        if source_urls and chunk_key in source_urls:
-            final_url = source_urls[chunk_key]
-        elif object_id:
-            base = gateway_url.rstrip("/")
-            final_url = f"{base}/objects/{object_id}"
-        else:
-            base = gateway_url.rstrip("/")
-            final_url = f"{base}/chunks/{transfer_id}/{chunk_index}"
-
-        # Resolve destination URL
-        if dest_urls and chunk_key in dest_urls:
-            chunk_dest_url = dest_urls[chunk_key]
-        else:
-            chunk_dest_url = destination_url
-
-        use_range = (
-            chunk_offset_for_fetch is not None
-            and chunk_size_for_fetch is not None
-            and (object_id is not None or (source_urls and chunk_key in source_urls))
-        )
-
+    try:
         # Check deadline
         if deadline_us > 0:
             now_us = time.time() * 1_000_000
@@ -1639,38 +1141,44 @@ async def execute_transfer(
                     last_etag,
                 )
 
-        try:
-            chunk_started = time.perf_counter()
-            (
-                bytes_fetched,
-                computed_chunk_hash,
-                etag,
-                response_code,
-                fetch_ms,
-                send_ms,
-            ) = await fetch_and_send_chunk(
-                client,
-                final_url,
-                chunk_dest_url,
-                transfer_id,
-                chunk_index,
-                chunk_offset=chunk_offset_for_fetch if use_range else None,
-                chunk_size=chunk_size_for_fetch if use_range else None,
-                total_size=total_size if use_range else None,
-                expected_max_bytes=expected_chunk_bytes,
-                expected_chunk_hash=chunk_hashes.get(chunk_index),
-                auth_token=auth_token,
-                task_id=task_id,
-                offer_id=offer_id,
-                route_metadata=multipart_metadata,
-                is_canary=is_canary,
+        chunk_started = time.perf_counter()
+        (
+            bytes_fetched,
+            computed_chunk_hash,
+            etag,
+            response_code,
+            fetch_ms,
+            send_ms,
+        ) = await fetch_and_send_chunk(
+            client,
+            source_url,
+            destination_url,
+            transfer_id,
+            chunk_index,
+            total_size=chunk_size,
+            expected_max_bytes=chunk_size,
+            expected_chunk_hash=chunk_hashes.get(chunk_index),
+            task_id=task_id,
+            offer_id=offer_id,
+            extra_fetch_headers=source_headers_offer or None,
+            extra_dest_headers=dest_headers_offer or None,
+            is_canary=is_canary,
+            send_chunk_offset=range_start,
+        )
+
+        if bytes_fetched != chunk_size:
+            return (
+                total_bytes,
+                False,
+                f"source range returned {bytes_fetched} bytes, expected {chunk_size}",
+                computed_chunk_hash or "",
+                last_etag,
             )
 
-            if is_canary:
-                print(f"[Worker] Chunk {chunk_index}: CANARY mode, skipping upload")
-                total_bytes += bytes_fetched
-                continue
-
+        if is_canary:
+            print(f"[Worker] Chunk {chunk_index}: CANARY mode, skipping upload")
+            total_bytes += bytes_fetched
+        else:
             if etag:
                 last_etag = etag
 
@@ -1684,40 +1192,49 @@ async def execute_transfer(
                 f"total_ms={total_ms:.1f} mbps={mbps:.1f} response={response_code}"
             )
 
-        except asyncio.TimeoutError as e:
-            detail = exception_detail(e)
-            print(
-                f"[Worker] Chunk {chunk_index} timeout "
-                f"task={task_label(task_id)} offer={task_label(offer_id)} error={detail}"
-            )
-            return (
-                total_bytes,
-                False,
-                f"Deadline exceeded at chunk {chunk_index}: {detail}",
-                "",
-                last_etag,
-            )
-        except httpx.HTTPStatusError as e:
-            detail = exception_detail(e)
-            print(
-                f"[Worker] Chunk {chunk_index} HTTP failure "
-                f"task={task_label(task_id)} offer={task_label(offer_id)} "
-                f"status={e.response.status_code} error={detail}"
-            )
-            return (
-                total_bytes,
-                False,
-                f"HTTP {e.response.status_code} at chunk {chunk_index}: {detail}",
-                "",
-                last_etag,
-            )
-        except Exception as e:
-            detail = exception_detail(e)
-            print(
-                f"[Worker] Chunk {chunk_index} failure "
-                f"task={task_label(task_id)} offer={task_label(offer_id)} error={detail}{http_status_detail(e)}"
-            )
-            return (total_bytes, False, f"Error at chunk {chunk_index}: {detail}", "", last_etag)
+    except asyncio.TimeoutError as e:
+        detail = exception_detail(e)
+        print(
+            f"[Worker] Chunk {chunk_index} timeout "
+            f"task={task_label(task_id)} offer={task_label(offer_id)} error={detail}"
+        )
+        return (
+            total_bytes,
+            False,
+            f"Deadline exceeded at chunk {chunk_index}: {detail}",
+            "",
+            last_etag,
+        )
+    except httpx.HTTPStatusError as e:
+        detail = exception_detail(e)
+        print(
+            f"[Worker] Chunk {chunk_index} HTTP failure "
+            f"task={task_label(task_id)} offer={task_label(offer_id)} "
+            f"status={e.response.status_code} error={detail}"
+        )
+        return (
+            total_bytes,
+            False,
+            f"HTTP {e.response.status_code} at chunk {chunk_index}: {detail}",
+            "",
+            last_etag,
+        )
+    except Exception as e:
+        detail = exception_detail(e)
+        print(
+            f"[Worker] Chunk {chunk_index} failure "
+            f"task={task_label(task_id)} offer={task_label(offer_id)} error={detail}{http_status_detail(e)}"
+        )
+        return (total_bytes, False, f"Error at chunk {chunk_index}: {detail}", "", last_etag)
+
+    if transfer_context.get("etag_required") and not last_etag:
+        return (
+            total_bytes,
+            False,
+            "missing ETag from storage PUT response",
+            computed_chunk_hash or "",
+            last_etag,
+        )
 
     print(f"[Worker] Transfer complete: {total_bytes} bytes")
     return (total_bytes, True, None, computed_chunk_hash, last_etag)
@@ -1734,12 +1251,14 @@ def get_ws_url(
     gateway_url: str,
     worker_secret: Optional[str] = None,
 ) -> str:
-    """Convert worker-gateway URL to the worker WebSocket URL."""
+    """Convert worker gateway URL to the worker WebSocket URL."""
     base = gateway_url.rstrip("/")
     if base.startswith("https://"):
         ws_base = "wss://" + base[8:]
     elif base.startswith("http://"):
         ws_base = "ws://" + base[7:]
+    elif base.startswith("wss://"):
+        ws_base = "wss://" + base[6:]
     elif base.startswith("ws://"):
         ws_base = "ws://" + base[5:]
     else:
@@ -1776,24 +1295,6 @@ def get_ws_status_code(exc: Exception) -> Optional[int]:
     return None
 
 
-async def ws_send_stats_snapshot(websocket, state: WorkerState) -> bool:
-    """Send a worker telemetry snapshot over WebSocket."""
-    try:
-        hotkey = getattr(getattr(state.wallet, "hotkey", None), "ss58_address", None)
-        msg = {
-            "type": "stats_snapshot",
-            "bandwidth_mbps": state.last_measured_bandwidth_mbps,
-            "tasks_active": state.active_tasks,
-        }
-        if hotkey:
-            msg["hotkey"] = hotkey
-        await ws_send_json(websocket, state, msg)
-        return True
-    except Exception as e:
-        print(f"[Worker] WS stats snapshot error: {e}")
-        return False
-
-
 async def ws_send_task_accept(
     websocket, state: WorkerState, task_id: str, offer_id: str = None
 ) -> bool:
@@ -1819,16 +1320,12 @@ async def ws_send_task_result(
     task_id: str,
     success: bool,
     bytes_transferred: int,
-    bandwidth_mbps: float,
-    duration_ms: float,
-    start_time_us: int,
-    end_time_us: int,
     chunk_hash: str = "",
     etag: str = None,
     error: str = None,
     offer_id: str = None,
 ) -> bool:
-    """Send task_result over WebSocket (BeamCore derives bytes from task metadata)."""
+    """Send task completion receipt over WebSocket."""
     try:
         msg = {
             "type": "task_result",
@@ -1856,10 +1353,6 @@ async def finalize_ws_task_result(
     task_id: str,
     success: bool,
     bytes_transferred: int,
-    bandwidth_mbps: float,
-    duration_ms: float,
-    start_time_us: int,
-    end_time_us: int,
     chunk_hash: str = "",
     etag: str = None,
     error: str = None,
@@ -1880,10 +1373,6 @@ async def finalize_ws_task_result(
                 task_id,
                 success,
                 bytes_transferred,
-                bandwidth_mbps,
-                duration_ms,
-                start_time_us,
-                end_time_us,
                 chunk_hash=chunk_hash,
                 etag=etag,
                 error=error,
@@ -1955,16 +1444,16 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
     offer_id = task.get("offer_id") or task_id
     task_key = offer_id or task_id
     deadline_us = task.get("deadline_us", 0)
-    transfer_plan, validation_error = resolve_transfer_plan(task)
-    estimated_bytes = estimate_task_bytes(task, transfer_plan)
+    transfer_context, validation_error = build_transfer_context(task)
+    estimated_bytes = estimate_task_bytes(task)
     reserved_capacity = False
 
     print(f"[Worker] [WS] Task: {task_label(task_id)} offer={task_label(offer_id)}...")
     if not task_id:
         print("[Worker] [WS] Skipping task: missing task_id")
         return False
-    if validation_error or transfer_plan is None:
-        reason = f"invalid_offer:{validation_error or 'missing_transfer_endpoints'}"
+    if validation_error or transfer_context is None:
+        reason = f"invalid_offer:{validation_error or 'unknown'}"
         await ws_send_task_reject(websocket, state, task_id, reason, offer_id=offer_id)
         print(
             f"[Worker] [WS] Rejected task {task_label(task_id)} offer={task_label(offer_id)}: "
@@ -2022,7 +1511,7 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
             state,
             task_id,
             task,
-            transfer_plan,
+            transfer_context,
             deadline_us,
             log_prefix="[Worker] [WS]",
         )
@@ -2033,10 +1522,6 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
             task_id,
             result.success,
             result.bytes_transferred,
-            result.bandwidth_mbps,
-            result.duration_ms,
-            result.start_time_us,
-            result.end_time_us,
             chunk_hash=result.chunk_hash,
             etag=result.etag,
             error=result.error_msg,
@@ -2051,14 +1536,10 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
                 chunk_hash=result.chunk_hash,
             )
 
-        if result.success:
-            state.bytes_relayed += result.bytes_transferred
-            state.last_measured_bandwidth_mbps = result.bandwidth_mbps
-
         status = "OK" if result.success else f"FAIL: {result.error_msg}"
         print(
             f"[Worker] [WS] Task {task_label(task_id)} offer={task_label(offer_id)}: {status} | "
-            f"{result.bytes_transferred} bytes | {result.bandwidth_mbps:.1f} Mbps"
+            f"{result.bytes_transferred} bytes"
         )
 
         return result.success
@@ -2070,10 +1551,10 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
 async def websocket_loop(state: WorkerState):
     """WebSocket communication loop with automatic reconnection."""
     if not WEBSOCKETS_AVAILABLE:
-        raise RuntimeError("websockets library is required for worker-gateway transport")
+        raise RuntimeError("websockets library is required for worker gateway transport")
 
     if not state.worker_gateway_url:
-        raise RuntimeError("WORKER_GATEWAY_URL is required for worker-gateway transport")
+        raise RuntimeError("WORKER_GATEWAY_URL is required for worker gateway transport")
 
     ws_url = get_ws_url(
         state.worker_id,
@@ -2097,9 +1578,6 @@ async def websocket_loop(state: WorkerState):
                 reconnect_delay = WS_RECONNECT_MIN_DELAY
                 print("[Worker] [WS] Connected!")
 
-                await ws_send_stats_snapshot(websocket, state)
-                last_stats_snapshot = time.time()
-
                 while state.running:
                     try:
                         try:
@@ -2112,18 +1590,6 @@ async def websocket_loop(state: WorkerState):
 
                             if msg_type == "connected":
                                 print("[Worker] [WS] Server confirmed connection")
-
-                            elif msg_type == "stats_snapshot_ack":
-                                bw_challenge = message.get("bw_challenge")
-                                if bw_challenge:
-                                    challenge_id = bw_challenge.get("challenge_id")
-                                    if challenge_id:
-                                        bw_response = {
-                                            "type": "bw_challenge_response",
-                                            "challenge_id": challenge_id,
-                                            "worker_id": state.worker_id,
-                                        }
-                                        await ws_send_json(websocket, state, bw_response)
 
                             elif msg_type == "task_offer":
                                 track_ws_task(state, handle_ws_task(state, websocket, message))
@@ -2143,7 +1609,7 @@ async def websocket_loop(state: WorkerState):
                                         f"reason={message.get('reason', 'unknown')}"
                                     )
 
-                            elif msg_type in ("task_result_ack", "task_result_summary_ack"):
+                            elif msg_type == "task_result_ack":
                                 ack_task_id = message.get("task_id")
                                 ack_offer_id = message.get("offer_id") or ack_task_id
                                 received = bool(message.get("received", False))
@@ -2177,11 +1643,6 @@ async def websocket_loop(state: WorkerState):
                         except asyncio.TimeoutError:
                             pass
 
-                        now = time.time()
-                        if now - last_stats_snapshot >= WS_STATS_SNAPSHOT_INTERVAL:
-                            await ws_send_stats_snapshot(websocket, state)
-                            last_stats_snapshot = now
-
                     except ConnectionClosed as e:
                         print(f"[Worker] [WS] Connection closed: {e.code} {e.reason}")
                         break
@@ -2189,7 +1650,7 @@ async def websocket_loop(state: WorkerState):
         except InvalidStatus as e:
             print(f"[Worker] [WS] Connection rejected: HTTP {e.status_code}")
             raise RuntimeError(
-                f"worker-gateway websocket rejected the connection with HTTP {e.status_code}"
+                f"worker gateway websocket rejected the connection with HTTP {e.status_code}"
             ) from e
 
         except ConnectionRefusedError:
@@ -2206,7 +1667,7 @@ async def websocket_loop(state: WorkerState):
             and state.ws_reconnect_attempts >= WS_MAX_RECONNECT_ATTEMPTS
         ):
             raise RuntimeError(
-                "worker-gateway websocket unavailable after maximum reconnect attempts"
+                "worker gateway websocket unavailable after maximum reconnect attempts"
             )
 
         if state.running and not shutdown_event.is_set():
@@ -2243,27 +1704,15 @@ async def run_worker(state: WorkerState):
     hotkey = wallet.hotkey.ss58_address
     if state.ws_send_lock is None:
         state.ws_send_lock = asyncio.Lock()
-    state.prewarm_lock = asyncio.Lock()
-    cache_path = _prewarm_cache_path()
-    if cache_path:
-        state.prewarm_origins = _load_prewarm_cache(cache_path)
-        if state.prewarm_origins:
-            print(
-                f"[Worker] Prewarm cache loaded ({cache_path.name}): "
-                f"{len(state.prewarm_origins)} origin(s)"
-            )
 
     # Create HTTP client
     state.http_client = httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=10.0, read=120.0, write=120.0, pool=5.0),  # read/write: 60→120s
+        timeout=httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=5.0),
         limits=httpx.Limits(
-            max_connections=max(16, MAX_CONCURRENT_TASKS * 8),         # was *4
-            max_keepalive_connections=max(8, MAX_CONCURRENT_TASKS * 4), # was *2
+            max_connections=max(8, MAX_CONCURRENT_TASKS * 4),
+            max_keepalive_connections=max(4, MAX_CONCURRENT_TASKS * 2),
         ),
     )
-
-    if PREWARM_ENABLED and state.prewarm_origins:
-        await _prewarm_origins(state.http_client, state.prewarm_origins, reason="startup")
 
     try:
         async with httpx.AsyncClient() as client:
@@ -2280,11 +1729,11 @@ async def run_worker(state: WorkerState):
         if CONNECTION_MODE not in {"websocket", "auto"}:
             raise RuntimeError("Worker transport is websocket-only; remove CONNECTION_MODE=http")
         if not WEBSOCKETS_AVAILABLE:
-            raise RuntimeError("websockets library is required for worker-gateway transport")
+            raise RuntimeError("websockets library is required for worker gateway transport")
         if not state.worker_gateway_url:
-            raise RuntimeError("WORKER_GATEWAY_URL must point to worker-gateway for worker runtime traffic")
+            raise RuntimeError("WORKER_GATEWAY_URL must point to an orchestrator-owned worker gateway")
 
-        print("[Worker] Starting WebSocket connection (worker-gateway transport)")
+        print("[Worker] Starting WebSocket connection (worker gateway transport)")
         await websocket_loop(state)
 
     except asyncio.CancelledError:
@@ -2329,6 +1778,11 @@ def _build_cli_args() -> list[str]:
         if wallet_hotkey:
             env_args.extend(["--wallet.hotkey", wallet_hotkey])
 
+    if not _cli_has_flag(cli, "--wallet.path"):
+        wallet_path = os.environ.get("WALLET_PATH", "").strip()
+        if wallet_path:
+            env_args.extend(["--wallet.path", wallet_path])
+
     if not _cli_has_flag(cli, "--subtensor.network"):
         network = os.environ.get("SUBTENSOR_NETWORK", "").strip()
         if network:
@@ -2339,7 +1793,6 @@ def _build_cli_args() -> list[str]:
 
 def get_config():
     """Get configuration from command line arguments and workspace .env."""
-    # Bittensor 10+ skips argv parsing unless this is disabled.
     os.environ.setdefault("BT_NO_PARSE_CLI_ARGS", "false")
 
     parser = argparse.ArgumentParser(description="Beam Network Worker")
@@ -2348,7 +1801,6 @@ def get_config():
     bt.Wallet.add_args(parser)
     bt.Subtensor.add_args(parser)
 
-    # Parse arguments
     config = bt.Config(parser, args=_build_cli_args())
     return config
 
@@ -2379,8 +1831,16 @@ async def main():
         print(f"Failed to load hotkey: {e}")
         sys.exit(1)
 
-    api_url = os.environ.get("CORE_SERVER_URL", MAINNET_URL)
-    print("Network: mainnet")
+    # Determine API URL based on network
+    network = config.subtensor.get("network", "finney")
+    if network not in ("finney", "mainnet"):
+        api_url = os.environ.get("CORE_SERVER_URL")
+        if not api_url:
+            raise RuntimeError("CORE_SERVER_URL is required when running the public worker on a non-mainnet network")
+        print(f"Network: {network}")
+    else:
+        api_url = os.environ.get("CORE_SERVER_URL", MAINNET_URL)
+        print("Network: mainnet")
     worker_gateway_url = os.environ.get("WORKER_GATEWAY_URL")
     worker_gateway_secret = (
         os.environ.get("WORKER_GATEWAY_WORKER_SECRET", "").strip()
@@ -2390,18 +1850,14 @@ async def main():
     print(f"API URL: {api_url}")
     if worker_gateway_url:
         print(f"Worker gateway URL: {worker_gateway_url}")
-        if not worker_gateway_secret:
-            print(
-                "Warning: WORKER_GATEWAY_WORKER_SECRET not set — "
-                "dedicated gateways reject unsigned worker connections"
-            )
+        if worker_gateway_secret:
+            print("Worker gateway secret: configured")
     else:
         print("Worker gateway URL: MISSING")
     print(
         f"Worker limits: concurrency={MAX_CONCURRENT_TASKS}, "
         f"ws_queue={MAX_QUEUED_WS_TASKS}, "
-        f"in_flight={MAX_IN_FLIGHT_BYTES // (1024 * 1024)} MiB, "
-        f"prewarm={'on' if PREWARM_ENABLED else 'off'}"
+        f"in_flight={MAX_IN_FLIGHT_BYTES // (1024 * 1024)} MiB"
     )
     print()
 

@@ -1,4 +1,4 @@
-# Build from repository root (beam), not from this directory:
+# Build from the repository root, not from this directory:
 #
 #   docker build -f neurons/orchestrator/Dockerfile -t beam-orchestrator:latest .
 #

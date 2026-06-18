@@ -44,6 +44,7 @@ require_instances() {
 case "$ACTION" in
   start)
     require_instances
+    beam_validate_orchestrator_configs
     beam_require_unit "beam-orchestrator@.service"
     beam_sync_orchestrators
     beam_systemctl start beam-orchestrators.target
@@ -63,6 +64,7 @@ case "$ACTION" in
     ;;
   restart)
     require_instances
+    beam_validate_orchestrator_configs
     beam_require_unit "beam-orchestrator@.service"
     beam_sync_orchestrators
     beam_systemctl restart beam-orchestrators.target

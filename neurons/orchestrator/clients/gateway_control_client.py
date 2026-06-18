@@ -1,8 +1,8 @@
 """
-Client for the orchestrator-owned worker gateway control channel.
+Client for the in-process worker gateway control channel.
 
-Implements the dedicated-gateway topology from the Beam orchestrator guide:
-https://data.b1m.ai/guide/orchestrators#dedicated-gateway-websocket-protocol
+Orchestrator connects to the local worker gateway WebSocket with control_secret:
+  ws://127.0.0.1:<API_PORT>/ws/<session_id>?api_key=...&control_secret=...
 """
 
 from __future__ import annotations
@@ -11,28 +11,32 @@ import asyncio
 import json
 import logging
 import uuid
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
+from urllib.parse import urlencode
 
 import websockets
-from websockets.exceptions import ConnectionClosed
 
 logger = logging.getLogger(__name__)
 
+ApiKeyProvider = Callable[[], Awaitable[Optional[str]]]
+
 
 class GatewayControlClient:
-    """Maintains the orchestrator ↔ worker-gateway control WebSocket."""
+    """Maintains the orchestrator ↔ in-process worker-gateway control WebSocket."""
 
     def __init__(
         self,
         control_url: str,
         control_secret: str,
         *,
+        api_key_provider: Optional[ApiKeyProvider] = None,
         open_timeout: float = 30.0,
         ping_interval: float = 30.0,
         ping_timeout: float = 10.0,
     ) -> None:
-        self._control_url = self._normalize_control_url(control_url)
+        self._control_base_url = control_url.rstrip("/")
         self._control_secret = control_secret
+        self._api_key_provider = api_key_provider
         self._open_timeout = open_timeout
         self._ping_interval = ping_interval
         self._ping_timeout = ping_timeout
@@ -45,24 +49,13 @@ class GatewayControlClient:
 
         self._pending_requests: dict[str, asyncio.Future] = {}
         self._event_handler: Optional[Callable] = None
-
         self._local_workers: dict[str, dict[str, Any]] = {}
-
-    @staticmethod
-    def _normalize_control_url(url: str) -> str:
-        trimmed = url.rstrip("/")
-        if trimmed.startswith("https://"):
-            return "wss://" + trimmed[8:]
-        if trimmed.startswith("http://"):
-            return "ws://" + trimmed[7:]
-        return trimmed
 
     @property
     def connected(self) -> bool:
         return self._connected
 
     def set_event_handler(self, handler: Callable) -> None:
-        """Handler for gateway push events (worker_connected, worker_response, etc.)."""
         self._event_handler = handler
 
     def get_local_workers(self) -> list[dict[str, Any]]:
@@ -94,7 +87,7 @@ class GatewayControlClient:
         return workers
 
     async def send_task_offer(self, worker_id: str, offer: dict[str, Any]) -> bool:
-        if not self._connected:
+        if not self._connected or not self._ws:
             logger.warning("Gateway control not connected; cannot send task_offer")
             return False
         try:
@@ -103,7 +96,7 @@ class GatewayControlClient:
             )
             return True
         except Exception as exc:
-            logger.error("Failed to send task_offer to gateway: %s", exc)
+            logger.error("Failed to send task_offer to gateway control: %s", exc)
             return False
 
     async def send_task_accept_ack(
@@ -115,7 +108,7 @@ class GatewayControlClient:
         accepted: bool,
         reason: Optional[str] = None,
     ) -> None:
-        if not self._connected:
+        if not self._connected or not self._ws:
             return
         await self._ws.send(
             json.dumps(
@@ -140,7 +133,7 @@ class GatewayControlClient:
         completed: Optional[bool] = None,
         reason: Optional[str] = None,
     ) -> None:
-        if not self._connected:
+        if not self._connected or not self._ws:
             return
         await self._ws.send(
             json.dumps(
@@ -156,8 +149,23 @@ class GatewayControlClient:
             )
         )
 
-    # Backward-compatible alias (deprecated)
-    send_task_result_summary_ack = send_task_result_ack
+    async def _build_connect_url(self) -> str:
+        ws_base = self._control_base_url
+        if ws_base.startswith("https://"):
+            ws_base = "wss://" + ws_base[8:]
+        elif ws_base.startswith("http://"):
+            ws_base = "ws://" + ws_base[7:]
+
+        params: dict[str, str] = {"control_secret": self._control_secret}
+        if self._api_key_provider:
+            api_key = await self._api_key_provider()
+            if api_key:
+                params["api_key"] = api_key
+
+        query = urlencode(params)
+        if "?" in ws_base:
+            return f"{ws_base}&{query}"
+        return f"{ws_base}?{query}"
 
     async def _send_request(self, message: dict[str, Any], timeout: float = 10.0) -> dict[str, Any]:
         if not self._ws or not self._connected:
@@ -177,10 +185,9 @@ class GatewayControlClient:
     async def _connection_loop(self) -> None:
         while self._running:
             try:
-                headers = {"x-control-secret": self._control_secret}
+                url = await self._build_connect_url()
                 async with websockets.connect(
-                    self._control_url,
-                    additional_headers=headers,
+                    url,
                     open_timeout=self._open_timeout,
                     ping_interval=self._ping_interval,
                     ping_timeout=self._ping_timeout,
@@ -188,12 +195,12 @@ class GatewayControlClient:
                     self._ws = ws
                     self._connected = True
                     self._reconnect_delay = 5.0
-                    logger.info("Connected to worker-gateway control channel: %s", self._control_url)
+                    logger.info("Connected to in-process worker gateway control: %s", url)
                     await self._recv_loop(ws)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                logger.warning("Gateway control connection error: %s", exc)
+                logger.warning("Worker gateway control connection error: %s", exc)
             finally:
                 self._connected = False
                 self._ws = None
@@ -232,13 +239,7 @@ class GatewayControlClient:
         if msg_type == "worker_connected":
             worker_id = data.get("worker_id")
             if worker_id:
-                self._local_workers[worker_id] = {
-                    "worker_id": worker_id,
-                    "client_ip": str(data.get("client_ip") or ""),
-                    "hotkey": str(data.get("hotkey") or ""),
-                    "bandwidth_mbps": 0.0,
-                    "trust_score": 0.8,
-                }
+                self._local_workers[worker_id] = {"worker_id": worker_id}
             if self._event_handler:
                 await self._dispatch_event(data)
             return
@@ -251,31 +252,14 @@ class GatewayControlClient:
                 await self._dispatch_event(data)
             return
 
-        if msg_type == "worker_capacity_update":
-            worker_id = data.get("worker_id")
-            if worker_id and worker_id in self._local_workers:
-                worker = self._local_workers[worker_id]
-                worker["bandwidth_mbps"] = float(data.get("bandwidth_mbps") or 0.0)
-                if data.get("client_ip"):
-                    worker["client_ip"] = str(data["client_ip"])
-                if data.get("hotkey"):
-                    worker["hotkey"] = str(data["hotkey"])
-            if self._event_handler:
-                await self._dispatch_event(data)
-            return
-
         if self._event_handler:
             await self._dispatch_event(data)
 
     def _sync_local_workers(self, workers: list[dict[str, Any]]) -> None:
         self._local_workers = {
-            w["worker_id"]: {
-                **w,
-                "trust_score": float(w.get("trust_score") or 0.8),
-                "bandwidth_mbps": float(w.get("bandwidth_mbps") or 0.0),
-            }
+            w["worker_id"]: dict(w)
             for w in workers
-            if w.get("worker_id")
+            if isinstance(w, dict) and w.get("worker_id")
         }
 
     async def _dispatch_event(self, data: dict[str, Any]) -> None:
@@ -293,3 +277,14 @@ class GatewayControlClient:
                 logger.error("Gateway control event handler error: %s", exc)
 
         asyncio.create_task(_run())
+
+
+def build_local_control_ws_url(
+    *,
+    host: str,
+    port: int,
+    session_id: str,
+) -> str:
+    """Build http:// host URL for GatewayControlClient (converted to ws:// internally)."""
+    base = f"http://{host}:{port}/ws/{session_id}"
+    return base

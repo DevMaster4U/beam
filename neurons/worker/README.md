@@ -50,13 +50,14 @@ See [Worker Guide](../../docs/worker.md#multiple-workers-on-one-machine) for ful
 
 ## Transport
 
-The worker uses BeamCore HTTP only for registration and signed bootstrap calls. Transfer runtime uses **worker-gateway** WebSockets (`WORKER_GATEWAY_URL` must be the gateway HTTP/WebSocket origin, not BeamCore Core).
+The worker uses BeamCore HTTP only for registration and signed bootstrap calls. Transfer runtime uses the orchestrator's in-process worker gateway WebSocket (`WORKER_GATEWAY_URL` must be the orchestrator HTTP/WebSocket origin, not BeamCore Core).
 
 Typical environment:
 
 ```bash
 export CORE_SERVER_URL=https://beamcore.b1m.ai
-export WORKER_GATEWAY_URL=https://public-worker-gateway.b1m.ai
+export WORKER_GATEWAY_URL=https://your-orchestrator.example.com
+export WORKER_GATEWAY_WORKER_SECRET=your-long-random-worker-secret
 export CONNECTION_MODE=auto               # or websocket (see worker.py)
 python worker.py --subtensor.network finney
 ```
@@ -64,7 +65,7 @@ python worker.py --subtensor.network finney
 ## How It Works
 
 1. Registers with the network using your Bittensor wallet (signed authentication)
-2. Connects to `worker-gateway` via WebSocket to receive tasks instantly as they are assigned
+2. Connects to the orchestrator worker gateway via WebSocket to receive tasks instantly as they are assigned
 3. For each task: fetches data chunks from the source and delivers them to the destination
 4. Reports completion with proof-of-bandwidth metrics (bytes transferred, speed, duration)
 5. Sends periodic heartbeats to stay registered

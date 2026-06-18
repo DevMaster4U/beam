@@ -109,9 +109,6 @@ async def get_metrics(
     # Byte metrics
     metrics.append(f"beam_bytes_relayed_total {state['total_bytes_relayed']}")
 
-    # Proof metrics
-    metrics.append(f"beam_proofs_pending {state['pending_proofs']}")
-
     # Epoch metrics
     metrics.append(f"beam_current_epoch {state['current_epoch']}")
 
