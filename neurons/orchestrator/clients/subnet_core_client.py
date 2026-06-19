@@ -676,7 +676,7 @@ class SubnetCoreClient:
                 logger.warning("No connected local workers for batch %s", batch_id)
                 break
             worker_id = workers[0]
-            print(f"Delivering offer to worker {worker_id}: {offer}")
+            logger.info(f"Delivering offer to worker {worker_id}: {offer}")
             if await self._worker_gateway.deliver_task_offer(worker_id, offer):
                 delivered += 1
             else:
