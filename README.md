@@ -127,7 +127,7 @@ This repository contains the code for running orchestrators, workers, and valida
 
 - [Orchestrator Guide](docs/orchestrator.md) — Run a miner node that coordinates bandwidth work
 - [Worker Guide](docs/worker.md) — Run a worker node that executes transfer tasks
-- [Worker Gateway Guide](docs/worker-gateway.md) — In-process worker gateway on the orchestrator
+- [Orchestrator Guide](docs/orchestrator.md) — In-process worker gateway on the orchestrator
 - [Validator Guide](docs/validator.md) — Run a validator that verifies proofs and sets weights
 
 ### Network Information

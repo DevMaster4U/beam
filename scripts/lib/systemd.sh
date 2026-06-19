@@ -137,6 +137,82 @@ beam_read_env_value() {
   grep -E "^${key}=" "$env_file" | tail -n1 | cut -d= -f2- || true
 }
 
+beam_env_files_have_key() {
+  local key="$1"
+  shift
+  local env_file
+  for env_file in "$@"; do
+    [[ -f "$env_file" ]] || continue
+    if grep -qE "^${key}=" "$env_file"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+beam_warn_deprecated_gateway_env() {
+  local label="$1"
+  shift
+  local env_files=("$@")
+  local deprecated=(
+  "WORKER_GATEWAY_WORKER_SECRET:WORKER_GATEWAY_SECRET"
+  "GATEWAY_WORKER_SECRET:WORKER_GATEWAY_SECRET"
+  )
+  local pair old_key new_key env_file
+  for pair in "${deprecated[@]}"; do
+    old_key="${pair%%:*}"
+    new_key="${pair#*:}"
+    for env_file in "${env_files[@]}"; do
+      [[ -f "$env_file" ]] || continue
+      if grep -qE "^${old_key}=" "$env_file"; then
+        echo "Warning: ${label} uses deprecated ${old_key}; rename to ${new_key} in ${env_file}" >&2
+      fi
+    done
+  done
+}
+
+beam_validate_orchestrator_gateway_env() {
+  local instance_env="$1"
+  local root_env="${BEAM_ROOT}/.env"
+  local env_files=()
+  [[ -f "$root_env" ]] && env_files+=("$root_env")
+  [[ -f "$instance_env" ]] && env_files+=("$instance_env")
+
+  beam_warn_deprecated_gateway_env "orchestrator" "${env_files[@]}"
+
+  if [[ "${#env_files[@]}" -eq 0 ]]; then
+    return 0
+  fi
+
+  if ! beam_env_files_have_key "WORKER_GATEWAY_SECRET" "${env_files[@]}" \
+    && ! beam_env_files_have_key "WORKER_GATEWAY_WORKER_SECRET" "${env_files[@]}" \
+    && ! beam_env_files_have_key "GATEWAY_WORKER_SECRET" "${env_files[@]}"; then
+    echo "Warning: no WORKER_GATEWAY_SECRET found in root .env or ${instance_env}" >&2
+    echo "  Workers will connect without worker_secret unless set elsewhere." >&2
+  fi
+}
+
+beam_validate_worker_gateway_env() {
+  local instance_env="$1"
+  local root_env="${BEAM_ROOT}/.env"
+  local env_files=()
+  [[ -f "$root_env" ]] && env_files+=("$root_env")
+  [[ -f "$instance_env" ]] && env_files+=("$instance_env")
+
+  beam_warn_deprecated_gateway_env "worker" "${env_files[@]}"
+
+  if [[ "${#env_files[@]}" -eq 0 ]]; then
+    return 0
+  fi
+
+  if ! beam_env_files_have_key "WORKER_GATEWAY_SECRET" "${env_files[@]}" \
+    && ! beam_env_files_have_key "WORKER_GATEWAY_WORKER_SECRET" "${env_files[@]}" \
+    && ! beam_env_files_have_key "GATEWAY_WORKER_SECRET" "${env_files[@]}"; then
+    echo "Warning: no WORKER_GATEWAY_SECRET found in root .env or ${instance_env}" >&2
+    echo "  Worker will connect without worker_secret unless set elsewhere." >&2
+  fi
+}
+
 beam_validate_orchestrator_configs() {
   local config_dir="${BEAM_ROOT}/config/orchestrators"
   local env_file

@@ -104,6 +104,12 @@ if [[ "$STATUS" -eq 1 ]]; then
   fi
   echo "  env: ${ENV_FILE}"
   echo "  log: ${LOG_FILE}"
+  if [[ -f "$LOG_FILE" ]]; then
+    echo "  log_bytes: $(wc -c < "$LOG_FILE" | tr -d ' ')"
+  else
+    echo "  log_bytes: 0 (file missing — service may have failed before logging started)"
+    echo "  journal: journalctl -u ${SERVICE} -n 50 --no-pager"
+  fi
   port="9000"
   if [[ -f "$ENV_FILE" ]]; then
     env_port="$(grep -E '^API_PORT=' "$ENV_FILE" | tail -n1 | cut -d= -f2- || true)"
@@ -137,6 +143,7 @@ if ! grep -qE '^WALLET_HOTKEY=' "$ENV_FILE"; then
 fi
 
 beam_validate_orchestrator_configs
+beam_validate_orchestrator_gateway_env "$ENV_FILE"
 
 PY="$(beam_python)"
 CMD=(
@@ -160,9 +167,22 @@ else
   echo "Started orchestrator ${INSTANCE}"
 fi
 
+if beam_unit_installed "$SERVICE"; then
+  active="$(systemctl is-active "$SERVICE" 2>/dev/null || true)"
+  echo "  state: ${active:-unknown}"
+  if [[ "${active}" != "active" ]]; then
+    echo "  warning: service is not active — check: journalctl -u ${SERVICE} -n 50 --no-pager" >&2
+  fi
+fi
+
 echo "  service: ${SERVICE}"
 echo "  env: ${ENV_FILE}"
 echo "  log: ${LOG_FILE}"
+if [[ -f "$LOG_FILE" ]]; then
+  echo "  log_bytes: $(wc -c < "$LOG_FILE" | tr -d ' ')"
+elif beam_unit_installed "$SERVICE"; then
+  echo "  journal: journalctl -u ${SERVICE} -n 50 --no-pager"
+fi
 port="9000"
 if [[ -f "$ENV_FILE" ]]; then
   env_port="$(grep -E '^API_PORT=' "$ENV_FILE" | tail -n1 | cut -d= -f2- || true)"

@@ -10,6 +10,7 @@ Group=@BEAM_GROUP@
 WorkingDirectory=@BEAM_ROOT@/neurons/orchestrator
 Environment="PATH=@BEAM_VENV@/bin:/usr/local/bin:/usr/bin:/bin"
 Environment="LOG_DIR=@BEAM_ROOT@/logs"
+Environment="ORCHESTRATOR_INSTANCE=%i"
 Environment="PYTHONUNBUFFERED=1"
 EnvironmentFile=-@BEAM_ROOT@/.env
 EnvironmentFile=-@BEAM_ROOT@/config/orchestrators/%i.env

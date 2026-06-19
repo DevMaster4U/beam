@@ -1843,7 +1843,8 @@ async def main():
         print("Network: mainnet")
     worker_gateway_url = os.environ.get("WORKER_GATEWAY_URL")
     worker_gateway_secret = (
-        os.environ.get("WORKER_GATEWAY_WORKER_SECRET", "").strip()
+        os.environ.get("WORKER_GATEWAY_SECRET", "").strip()
+        or os.environ.get("WORKER_GATEWAY_WORKER_SECRET", "").strip()
         or os.environ.get("GATEWAY_WORKER_SECRET", "").strip()
     ) or None
 

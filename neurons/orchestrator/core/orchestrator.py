@@ -323,12 +323,7 @@ class Orchestrator:
         self.hotkey: Optional[str] = None
 
         # --- Manager instances ---
-        self._worker_mgr = WorkerManager(
-            self.settings,
-            lambda: self.subnet_core_client,
-            worker_gateway_ref=lambda: self.worker_gateway,
-            gateway_control_client_ref=lambda: self.gateway_control_client,
-        )
+        self._worker_mgr = WorkerManager(self.settings, lambda: self.subnet_core_client)
         self._task_sched = TaskScheduler(
             self.settings, self._worker_mgr, get_subnet_core_client=lambda: self.subnet_core_client
         )
@@ -366,9 +361,6 @@ class Orchestrator:
 
         # SubnetCoreClient for API-based data operations
         self.subnet_core_client: Optional[Any] = None
-
-        # Loopback client for in-process worker gateway control channel
-        self.gateway_control_client: Optional[Any] = None
 
         # In-process worker gateway (workers dial /ws/{worker_id})
         self.worker_gateway: WorkerGateway = WorkerGateway(
@@ -562,10 +554,6 @@ class Orchestrator:
                 await self.subnet_core_client.stop_polling()
             await close_subnet_core_client()
             logger.info("SubnetCoreClient closed")
-
-        if self.gateway_control_client:
-            await self.gateway_control_client.stop()
-            self.gateway_control_client = None
 
         logger.info("Orchestrator stopped")
 
@@ -1100,48 +1088,6 @@ class Orchestrator:
             # Wire the in-process worker gateway.
             self.subnet_core_client.set_worker_gateway(self.worker_gateway)
 
-            if self.settings.worker_gateway_control_secret:
-                from clients.gateway_control_client import (
-                    GatewayControlClient,
-                    build_local_control_ws_url,
-                )
-
-                control_base = self.settings.worker_gateway_control_url
-                if not control_base:
-                    import socket as _socket
-
-                    try:
-                        _s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
-                        _s.connect(("8.8.8.8", 80))
-                        local_ip = self.settings.external_ip or _s.getsockname()[0]
-                        _s.close()
-                    except Exception:
-                        local_ip = self.settings.external_ip or "127.0.0.1"
-                    session_id = self.hotkey or "orchestrator"
-                    control_base = build_local_control_ws_url(
-                        host=local_ip,
-                        port=self.settings.api_port,
-                        session_id=session_id,
-                    )
-
-                async def _control_api_key() -> Optional[str]:
-                    if self.subnet_core_client is None:
-                        return None
-                    return await self.subnet_core_client._ensure_api_key()
-
-                self.gateway_control_client = GatewayControlClient(
-                    control_url=control_base,
-                    control_secret=self.settings.worker_gateway_control_secret,
-                    api_key_provider=_control_api_key,
-                )
-                self.gateway_control_client.set_event_handler(self._handle_gateway_control_event)
-                self.subnet_core_client.enable_gateway_control(self.gateway_control_client)
-                await self.gateway_control_client.start()
-                logger.info(
-                    "In-process worker gateway control channel started: %s",
-                    control_base,
-                )
-
             # Configure registration message sent on every WS connect
             import socket as _socket
 
@@ -1183,19 +1129,6 @@ class Orchestrator:
         except Exception as e:
             logger.warning(f"Failed to initialize SubnetCoreClient: {e}")
             self.subnet_core_client = None
-
-    async def _handle_gateway_control_event(self, message: dict) -> None:
-        """Handle push events from the in-process worker gateway control channel."""
-        msg_type = message.get("type")
-        worker_id = str(message.get("worker_id") or "")
-
-        if msg_type == "worker_connected":
-            await self._worker_mgr.handle_worker_update(worker_id, "connected")
-            return
-
-        if msg_type == "worker_disconnected":
-            await self._worker_mgr.handle_worker_update(worker_id, "disconnected")
-            return
 
     # SubnetCoreClient receives BeamCore task offer batches and routes them
     # to connected local workers.

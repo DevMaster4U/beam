@@ -29,17 +29,10 @@ logger = logging.getLogger(__name__)
 class WorkerManager:
     """Manages worker registration, verification, health checks, and WebSocket connections."""
 
-    def __init__(
-        self,
-        settings: OrchestratorSettings,
-        subnet_core_client_ref=None,
-        worker_gateway_ref=None,
-        gateway_control_client_ref=None,
-    ):
+    def __init__(self, settings: OrchestratorSettings, subnet_core_client_ref=None):
         self.settings = settings
+        # Callable that returns subnet_core_client (to avoid circular refs)
         self._get_subnet_core_client = subnet_core_client_ref or (lambda: None)
-        self._get_worker_gateway = worker_gateway_ref or (lambda: None)
-        self._get_gateway_control_client = gateway_control_client_ref or (lambda: None)
 
         # Worker registry (local cache, SubnetCore is source of truth)
         self.workers: Dict[str, Any] = {}  # worker_id -> Worker
@@ -471,41 +464,11 @@ class WorkerManager:
         return hashlib.sha256(data.encode()).hexdigest()[:16]
 
     async def sync_workers_from_subnetcore(self) -> int:
-        """Sync connected workers from the in-process worker gateway."""
-        gateway_control = self._get_gateway_control_client()
-        if gateway_control and getattr(gateway_control, "connected", False):
-            workers_list = gateway_control.get_local_workers()
-        else:
-            worker_gateway = self._get_worker_gateway()
-            if not worker_gateway:
-                logger.debug("Worker gateway unavailable; skipping worker sync")
-                return 0
-            workers_list = worker_gateway.get_local_workers()
-
-        if not workers_list:
-            return 0
-
-        from .orchestrator import Worker, WorkerStatus
-
-        synced = 0
-        for entry in workers_list:
-            worker_id = entry.get("worker_id")
-            if not worker_id:
-                continue
-            if worker_id not in self.workers:
-                self.workers[worker_id] = Worker(
-                    worker_id=worker_id,
-                    hotkey=worker_id,
-                    ip="0.0.0.0",
-                    port=0,
-                    region=self.settings.region,
-                    status=WorkerStatus.ACTIVE,
-                )
-                self.workers_by_hotkey[worker_id] = worker_id
-                self.workers_by_region[self.settings.region].add(worker_id)
-            synced += 1
-
-        return synced
+        """
+        Keep the local worker cache as the source of truth.
+        """
+        logger.debug("Worker cache sync uses local worker registrations only")
+        return 0
 
     async def worker_sync_loop(self, running_flag, interval_seconds: int = 60) -> None:
         """Background loop for syncing workers from SubnetCore."""

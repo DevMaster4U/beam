@@ -110,6 +110,8 @@ if [[ ! -f "$ENV_FILE" ]]; then
   exit 1
 fi
 
+beam_validate_worker_gateway_env "$ENV_FILE"
+
 PY="$(beam_python)"
 CMD=(
   "$PY" "${ROOT}/neurons/worker/worker.py"

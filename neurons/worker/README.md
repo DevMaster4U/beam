@@ -57,7 +57,7 @@ Typical environment:
 ```bash
 export CORE_SERVER_URL=https://beamcore.b1m.ai
 export WORKER_GATEWAY_URL=https://your-orchestrator.example.com
-export WORKER_GATEWAY_WORKER_SECRET=your-long-random-worker-secret
+export WORKER_GATEWAY_SECRET=your-long-random-worker-secret
 export CONNECTION_MODE=auto               # or websocket (see worker.py)
 python worker.py --subtensor.network finney
 ```

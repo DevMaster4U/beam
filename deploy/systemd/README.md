@@ -37,7 +37,7 @@ Enable only specific instances:
 | `config/orchestrators/orch1.env` | `beam-orchestrator@orch1.service` | `logs/orchestrators/orch1.log` |
 | `config/orchestrators/orch2.env` | `beam-orchestrator@orch2.service` | `logs/orchestrators/orch2.log` |
 
-Each orchestrator hosts the worker WebSocket gateway at `/ws/{worker_id}` on `API_PORT`. Set `ORCHESTRATOR_WORKER_GATEWAY_URL` and `WORKER_GATEWAY_WORKER_SECRET` in the orchestrator env; workers use matching `WORKER_GATEWAY_URL` and secret.
+Each orchestrator hosts the worker WebSocket gateway at `/ws/{worker_id}` on `API_PORT`. Set `ORCHESTRATOR_WORKER_GATEWAY_URL` and `WORKER_GATEWAY_SECRET` in the orchestrator env; workers use matching `WORKER_GATEWAY_URL` and `WORKER_GATEWAY_SECRET`.
 
 ### Install (first time)
 

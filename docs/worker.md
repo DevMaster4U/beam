@@ -41,7 +41,7 @@ Create or export the worker environment before starting the process:
 ```bash
 CORE_SERVER_URL=https://beamcore.b1m.ai
 WORKER_GATEWAY_URL=https://your-orchestrator.example.com
-WORKER_GATEWAY_WORKER_SECRET=your-long-random-worker-secret
+WORKER_GATEWAY_SECRET=your-long-random-worker-secret
 SUBTENSOR_NETWORK=finney
 NETUID=105
 ```
@@ -197,6 +197,6 @@ WORKER_PREWARM_MAX_ORIGINS=32
 
 - Verify the hotkey is registered on subnet 105.
 - Verify `WORKER_GATEWAY_URL` matches the orchestrator's `ORCHESTRATOR_WORKER_GATEWAY_URL`.
-- Verify `WORKER_GATEWAY_WORKER_SECRET` matches the orchestrator when using secret auth.
+- Verify `WORKER_GATEWAY_SECRET` matches the orchestrator when using secret auth.
 - Verify `CORE_SERVER_URL=https://beamcore.b1m.ai`.
 - If the worker starts but receives no tasks, keep it connected and confirm the gateway URL is reachable from the host.

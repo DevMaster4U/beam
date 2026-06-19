@@ -4,11 +4,10 @@ Worker WebSocket gateway route (in-process mode).
 Workers connect via:
   GET /ws/{worker_id}?api_key=<beamcore_api_key>&worker_secret=<shared_secret>
 
-Orchestrator control connects to the same in-process gateway with:
-  GET /ws/{session_id}?api_key=<beamcore_api_key>&control_secret=<shared_secret>
+When WORKER_GATEWAY_SECRET is set on the gateway, workers must send a matching worker_secret.
+api_key is always validated against BeamCore for worker connections.
 
-When WORKER_GATEWAY_WORKER_SECRET is configured, worker_secret must match.
-api_key is always validated against BeamCore.
+Orchestrator talks to WorkerGateway in-process (set_worker_gateway); no control WebSocket.
 """
 
 import logging
@@ -51,28 +50,6 @@ def _provided_worker_secret(websocket: WebSocket) -> str:
     )
 
 
-async def _authenticate_worker(
-    websocket: WebSocket,
-    worker_id: str,
-    *,
-    core_url: str,
-    configured_secret: Optional[str],
-) -> bool:
-    api_key = websocket.query_params.get("api_key") or ""
-    if not api_key:
-        return False
-
-    if not await _validate_worker_api_key(core_url, worker_id, api_key):
-        return False
-
-    if configured_secret:
-        provided_secret = _provided_worker_secret(websocket)
-        if provided_secret != configured_secret:
-            return False
-
-    return True
-
-
 @router.websocket("/ws/{worker_id}")
 async def worker_ws(websocket: WebSocket, worker_id: str) -> None:
     orchestrator = get_orchestrator()
@@ -85,30 +62,34 @@ async def worker_ws(websocket: WebSocket, worker_id: str) -> None:
         await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER)
         return
 
-    # Orchestrator control channel on the in-process worker gateway.
-    if "control_secret" in websocket.query_params:
-        from routes.gateway_control import handle_gateway_control_websocket
-
-        await handle_gateway_control_websocket(
-            websocket,
-            session_id=worker_id,
-            configured_secret=orchestrator.settings.worker_gateway_control_secret,
-        )
-        return
-
-    core_url = orchestrator.settings.core_server_url
-    configured_secret = orchestrator.settings.worker_gateway_worker_secret
-    valid = await _authenticate_worker(
-        websocket,
-        worker_id,
-        core_url=core_url,
-        configured_secret=configured_secret,
-    )
-    if not valid:
-        logger.warning("Worker %s: authentication failed", worker_id)
+    # --- Auth ---
+    api_key = websocket.query_params.get("api_key") or ""
+    if not api_key:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
+    core_url = orchestrator.settings.core_server_url
+    if not await _validate_worker_api_key(core_url, worker_id, api_key):
+        logger.warning("Worker %s: API key validation failed", worker_id)
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    configured_secret: Optional[str] = orchestrator.settings.worker_gateway_worker_secret
+    if not configured_secret:
+        logger.warning(
+            "Worker %s rejected: WORKER_GATEWAY_SECRET is not configured on this gateway",
+            worker_id,
+        )
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    provided_secret = _provided_worker_secret(websocket)
+    if not provided_secret or provided_secret != configured_secret:
+        logger.warning("Worker %s: worker_secret missing or invalid", worker_id)
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    # --- Capacity check ---
     if gateway.is_full() and worker_id not in gateway.worker_ids:
         await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER)
         return

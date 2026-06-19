@@ -70,7 +70,7 @@ WALLET_HOTKEY=default
 CORE_SERVER_URL=https://beamcore.b1m.ai
 ORCH_GATEWAY_URL=https://orch-gateway.b1m.ai
 ORCHESTRATOR_WORKER_GATEWAY_URL=https://orchestrator.example.com
-WORKER_GATEWAY_WORKER_SECRET=your-long-random-worker-secret
+WORKER_GATEWAY_SECRET=your-long-random-worker-secret
 SUBTENSOR_NETWORK=finney
 NETUID=105
 API_PORT=9000
@@ -103,8 +103,7 @@ Important settings:
 | `CORE_SERVER_URL` | BeamCore HTTP base used for registration/auth bootstrap |
 | `ORCH_GATEWAY_URL` | Orchestrator gateway origin used for the persistent control-plane WebSocket |
 | `ORCHESTRATOR_WORKER_GATEWAY_URL` | Public worker gateway origin advertised to BeamCore |
-| `WORKER_GATEWAY_WORKER_SECRET` | Shared secret for worker WebSocket auth on `/ws/{worker_id}` |
-| `WORKER_GATEWAY_CONTROL_SECRET` | Shared secret for orchestrator control on `/ws/{session_id}?control_secret=...` |
+| `WORKER_GATEWAY_SECRET` | Shared secret for worker WebSocket auth on `/ws/{worker_id}` |
 | `READY` | `true` opts the orchestrator into routed work; default is `false` |
 | `API_PORT` | FastAPI port and in-process worker-gateway port |
 | `ORCHESTRATOR_UID` | Optional; skip subtensor metagraph lookup when preset |
@@ -127,7 +126,7 @@ python main.py
 ./scripts/run-orchestrators.sh start
 ```
 
-See [deploy/systemd/README.md](../deploy/systemd/README.md) and [Worker Gateway Guide](worker-gateway.md).
+See [deploy/systemd/README.md](../deploy/systemd/README.md).
 
 ## Health And Readiness
 
@@ -149,24 +148,18 @@ The in-process worker gateway accepts:
 ws(s)://<worker-gateway-origin>/ws/<worker_id>?api_key=<worker-api-key>&worker_secret=<shared-secret>
 ```
 
-Orchestrator control channel (loopback to the same in-process gateway):
-
-```text
-ws(s)://<worker-gateway-origin>/ws/<session_id>?api_key=<api-key>&control_secret=<shared-secret>
-```
-
 Workers derive this URL from `WORKER_GATEWAY_URL`. Set matching values on orchestrator and workers:
 
 ```dotenv
 ORCHESTRATOR_WORKER_GATEWAY_URL=https://orchestrator.example.com
-WORKER_GATEWAY_WORKER_SECRET=your-long-random-worker-secret
+WORKER_GATEWAY_SECRET=your-long-random-worker-secret
 ```
 
 Worker env:
 
 ```dotenv
 WORKER_GATEWAY_URL=https://orchestrator.example.com
-WORKER_GATEWAY_WORKER_SECRET=your-long-random-worker-secret
+WORKER_GATEWAY_SECRET=your-long-random-worker-secret
 ```
 
 ## Task Offer Flow
@@ -190,7 +183,7 @@ worker -> BeamCore HTTP payment-evidence
 ### Worker cannot connect
 
 - Confirm `WORKER_GATEWAY_URL` matches `ORCHESTRATOR_WORKER_GATEWAY_URL`.
-- Confirm `WORKER_GATEWAY_WORKER_SECRET` matches when using secret auth.
+- Confirm `WORKER_GATEWAY_SECRET` matches when using secret auth.
 - Confirm the gateway is reachable from the worker host.
 
 ### Multiple orchestrators fail to start

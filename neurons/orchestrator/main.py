@@ -34,7 +34,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from core.config import get_settings
+from core.config import configure_orchestrator_logging, get_settings
 from core.orchestrator import Orchestrator, get_orchestrator
 from middleware.metrics import MetricsMiddleware, get_metrics_collector, get_metrics_response
 from middleware.rate_limiting import RateLimitMiddleware, get_rate_limiter
@@ -42,25 +42,6 @@ from routes import health, orchestrators, workers
 
 # WebSocket registration, keepalive, and transfer flow are owned by
 # SubnetCoreClient. main.py only wires lifespan + FastAPI routes.
-
-
-# Configure logging - both console and file
-LOG_DIR = os.environ.get("LOG_DIR", "/tmp/beam_logs")
-os.makedirs(LOG_DIR, exist_ok=True)
-
-log_format = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-log_datefmt = "%Y-%m-%d %H:%M:%S"
-
-logging.basicConfig(
-    level=logging.INFO,
-    format=log_format,
-    datefmt=log_datefmt,
-)
-
-# Add file handler for log viewer
-file_handler = logging.FileHandler(f"{LOG_DIR}/orchestrator.log")
-file_handler.setFormatter(logging.Formatter(log_format, datefmt=log_datefmt))
-logging.getLogger().addHandler(file_handler)
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +68,10 @@ async def lifespan(app: FastAPI):
     global orchestrator
 
     settings = get_settings()
+
+    # Re-apply file logging after imports (bittensor/uvicorn can touch logging config).
+    log_path = configure_orchestrator_logging(force=True)
+    logger.info("Orchestrator log file: %s", log_path)
 
     # Configure logging level
     logging.getLogger().setLevel(settings.log_level)
@@ -121,6 +106,12 @@ async def lifespan(app: FastAPI):
     logger.info(f"Network: {settings.subtensor_network}")
     logger.info(f"Subnet: {settings.netuid}")
     logger.info(f"API: http://{settings.api_host}:{settings.api_port}")
+    if settings.worker_gateway_worker_secret:
+        logger.info("Worker gateway: WORKER_GATEWAY_SECRET configured (workers must authenticate)")
+    else:
+        logger.warning(
+            "Worker gateway: WORKER_GATEWAY_SECRET is not set — all worker WebSocket connections will be rejected"
+        )
     logger.info("=" * 60)
 
     # WebSocket connection (registration + keepalive + transfer flow) is owned by
@@ -140,7 +131,12 @@ async def lifespan(app: FastAPI):
     logger.info("WebSocket connection handled by SubnetCoreClient")
 
     # Signal readiness to receive transfers through the orchestrator WS relay.
-    if settings.ready and orchestrator.subnet_core_client:
+    if not orchestrator.subnet_core_client:
+        logger.warning(
+            "SubnetCoreClient unavailable — cannot signal READY to BeamCore "
+            "(check logs above for initialization errors)"
+        )
+    elif settings.ready:
         try:
             applied = await orchestrator.subnet_core_client.set_ready(True)
             if applied:
@@ -155,7 +151,7 @@ async def lifespan(app: FastAPI):
             logger.warning(f"Failed to set ready=True through orch-gateway: {e}")
     else:
         logger.info(
-            "ready=False (default) — orchestrator will NOT receive transfers until READY=true is set"
+            "READY is false — orchestrator will NOT receive transfers until READY=true is set"
         )
 
     yield

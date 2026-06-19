@@ -6,7 +6,6 @@ The orchestrator forwards task offer batch items as task_offer messages,
 and relays task_accept / task_reject / task_result upstream.
 """
 
-import asyncio
 import json
 import logging
 from typing import Callable, Dict, Optional
@@ -27,39 +26,9 @@ class WorkerGateway:
         self._cursor = 0
         self._on_ready_change = on_ready_change
         self._upstream: Optional[object] = None  # SubnetCoreClient ref
-        self._control_ws: Optional[object] = None
 
     def set_upstream(self, upstream: object) -> None:
         self._upstream = upstream
-
-    def set_control(self, ws: object) -> None:
-        self._control_ws = ws
-
-    def clear_control(self) -> None:
-        self._control_ws = None
-
-    @property
-    def control_connected(self) -> bool:
-        return self._control_ws is not None
-
-    def list_workers(self) -> list[dict]:
-        return [{"worker_id": worker_id} for worker_id in self._sessions.keys()]
-
-    def get_local_workers(self) -> list[dict]:
-        return self.list_workers()
-
-    async def _notify_control(self, payload: dict) -> None:
-        ws = self._control_ws
-        if ws is None:
-            return
-        try:
-            await ws.send_text(json.dumps(payload))
-        except Exception as exc:
-            logger.warning("control notify failed: %s", exc)
-            self._control_ws = None
-
-    async def send_worker_payload(self, worker_id: str, payload: dict) -> None:
-        await self._send_to_worker(worker_id, payload)
 
     @property
     def connected_count(self) -> int:
@@ -79,7 +48,6 @@ class WorkerGateway:
         was_empty = len(self._sessions) == 0
         self._sessions[worker_id] = ws
         logger.info("Worker connected: %s (%d/%d)", worker_id, len(self._sessions), MAX_WORKERS)
-        asyncio.create_task(self._notify_control({"type": "worker_connected", "worker_id": worker_id}))
         if was_empty and self._on_ready_change:
             self._on_ready_change(True)
         return True
@@ -87,7 +55,6 @@ class WorkerGateway:
     def disconnect(self, worker_id: str) -> None:
         self._sessions.pop(worker_id, None)
         logger.info("Worker disconnected: %s (%d/%d)", worker_id, len(self._sessions), MAX_WORKERS)
-        asyncio.create_task(self._notify_control({"type": "worker_disconnected", "worker_id": worker_id}))
         if len(self._sessions) == 0 and self._on_ready_change:
             self._on_ready_change(False)
 

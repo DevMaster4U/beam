@@ -76,9 +76,6 @@ class SubnetCoreClient:
         self._ws_ping_timeout = ws_ping_timeout
         self._client: Optional[httpx.AsyncClient] = None
 
-        # Optional loopback client for in-process worker gateway control channel
-        self._gateway_control_client: Optional[Any] = None
-
         # WebSocket push handlers (task offer batches and worker updates via WS)
         self._worker_update_handler: Optional[Callable] = (
             None  # Handler for worker connect/disconnect push events
@@ -615,6 +612,11 @@ class SubnetCoreClient:
             self._registered = False
             self._schedule_registration_retry_if_needed()
 
+        elif msg_type == "ping":
+            # Respond to server ping
+            if self._ws:
+                await self._ws.send(json.dumps({"type": "pong"}))
+
         elif msg_type == "error":
             if data.get("code") == "unauthorized":
                 logger.warning(
@@ -661,7 +663,7 @@ class SubnetCoreClient:
         if not isinstance(offers, list) or not offers:
             logger.warning("worker_task_offer_batch missing offers: batch=%s", batch_id)
             return
-        if not self._worker_gateway and not self._gateway_control_client:
+        if not self._worker_gateway:
             logger.warning("No local worker gateway available for batch %s", batch_id)
             return
 
@@ -669,28 +671,13 @@ class SubnetCoreClient:
         for offer in offers:
             if not isinstance(offer, dict):
                 continue
-
-            workers: list[str] = []
-            if self._gateway_control_client and self._gateway_control_client.connected:
-                local = self._gateway_control_client.get_local_workers()
-                if local:
-                    workers = [local[0]["worker_id"]]
-            elif self._worker_gateway:
-                workers = self._worker_gateway.get_workers_round_robin(1)
-
+            workers = self._worker_gateway.get_workers_round_robin(1)
             if not workers:
                 logger.warning("No connected local workers for batch %s", batch_id)
                 break
             worker_id = workers[0]
-
-            if self._gateway_control_client and self._gateway_control_client.connected:
-                ok = await self._gateway_control_client.send_task_offer(worker_id, offer)
-            elif self._worker_gateway:
-                ok = await self._worker_gateway.deliver_task_offer(worker_id, offer)
-            else:
-                ok = False
-
-            if ok:
+            print(f"Delivering offer to worker {worker_id}: {offer}")
+            if await self._worker_gateway.deliver_task_offer(worker_id, offer):
                 delivered += 1
             else:
                 logger.warning(
@@ -825,10 +812,6 @@ class SubnetCoreClient:
     def set_worker_gateway(self, gateway) -> None:
         """Wire in the in-process WorkerGateway so task offer batches are dispatched."""
         self._worker_gateway = gateway
-
-    def enable_gateway_control(self, gateway_control_client: Any) -> None:
-        """Use the in-process worker gateway control WebSocket for task delivery."""
-        self._gateway_control_client = gateway_control_client
         gateway.set_upstream(self)
 
     async def send_task_accept(

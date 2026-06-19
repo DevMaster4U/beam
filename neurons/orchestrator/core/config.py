@@ -4,12 +4,148 @@ Orchestrator Configuration
 Settings for the BEAM Orchestrator service (single-node deployment).
 """
 
+import logging
 import os
+import sys
 from functools import lru_cache
+from pathlib import Path
 from typing import List, Optional
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings
+
+_WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
+_ENV_LOADED = False
+
+
+def _workspace_root() -> Path:
+    return _WORKSPACE_ROOT
+
+
+def _extract_env_file_arg(argv: list[str]) -> tuple[Optional[Path], list[str]]:
+    cleaned: list[str] = []
+    env_file: Optional[Path] = None
+    idx = 0
+    while idx < len(argv):
+        arg = argv[idx]
+        if arg == "--env-file":
+            if idx + 1 >= len(argv):
+                print("Error: --env-file requires a path argument", file=sys.stderr)
+                sys.exit(2)
+            env_file = Path(argv[idx + 1]).expanduser()
+            idx += 2
+            continue
+        if arg.startswith("--env-file="):
+            env_file = Path(arg.split("=", 1)[1]).expanduser()
+            idx += 1
+            continue
+        cleaned.append(arg)
+        idx += 1
+    return env_file, cleaned
+
+
+def _resolve_env_path(path: Path) -> Path:
+    if path.is_absolute():
+        return path
+    return _workspace_root() / path
+
+
+def _load_workspace_env() -> None:
+    """Load workspace .env, then optional --env-file instance config (override)."""
+    global _ENV_LOADED
+    if _ENV_LOADED:
+        return
+
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        _ENV_LOADED = True
+        return
+
+    shared_env = _workspace_root() / ".env"
+    if shared_env.exists():
+        load_dotenv(shared_env, override=False)
+
+    env_file, _ = _extract_env_file_arg(sys.argv[1:])
+    if env_file is None:
+        env_path = os.environ.get("ORCHESTRATOR_ENV_FILE", "").strip()
+        if env_path:
+            env_file = Path(env_path).expanduser()
+
+    if env_file is not None:
+        env_file = _resolve_env_path(env_file)
+        if env_file.exists():
+            load_dotenv(env_file, override=True)
+        else:
+            print(f"Warning: orchestrator env file not found: {env_file}", file=sys.stderr)
+
+    _ENV_LOADED = True
+
+
+def _orchestrator_instance_name() -> str:
+    instance = os.environ.get("ORCHESTRATOR_INSTANCE", "").strip()
+    if instance:
+        return instance
+
+    env_file, _ = _extract_env_file_arg(sys.argv[1:])
+    if env_file is None:
+        env_path = os.environ.get("ORCHESTRATOR_ENV_FILE", "").strip()
+        if env_path:
+            env_file = Path(env_path).expanduser()
+
+    if env_file is not None:
+        return _resolve_env_path(env_file).stem
+    return "orchestrator"
+
+
+_LOGGING_CONFIGURED = False
+
+
+def configure_orchestrator_logging(force: bool = False) -> Path:
+    """Write orchestrator logs to logs/orchestrators/<instance>.log."""
+    global _LOGGING_CONFIGURED
+    instance = _orchestrator_instance_name()
+    log_root = Path(os.environ.get("LOG_DIR", _workspace_root() / "logs"))
+    log_dir = log_root / "orchestrators"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{instance}.log"
+
+    if _LOGGING_CONFIGURED and not force:
+        return log_path
+
+    log_format = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    log_datefmt = "%Y-%m-%d %H:%M:%S"
+    formatter = logging.Formatter(log_format, datefmt=log_datefmt)
+
+    file_handler = logging.FileHandler(log_path, delay=False)
+    file_handler.setFormatter(formatter)
+
+    handlers: list[logging.Handler] = [file_handler]
+    # Under systemd (no TTY) stderr is captured by journal — useful when the log file path is wrong.
+    if not sys.stderr.isatty():
+        stderr_handler = logging.StreamHandler(sys.stderr)
+        stderr_handler.setFormatter(formatter)
+        handlers.append(stderr_handler)
+    else:
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        handlers.append(stream_handler)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format=log_format,
+        datefmt=log_datefmt,
+        handlers=handlers,
+        force=True,
+    )
+
+    _LOGGING_CONFIGURED = True
+    logging.getLogger(__name__).info("Orchestrator logging initialized: %s", log_path)
+    return log_path
+
+
+_load_workspace_env()
+configure_orchestrator_logging()
 
 
 class OrchestratorSettings(BaseSettings):
@@ -111,17 +247,21 @@ class OrchestratorSettings(BaseSettings):
     orch_ws_ping_interval: float = Field(default=30.0, env="ORCH_WS_PING_INTERVAL")
     orch_ws_ping_timeout: float = Field(default=45.0, env="ORCH_WS_PING_TIMEOUT")
 
-    worker_gateway_url: Optional[str] = Field(default=None, env="ORCHESTRATOR_WORKER_GATEWAY_URL")
+    worker_gateway_url: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "ORCHESTRATOR_WORKER_GATEWAY_URL",
+            "WORKER_GATEWAY_URL",
+        ),
+    )
     worker_gateway_worker_secret: Optional[str] = Field(
-        default=None, env="WORKER_GATEWAY_WORKER_SECRET"
+        default=None,
+        validation_alias=AliasChoices(
+            "WORKER_GATEWAY_SECRET",
+            "WORKER_GATEWAY_WORKER_SECRET",
+            "GATEWAY_WORKER_SECRET",
+        ),
     )
-    worker_gateway_control_secret: Optional[str] = Field(
-        default=None, env="WORKER_GATEWAY_CONTROL_SECRET"
-    )
-    worker_gateway_control_url: Optional[str] = Field(
-        default=None, env="WORKER_GATEWAY_CONTROL_URL"
-    )
-
     # ==========================================================================
     # Worker Scoring Weights (for selection)
     # ==========================================================================
@@ -202,14 +342,22 @@ class OrchestratorSettings(BaseSettings):
             raise ValueError("ORCH_GATEWAY_URL is required")
 
         if not self.worker_gateway_worker_secret:
-            alt_worker = os.environ.get("GATEWAY_WORKER_SECRET", "").strip()
-            if alt_worker:
-                object.__setattr__(self, "worker_gateway_worker_secret", alt_worker)
+            for alt_name in (
+                "WORKER_GATEWAY_SECRET",
+                "WORKER_GATEWAY_WORKER_SECRET",
+                "GATEWAY_WORKER_SECRET",
+            ):
+                alt_worker = os.environ.get(alt_name, "").strip()
+                if alt_worker:
+                    object.__setattr__(self, "worker_gateway_worker_secret", alt_worker)
+                    break
 
-        if not self.worker_gateway_control_secret:
-            alt_control = os.environ.get("GATEWAY_CONTROL_SECRET", "").strip()
-            if alt_control:
-                object.__setattr__(self, "worker_gateway_control_secret", alt_control)
+        if not self.worker_gateway_url:
+            for alt_name in ("ORCHESTRATOR_WORKER_GATEWAY_URL", "WORKER_GATEWAY_URL"):
+                alt_url = os.environ.get(alt_name, "").strip()
+                if alt_url:
+                    object.__setattr__(self, "worker_gateway_url", alt_url)
+                    break
 
     # ==========================================================================
     # Client Tiers
@@ -268,7 +416,7 @@ class OrchestratorSettings(BaseSettings):
     audit_source: str = Field(default="datapipe_subnet", env="AUDIT_SOURCE")
 
     class Config:
-        env_file = ".env"
+        env_file = str(_WORKSPACE_ROOT / ".env")
         extra = "ignore"
 
     def get_pre_approved_hotkeys(self) -> List[str]:
@@ -343,4 +491,5 @@ class OrchestratorSettings(BaseSettings):
 @lru_cache
 def get_settings() -> OrchestratorSettings:
     """Get cached settings instance."""
+    _load_workspace_env()
     return OrchestratorSettings()
