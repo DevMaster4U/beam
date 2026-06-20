@@ -109,6 +109,7 @@ class SubnetCoreClient:
 
         # In-process worker gateway (set after init)
         self._worker_gateway = None
+        self._global_gateway_client: Optional[Any] = None
 
         # orch-gateway → BeamCore upstream relay (independent of orch ↔ orch-gateway edge socket)
         self._beamcore_upstream_degraded: bool = False
@@ -663,6 +664,21 @@ class SubnetCoreClient:
         if not isinstance(offers, list) or not offers:
             logger.warning("worker_task_offer_batch missing offers: batch=%s", batch_id)
             return
+
+        if self._global_gateway_client:
+            sent, failed = await self._global_gateway_client.send_task_offer_batch(
+                str(batch_id or "unknown"),
+                [o for o in offers if isinstance(o, dict)],
+            )
+            logger.info(
+                "worker_task_offer_batch forwarded to global gateway: batch=%s offers=%s sent=%s failed=%s",
+                batch_id,
+                len(offers),
+                sent,
+                failed,
+            )
+            return
+
         if not self._worker_gateway:
             logger.warning("No local worker gateway available for batch %s", batch_id)
             return
@@ -813,6 +829,10 @@ class SubnetCoreClient:
         """Wire in the in-process WorkerGateway so task offer batches are dispatched."""
         self._worker_gateway = gateway
         gateway.set_upstream(self)
+
+    def set_global_gateway_client(self, client: Any) -> None:
+        """Use shared global worker gateway for task offer delivery and worker relay."""
+        self._global_gateway_client = client
 
     async def send_task_accept(
         self,

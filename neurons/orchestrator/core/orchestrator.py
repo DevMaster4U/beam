@@ -362,10 +362,13 @@ class Orchestrator:
         # SubnetCoreClient for API-based data operations
         self.subnet_core_client: Optional[Any] = None
 
-        # In-process worker gateway (workers dial /ws/{worker_id})
+        # In-process worker gateway (workers dial /ws/{worker_id} when mode=in_process)
         self.worker_gateway: WorkerGateway = WorkerGateway(
             on_ready_change=self._on_worker_gateway_ready_change,
         )
+
+        # Global gateway control client (mode=global)
+        self.global_gateway_client: Optional[Any] = None
 
         # Async control
         self._running: bool = False
@@ -400,7 +403,9 @@ class Orchestrator:
         self._reward_mgr.total_rewards_distributed = value
 
     def _on_worker_gateway_ready_change(self, ready: bool) -> None:
-        """Toggle orchestrator readiness when the first/last worker connects."""
+        """Toggle orchestrator readiness when the first/last local worker connects."""
+        if self.settings.worker_gateway_mode == "global":
+            return
         if self.subnet_core_client is None:
             return
         import asyncio
@@ -410,6 +415,21 @@ class Orchestrator:
                 asyncio.create_task(self.subnet_core_client.set_ready(ready))
         except Exception as exc:
             logger.warning("ready-change signal failed: %s", exc)
+
+    async def _on_global_pool_ready(self, worker_count: int) -> None:
+        """Toggle readiness based on shared global worker pool size."""
+        if self.subnet_core_client is None:
+            return
+        try:
+            await self.subnet_core_client.set_ready(worker_count > 0)
+        except Exception as exc:
+            logger.warning("global pool ready sync failed: %s", exc)
+
+    async def _handle_global_gateway_worker_message(self, worker_id: str, message: dict) -> None:
+        """Relay worker messages from global gateway through WorkerGateway → BeamCore."""
+        import json
+
+        await self.worker_gateway.handle_worker_message(worker_id, json.dumps(message))
 
     # =========================================================================
     # Lifecycle
@@ -554,6 +574,10 @@ class Orchestrator:
                 await self.subnet_core_client.stop_polling()
             await close_subnet_core_client()
             logger.info("SubnetCoreClient closed")
+
+        if self.global_gateway_client:
+            await self.global_gateway_client.stop()
+            self.global_gateway_client = None
 
         logger.info("Orchestrator stopped")
 
@@ -1085,8 +1109,46 @@ class Orchestrator:
             # WS push handlers. BeamCore task offer batches drive worker routing.
             self.subnet_core_client.set_worker_update_handler(self._worker_mgr.handle_worker_update)
 
-            # Wire the in-process worker gateway.
+            # Wire worker gateway upstream (BeamCore relay for accept/result).
             self.subnet_core_client.set_worker_gateway(self.worker_gateway)
+
+            gateway_mode = (self.settings.worker_gateway_mode or "in_process").strip().lower()
+            if gateway_mode == "global":
+                control_secret = self.settings.orchestrator_gateway_secret
+                control_base = self.settings.global_gateway_url or self.settings.worker_gateway_url
+                if not control_base or not control_secret:
+                    raise ValueError(
+                        "WORKER_GATEWAY_MODE=global requires GLOBAL_GATEWAY_URL (or "
+                        "ORCHESTRATOR_WORKER_GATEWAY_URL) and ORCHESTRATOR_GATEWAY_SECRET"
+                    )
+
+                from clients.global_gateway_client import GlobalGatewayClient
+
+                async def _control_api_key() -> Optional[str]:
+                    if self.subnet_core_client is None:
+                        return None
+                    return await self.subnet_core_client._ensure_api_key()
+
+                self.global_gateway_client = GlobalGatewayClient(
+                    control_base_url=control_base,
+                    orchestrator_hotkey=self.hotkey or "unknown",
+                    control_secret=control_secret,
+                    api_key_provider=_control_api_key,
+                    ping_interval=self.settings.orch_ws_ping_interval,
+                    ping_timeout=self.settings.orch_ws_ping_timeout,
+                )
+                self.global_gateway_client.set_worker_message_handler(
+                    self._handle_global_gateway_worker_message
+                )
+                self.global_gateway_client.set_pool_status_handler(self._on_global_pool_ready)
+                self.worker_gateway.set_outbound_sender(self.global_gateway_client.send_to_worker)
+                self.subnet_core_client.set_global_gateway_client(self.global_gateway_client)
+                await self.global_gateway_client.start()
+                logger.info(
+                    "Global worker gateway control channel started: %s (hotkey=%s)",
+                    control_base,
+                    self.hotkey,
+                )
 
             # Configure registration message sent on every WS connect
             import socket as _socket
@@ -1103,7 +1165,11 @@ class Orchestrator:
             # otherwise derive from the orchestrator's own HTTP address.
             gateway_url = (
                 self.settings.worker_gateway_url
-                or f"http://{local_ip}:{self.settings.api_port}"
+                or (
+                    self.settings.global_gateway_url
+                    if gateway_mode == "global"
+                    else f"http://{local_ip}:{self.settings.api_port}"
+                )
             )
             self.subnet_core_client.set_registration_config(
                 url=orch_url,

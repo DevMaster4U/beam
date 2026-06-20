@@ -262,6 +262,16 @@ class OrchestratorSettings(BaseSettings):
             "GATEWAY_WORKER_SECRET",
         ),
     )
+    worker_gateway_mode: str = Field(default="in_process", env="WORKER_GATEWAY_MODE")
+    global_gateway_url: Optional[str] = Field(default=None, env="GLOBAL_GATEWAY_URL")
+    orchestrator_gateway_secret: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "ORCHESTRATOR_GATEWAY_SECRET",
+            "ORCHESTRATOR_WORKER_GATEWAY_SECRET",
+            "GATEWAY_ORCHESTRATOR_SECRET",
+        ),
+    )
     # ==========================================================================
     # Worker Scoring Weights (for selection)
     # ==========================================================================
@@ -357,6 +367,17 @@ class OrchestratorSettings(BaseSettings):
                 alt_url = os.environ.get(alt_name, "").strip()
                 if alt_url:
                     object.__setattr__(self, "worker_gateway_url", alt_url)
+                    break
+
+        if not self.orchestrator_gateway_secret:
+            for alt_name in (
+                "ORCHESTRATOR_GATEWAY_SECRET",
+                "ORCHESTRATOR_WORKER_GATEWAY_SECRET",
+                "GATEWAY_ORCHESTRATOR_SECRET",
+            ):
+                alt_secret = os.environ.get(alt_name, "").strip()
+                if alt_secret:
+                    object.__setattr__(self, "orchestrator_gateway_secret", alt_secret)
                     break
 
     # ==========================================================================

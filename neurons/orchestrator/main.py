@@ -227,7 +227,11 @@ if _cors_origins:
 # Mount route modules
 app.include_router(health.router)
 app.include_router(orchestrators.router)
-app.include_router(workers.router)
+_settings = get_settings()
+if (_settings.worker_gateway_mode or "in_process").strip().lower() != "global":
+    app.include_router(workers.router)
+else:
+    logger.info("WORKER_GATEWAY_MODE=global — worker WS served by global gateway, not this process")
 
 
 # =============================================================================

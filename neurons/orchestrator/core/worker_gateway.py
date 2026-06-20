@@ -6,6 +6,7 @@ The orchestrator forwards task offer batch items as task_offer messages,
 and relays task_accept / task_reject / task_result upstream.
 """
 
+import asyncio
 import json
 import logging
 from typing import Callable, Dict, Optional
@@ -26,9 +27,14 @@ class WorkerGateway:
         self._cursor = 0
         self._on_ready_change = on_ready_change
         self._upstream: Optional[object] = None  # SubnetCoreClient ref
+        self._outbound_send: Optional[Callable] = None
 
     def set_upstream(self, upstream: object) -> None:
         self._upstream = upstream
+
+    def set_outbound_sender(self, sender: Callable) -> None:
+        """Send payloads to workers via global gateway (or other external transport)."""
+        self._outbound_send = sender
 
     @property
     def connected_count(self) -> int:
@@ -99,6 +105,15 @@ class WorkerGateway:
             logger.debug("Unhandled worker message type %s from %s", msg_type, worker_id)
 
     async def _send_to_worker(self, worker_id: str, payload: dict) -> None:
+        if self._outbound_send is not None:
+            try:
+                result = self._outbound_send(worker_id, payload)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as exc:
+                logger.warning("outbound worker send failed for %s: %s", worker_id, exc)
+            return
+
         ws = self._sessions.get(worker_id)
         if ws is None:
             return

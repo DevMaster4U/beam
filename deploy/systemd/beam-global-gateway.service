@@ -1,0 +1,16 @@
+[Unit]
+Description=BEAM Global Worker Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/subnets/sn105/global-gateway
+EnvironmentFile=-/root/subnets/sn105/config/global-gateway.env
+Environment=PYTHONPATH=/root/subnets/sn105/global-gateway
+ExecStart=/usr/bin/python3 main.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
