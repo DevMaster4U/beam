@@ -50,9 +50,9 @@ See [Worker Guide](../../docs/worker.md#multiple-workers-on-one-machine) for ful
 
 ## Transport
 
-The worker uses BeamCore HTTP only for registration and signed bootstrap calls. Transfer runtime uses the orchestrator's in-process worker gateway WebSocket (`WORKER_GATEWAY_URL` must be the orchestrator HTTP/WebSocket origin, not BeamCore Core).
+The worker uses BeamCore HTTP only for registration and signed bootstrap calls. Transfer runtime uses a worker gateway WebSocket (`WORKER_GATEWAY_URL` is the gateway HTTP/WebSocket origin — orchestrator in-process gateway or shared global gateway, not BeamCore).
 
-Typical environment:
+Typical environment (orchestrator in-process gateway):
 
 ```bash
 export CORE_SERVER_URL=https://beamcore.b1m.ai
@@ -62,12 +62,19 @@ export CONNECTION_MODE=auto               # or websocket (see worker.py)
 python worker.py --subtensor.network finney
 ```
 
+Shared global gateway (multiple orchestrators, one worker pool):
+
+```bash
+export WORKER_GATEWAY_URL=http://your-global-gateway.example.com:8005
+export WORKER_GATEWAY_SECRET=your-long-random-worker-secret
+```
+
 ## How It Works
 
 1. Registers with the network using your Bittensor wallet (signed authentication)
-2. Connects to the orchestrator worker gateway via WebSocket to receive tasks instantly as they are assigned
-3. For each task: fetches data chunks from the source and delivers them to the destination
-4. Reports completion with proof-of-bandwidth metrics (bytes transferred, speed, duration)
+2. Connects to the worker gateway via WebSocket to receive `task_offer` messages
+3. For each offer: starts the transfer and sends `task_accept` immediately in parallel, waits for `task_accept_ack`, then submits `task_result` if accepted (aborts transfer if rejected)
+4. Sends `task_result` after the transfer and waits for `task_result_ack` (`completed=true` for scoring/payment)
 5. Sends periodic heartbeats to stay registered
 
 ## Environment Variables
@@ -75,5 +82,13 @@ python worker.py --subtensor.network finney
 | Variable            | Required | Description |
 | ------------------- | -------- | ----------- |
 | `CORE_SERVER_URL`   | no       | BeamCore HTTP base. |
-| `WORKER_GATEWAY_URL`        | **yes**  | Worker-gateway base URL (`http(s)://host:port` — used to derive WebSocket URLs). |
+| `WORKER_GATEWAY_URL`        | **yes**  | Worker-gateway base URL (`http(s)://host:port` — orchestrator or global gateway). |
+| `WORKER_GATEWAY_SECRET`     | **yes**  | Sent as `worker_secret` on the gateway WebSocket query string. |
+| `WORKER_TASK_ACCEPT_ACK_TIMEOUT` | no | Seconds to wait for `task_accept_ack` after `task_accept` is sent (default `5`). |
+| `WORKER_TASK_RESULT_ACK_TIMEOUT` | no | Seconds to wait for `task_result_ack` (default `3`). |
+| `WORKER_EARLY_TRANSFER` | no | Start transfer on `task_offer` before accept ack (default `true`). Set `false` for legacy sequential accept. |
+| `WORKER_PREWARM_ENABLED` | no | `HEAD` origins on startup and before each transfer to warm DNS/TLS (default `true`). |
+| `WORKER_PREWARM_TIMEOUT` | no | Seconds per origin prewarm request (default `5`). |
+| `WORKER_PREWARM_MAX_ORIGINS` | no | Max persisted origins in `config/workers/<instance>.prewarm-hosts.json` (default `32`). |
+| `WORKER_PREWARM_ORIGINS` | no | Optional comma-separated origin seeds (e.g. R2 bucket host) before first task. |
 | `CONNECTION_MODE`   | no       | `websocket` / `polling` / `auto` (default `websocket` in env). Transfer path expects gateway WebSockets. |

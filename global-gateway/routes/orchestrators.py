@@ -36,23 +36,28 @@ async def _handle_task_offer_batch(orchestrator_hotkey: str, message: dict) -> d
         if not isinstance(offer, dict):
             failed += 1
             continue
-        workers = gateway_state.get_workers_round_robin(1)
+        workers = gateway_state.select_best_worker()
         if not workers:
-            logger.warning("task_offer_batch %s: no workers connected", batch_id)
+            logger.warning("task_offer_batch %s: no free workers", batch_id)
             failed += 1
             continue
-        worker_id = workers[0]
+        worker_id = workers
         offer_id = offer.get("offer_id") or offer.get("task_id")
         task_id = offer.get("task_id") or offer_id
         gateway_state.register_route(orchestrator_hotkey, worker_id, offer_id, task_id)
 
         payload = {"type": "task_offer", **offer}
         if await gateway_state.send_to_worker(worker_id, payload):
+            gateway_state.mark_worker_busy(worker_id, offer_id)
             delivered += 1
+            profile = gateway_state.get_profile(worker_id)
             logger.info(
-                "task_offer orch=%s -> worker=%s task=%s offer=%s",
+                "task_offer orch=%s -> worker=%s score=%.4f avg_mbps=%.1f ip=%s task=%s offer=%s",
                 orchestrator_hotkey[:16],
                 worker_id,
+                profile.score(gateway_state.scoring_weights),
+                profile.average_mbps,
+                profile.ip or "?",
                 task_id,
                 offer_id,
             )
@@ -99,7 +104,7 @@ async def orchestrator_control_ws(websocket: WebSocket, orchestrator_hotkey: str
             "type": "control_connected",
             "orchestrator_hotkey": orchestrator_hotkey,
             "worker_count": gateway_state.worker_count(),
-            "workers": [{"worker_id": wid} for wid in gateway_state.list_worker_ids()],
+            "workers": gateway_state.worker_status_payload(),
         },
     )
 
@@ -132,7 +137,7 @@ async def orchestrator_control_ws(websocket: WebSocket, orchestrator_hotkey: str
                     {
                         "type": "list_workers",
                         "request_id": message.get("request_id"),
-                        "workers": [{"worker_id": wid} for wid in gateway_state.list_worker_ids()],
+                        "workers": gateway_state.worker_status_payload(),
                     },
                 )
                 continue

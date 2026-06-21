@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
@@ -12,9 +11,84 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class WorkerScoringWeights:
+    """Match orchestrator task_scheduler._select_best_worker weights."""
+
+    weight_trust: float = 0.30
+    weight_latency: float = 0.25
+    weight_load: float = 0.20
+    weight_bandwidth: float = 0.15
+    weight_success: float = 0.10
+
+
+@dataclass
+class WorkerProfile:
+    worker_id: str
+    ip: str = ""
+    claimed_bandwidth_mbps: float = 0.0
+    transfer_mbps_sum: float = 0.0
+    transfer_count: int = 0
+    trust_score: float = 0.5
+    success_rate: float = 1.0
+    total_tasks: int = 0
+    successful_tasks: int = 0
+    max_concurrent_tasks: int = 5
+    active: bool = False
+    active_offer_id: Optional[str] = None
+
+    @property
+    def average_mbps(self) -> float:
+        """Mean observed transfer Mbps across completed tasks."""
+        if self.transfer_count > 0:
+            return self.transfer_mbps_sum / self.transfer_count
+        if self.claimed_bandwidth_mbps > 0:
+            return self.claimed_bandwidth_mbps
+        return 0.0
+
+    @property
+    def load_factor(self) -> float:
+        if self.max_concurrent_tasks <= 0:
+            return 1.0
+        effective_tasks = 1 if self.active else 0
+        return effective_tasks / self.max_concurrent_tasks
+
+    def observe_transfer(self, transfer_mbps: Optional[float], success: bool) -> None:
+        if transfer_mbps is not None:
+            try:
+                mbps = float(transfer_mbps)
+            except (TypeError, ValueError):
+                mbps = 0.0
+            if mbps > 0:
+                self.transfer_mbps_sum += mbps
+                self.transfer_count += 1
+        self.total_tasks += 1
+        if success:
+            self.successful_tasks += 1
+        if self.total_tasks > 0:
+            self.success_rate = self.successful_tasks / self.total_tasks
+
+    def score(self, weights: WorkerScoringWeights) -> float:
+        """Multi-factor score aligned with orchestrator _select_best_worker."""
+        load_score = 1.0 - self.load_factor
+        bandwidth = self.average_mbps
+        bandwidth_score = min(1.0, bandwidth / 1000.0)
+        success_score = self.success_rate
+        geo_score = 0.5
+        return (
+            weights.weight_trust * self.trust_score
+            + weights.weight_latency * geo_score
+            + weights.weight_load * load_score
+            + weights.weight_bandwidth * bandwidth_score
+            + weights.weight_success * success_score
+        )
+
+
+@dataclass
 class GlobalGatewayState:
     max_workers: int = 100
+    scoring_weights: WorkerScoringWeights = field(default_factory=WorkerScoringWeights)
     worker_sessions: Dict[str, Any] = field(default_factory=dict)
+    worker_profiles: Dict[str, WorkerProfile] = field(default_factory=dict)
     orchestrator_sessions: Dict[str, Any] = field(default_factory=dict)
     worker_cursor: int = 0
     offer_routes: Dict[str, str] = field(default_factory=dict)
@@ -29,15 +103,153 @@ class GlobalGatewayState:
     def list_worker_ids(self) -> list[str]:
         return list(self.worker_sessions.keys())
 
+    def get_profile(self, worker_id: str) -> WorkerProfile:
+        profile = self.worker_profiles.get(worker_id)
+        if profile is None:
+            profile = WorkerProfile(worker_id=worker_id)
+            self.worker_profiles[worker_id] = profile
+        return profile
+
+    def register_worker_session(
+        self,
+        worker_id: str,
+        websocket: Any,
+        *,
+        ip: str = "",
+        claimed_bandwidth_mbps: float = 0.0,
+        trust_score: float = 0.5,
+        success_rate: float = 1.0,
+        max_concurrent_tasks: int = 5,
+    ) -> None:
+        self.worker_sessions[worker_id] = websocket
+        profile = self.get_profile(worker_id)
+        if ip:
+            profile.ip = ip.strip()
+        if claimed_bandwidth_mbps > 0 and profile.claimed_bandwidth_mbps <= 0:
+            profile.claimed_bandwidth_mbps = float(claimed_bandwidth_mbps)
+        profile.trust_score = float(trust_score)
+        profile.success_rate = float(success_rate)
+        if max_concurrent_tasks > 0:
+            profile.max_concurrent_tasks = int(max_concurrent_tasks)
+
+    def unregister_worker_session(self, worker_id: str) -> None:
+        self.worker_sessions.pop(worker_id, None)
+        profile = self.worker_profiles.get(worker_id)
+        if profile:
+            profile.active = False
+            profile.active_offer_id = None
+
+    def update_worker_hello(
+        self,
+        worker_id: str,
+        ip: Optional[str] = None,
+        claimed_bandwidth_mbps: Optional[float] = None,
+    ) -> None:
+        profile = self.get_profile(worker_id)
+        if ip and ip.strip():
+            profile.ip = ip.strip()
+        if claimed_bandwidth_mbps is not None and claimed_bandwidth_mbps > 0:
+            if profile.claimed_bandwidth_mbps <= 0:
+                profile.claimed_bandwidth_mbps = float(claimed_bandwidth_mbps)
+
+    def busy_ips(self) -> set[str]:
+        ips: set[str] = set()
+        for profile in self.worker_profiles.values():
+            if profile.active and profile.ip:
+                ips.add(profile.ip)
+        return ips
+
+    def select_best_worker(self) -> Optional[str]:
+        """Score idle workers (orchestrator-style), prefer IPs not already busy."""
+        connected = self.list_worker_ids()
+        if not connected:
+            return None
+
+        free_ids = [
+            wid
+            for wid in connected
+            if not self.worker_profiles.get(wid, WorkerProfile(worker_id=wid)).active
+        ]
+        if not free_ids:
+            return None
+
+        busy = self.busy_ips()
+        prefer_other_ip = [
+            wid
+            for wid in free_ids
+            if not self.get_profile(wid).ip or self.get_profile(wid).ip not in busy
+        ]
+        pool = prefer_other_ip if prefer_other_ip else free_ids
+
+        weights = self.scoring_weights
+        scored: list[tuple[str, float]] = []
+        for worker_id in pool:
+            profile = self.get_profile(worker_id)
+            scored.append((worker_id, profile.score(weights)))
+
+        if not scored:
+            return None
+
+        scored.sort(key=lambda item: item[1], reverse=True)
+        best_id, best_score = scored[0]
+        profile = self.get_profile(best_id)
+        logger.info(
+            "selected worker %s score=%.4f avg_mbps=%.1f ip=%s pool=%d prefer_ip=%s",
+            best_id,
+            best_score,
+            profile.average_mbps,
+            profile.ip or "?",
+            len(pool),
+            bool(prefer_other_ip),
+        )
+        return best_id
+
     def get_workers_round_robin(self, n: int = 1) -> list[str]:
-        ids = self.list_worker_ids()
-        if not ids:
-            return []
+        """Select up to n best idle workers (caller marks busy when delivering offers)."""
         selected: list[str] = []
-        for _ in range(min(n, len(ids))):
-            selected.append(ids[self.worker_cursor % len(ids)])
-            self.worker_cursor += 1
+        for _ in range(n):
+            worker_id = self.select_best_worker()
+            if not worker_id:
+                break
+            selected.append(worker_id)
         return selected
+
+    def mark_worker_busy(self, worker_id: str, offer_id: Optional[str] = None) -> None:
+        profile = self.get_profile(worker_id)
+        profile.active = True
+        profile.active_offer_id = str(offer_id) if offer_id else None
+
+    def mark_worker_idle(self, worker_id: str) -> None:
+        profile = self.get_profile(worker_id)
+        profile.active = False
+        profile.active_offer_id = None
+
+    def observe_worker_transfer(
+        self,
+        worker_id: str,
+        transfer_mbps: Optional[float],
+        success: bool = False,
+    ) -> None:
+        self.get_profile(worker_id).observe_transfer(transfer_mbps, success)
+
+    def worker_status_payload(self) -> list[dict]:
+        rows: list[dict] = []
+        for worker_id in self.list_worker_ids():
+            profile = self.get_profile(worker_id)
+            rows.append(
+                {
+                    "worker_id": worker_id,
+                    "ip": profile.ip,
+                    "average_mbps": round(profile.average_mbps, 1),
+                    "transfer_count": profile.transfer_count,
+                    "claimed_bandwidth_mbps": round(profile.claimed_bandwidth_mbps, 1),
+                    "trust_score": round(profile.trust_score, 4),
+                    "success_rate": round(profile.success_rate, 4),
+                    "score": round(profile.score(self.scoring_weights), 4),
+                    "active": profile.active,
+                }
+            )
+        return rows
 
     def register_route(
         self,
@@ -79,7 +291,7 @@ class GlobalGatewayState:
         payload = {
             "type": "pool_status",
             "worker_count": self.worker_count(),
-            "workers": [{"worker_id": wid} for wid in self.list_worker_ids()],
+            "workers": self.worker_status_payload(),
         }
         for hotkey, ws in list(self.orchestrator_sessions.items()):
             if not await self.send_json(ws, payload):

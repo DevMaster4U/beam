@@ -44,7 +44,6 @@ import signal
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -264,8 +263,20 @@ FETCH_TIMEOUT = 30  # seconds
 SEND_TIMEOUT = 120  # seconds — cover large uploads on slow links
 MAX_RETRIES = 3
 RETRY_BACKOFF = 1.0  # Base backoff in seconds
-FETCH_STREAM_CHUNK_SIZE = int(
-    os.environ.get("WORKER_FETCH_STREAM_CHUNK_SIZE", str(512 * 1024))
+# Larger read granularity = fewer asyncio scheduling round-trips per byte.
+FETCH_STREAM_CHUNK_SIZE = int(os.environ.get("WORKER_FETCH_STREAM_CHUNK_SIZE", str(2 * 1024 * 1024)))
+
+# Parallel sub-range GET settings. The destination is always a single
+# presigned PUT URL (one-shot whole-body upload) so only the source GET
+# can be split across multiple connections; the PUT itself stays a single
+# sequential request. Sub-range fan-out only kicks in above the size floor
+# below, since small chunks aren't worth the extra connection overhead.
+PARALLEL_FETCH_STREAMS = max(1, int(os.environ.get("WORKER_PARALLEL_FETCH_STREAMS", "4")))
+PARALLEL_FETCH_MIN_CHUNK_BYTES = max(
+    1, int(os.environ.get("WORKER_PARALLEL_FETCH_MIN_CHUNK_BYTES", str(4 * 1024 * 1024)))
+)
+PARALLEL_FETCH_MIN_SUBRANGE_BYTES = max(
+    1, int(os.environ.get("WORKER_PARALLEL_FETCH_MIN_SUBRANGE_BYTES", str(1024 * 1024)))
 )
 
 
@@ -279,9 +290,6 @@ def _env_bool(name: str, default: bool) -> bool:
 WS_TASK_ACCEPT_ACK_TIMEOUT = float(os.environ.get("WORKER_TASK_ACCEPT_ACK_TIMEOUT", "5.0"))
 WS_TASK_RESULT_ACK_TIMEOUT = float(os.environ.get("WORKER_TASK_RESULT_ACK_TIMEOUT", "3.0"))
 WORKER_EARLY_TRANSFER = _env_bool("WORKER_EARLY_TRANSFER", True)
-PREWARM_ENABLED = _env_bool("WORKER_PREWARM_ENABLED", True)
-PREWARM_TIMEOUT = float(os.environ.get("WORKER_PREWARM_TIMEOUT", "5"))
-PREWARM_MAX_ORIGINS = max(1, int(os.environ.get("WORKER_PREWARM_MAX_ORIGINS", "32")))
 
 
 # Participant workers default to recording a payment obligation unless opted out.
@@ -301,7 +309,6 @@ class WorkerState:
     worker_gateway_secret: Optional[str] = None
     worker_id: Optional[str] = None
     api_key: Optional[str] = None
-    worker_ip: Optional[str] = None
     orchestrator_hotkey: Optional[str] = None
     active_tasks: int = 0
     running: bool = True
@@ -316,7 +323,6 @@ class WorkerState:
     reserved_ws_slots: int = 0
     reserved_bytes: int = 0
     ws_send_lock: Optional[asyncio.Lock] = None
-    prewarm_origins: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -603,13 +609,6 @@ async def get_public_ip() -> str:
     raise RuntimeError("Failed to detect public IP from any service")
 
 
-def transfer_mbps(bytes_transferred: int, duration_ms: float) -> float:
-    """End-to-end transfer rate in Mbps (matches worker chunk log)."""
-    if bytes_transferred <= 0 or duration_ms <= 0:
-        return 0.0
-    return (bytes_transferred * 8 / 1_000_000) / (duration_ms / 1000)
-
-
 def sign_message(wallet: Any, message: str) -> str:
     """Sign a message with the wallet's hotkey. Returns hex signature."""
     signature = wallet.hotkey.sign(message.encode())
@@ -772,183 +771,6 @@ async def register_worker(client: httpx.AsyncClient, state: WorkerState) -> Dict
 
 
 # =============================================================================
-# HTTP connection prewarm (cold TLS after idle)
-# =============================================================================
-
-
-def _prewarm_hosts_path() -> Optional[Path]:
-    instance = _worker_instance_name()
-    if not instance:
-        return None
-    worker_env = _resolve_worker_env_file()
-    if worker_env is not None:
-        return _resolve_env_path(worker_env).parent / f"{instance}.prewarm-hosts.json"
-    return _workspace_root() / "config" / "workers" / f"{instance}.prewarm-hosts.json"
-
-
-def url_origin(url: str) -> Optional[str]:
-    """Normalize a URL to scheme://host (no path) for connection pooling."""
-    parts = urlsplit(url.strip())
-    if parts.scheme not in ("http", "https") or not parts.hostname:
-        return None
-    host = parts.hostname.lower()
-    if parts.port and parts.port not in (80, 443):
-        netloc = f"{host}:{parts.port}"
-    else:
-        netloc = host
-    return f"{parts.scheme}://{netloc}"
-
-
-def _short_prewarm_host(origin: str) -> str:
-    host = (urlsplit(origin).hostname or origin).lower()
-    parts = host.split(".")
-    if len(parts) >= 3 and len(parts[0]) > 4:
-        return f"{parts[0][:4]}....{'.'.join(parts[-2:])}"
-    return host
-
-
-def _parse_prewarm_origins_env() -> list[str]:
-    raw = os.environ.get("WORKER_PREWARM_ORIGINS", "").strip()
-    if not raw:
-        return []
-    origins: list[str] = []
-    for piece in raw.replace("\n", ",").split(","):
-        piece = piece.strip()
-        if not piece:
-            continue
-        origin = url_origin(piece) if "://" in piece else url_origin(f"https://{piece}")
-        if origin:
-            origins.append(origin)
-    return origins
-
-
-def load_prewarm_origins_from_disk() -> list[str]:
-    """Load persisted origins plus optional WORKER_PREWARM_ORIGINS seeds."""
-    known: list[str] = []
-    seen: set[str] = set()
-
-    def add_origin(origin: Optional[str]) -> None:
-        if not origin or origin in seen:
-            return
-        seen.add(origin)
-        known.append(origin)
-
-    for origin in _parse_prewarm_origins_env():
-        add_origin(origin)
-
-    path = _prewarm_hosts_path()
-    if path and path.is_file():
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            for item in data.get("origins") or []:
-                if isinstance(item, str):
-                    add_origin(url_origin(item) if "://" in item else url_origin(f"https://{item}"))
-        except Exception as exc:
-            print(f"[Worker] Prewarm cache load failed: {exc}")
-
-    if len(known) > PREWARM_MAX_ORIGINS:
-        known = known[-PREWARM_MAX_ORIGINS:]
-
-    if path and known:
-        print(f"[Worker] Prewarm cache loaded ({path.name}): {len(known)} origin(s)")
-
-    return known
-
-
-def save_prewarm_origins(origins: list[str]) -> None:
-    path = _prewarm_hosts_path()
-    if not path:
-        return
-    trimmed = origins[-PREWARM_MAX_ORIGINS:]
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "origins": trimmed,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-
-
-def merge_prewarm_origins(state: WorkerState, urls: list[str]) -> list[str]:
-    """Learn origins from task URLs, persist when the cache changes."""
-    known = list(state.prewarm_origins)
-    seen = set(known)
-    for url in urls:
-        origin = url_origin(url)
-        if origin and origin not in seen:
-            known.append(origin)
-            seen.add(origin)
-    if len(known) > PREWARM_MAX_ORIGINS:
-        known = known[-PREWARM_MAX_ORIGINS:]
-    if known != state.prewarm_origins:
-        state.prewarm_origins = known
-        save_prewarm_origins(known)
-    return known
-
-
-def origins_for_urls(urls: list[str]) -> list[str]:
-    """Unique origins for a set of URLs, preserving order."""
-    out: list[str] = []
-    seen: set[str] = set()
-    for url in urls:
-        origin = url_origin(url)
-        if origin and origin not in seen:
-            out.append(origin)
-            seen.add(origin)
-    return out
-
-
-async def _prewarm_single_origin(
-    client: httpx.AsyncClient,
-    origin: str,
-    timeout: float,
-) -> bool:
-    """HEAD the origin root; any HTTP response warms DNS/TLS/pool."""
-    url = origin.rstrip("/") + "/"
-    try:
-        await client.head(url, timeout=timeout, follow_redirects=True)
-        return True
-    except httpx.HTTPStatusError:
-        return True
-    except Exception:
-        return False
-
-
-async def prewarm_origins(
-    client: httpx.AsyncClient,
-    origins: list[str],
-    label: str,
-    timeout: float,
-) -> None:
-    if not origins:
-        return
-    started = time.perf_counter()
-    results = await asyncio.gather(
-        *[_prewarm_single_origin(client, origin, timeout) for origin in origins],
-        return_exceptions=True,
-    )
-    ok = sum(1 for r in results if r is True)
-    elapsed_ms = (time.perf_counter() - started) * 1000
-    hosts = ", ".join(_short_prewarm_host(o) for o in origins)
-    print(
-        f"[Worker] Prewarm {label}: {ok}/{len(origins)} origin(s) "
-        f"in {elapsed_ms:.1f}ms — {hosts}"
-    )
-
-
-async def prewarm_for_transfer(
-    state: WorkerState,
-    source_url: str,
-    destination_url: str,
-) -> None:
-    if not PREWARM_ENABLED or not state.http_client:
-        return
-    urls = [source_url, destination_url]
-    merge_prewarm_origins(state, urls)
-    task_origins = origins_for_urls(urls)
-    await prewarm_origins(state.http_client, task_origins, "task", PREWARM_TIMEOUT)
-
-
-# =============================================================================
 # Transfer Helpers
 # =============================================================================
 
@@ -996,6 +818,190 @@ def _build_fetch_headers(
     return headers
 
 
+def _plan_subranges(abs_start: int, abs_end: int, num_streams: int) -> list[tuple[int, int]]:
+    """Split an absolute inclusive byte range [abs_start, abs_end] into up to
+    num_streams contiguous sub-ranges of roughly equal size. Returns a list of
+    (sub_start, sub_end) absolute, inclusive byte offsets, in ascending order.
+    """
+    total = abs_end - abs_start + 1
+    if num_streams <= 1 or total <= 0:
+        return [(abs_start, abs_end)]
+    base = total // num_streams
+    remainder = total % num_streams
+    ranges = []
+    cursor = abs_start
+    for i in range(num_streams):
+        size = base + (1 if i < remainder else 0)
+        if size <= 0:
+            continue
+        sub_start = cursor
+        sub_end = cursor + size - 1
+        ranges.append((sub_start, sub_end))
+        cursor = sub_end + 1
+    return ranges
+
+
+async def _fetch_subrange_into_buffer(
+    client: httpx.AsyncClient,
+    source_url: str,
+    buffer: bytearray,
+    base_offset: int,
+    sub_start: int,
+    sub_end: int,
+    fetch_headers: dict,
+    stream_index: int,
+    task_id: Optional[str],
+    offer_id: Optional[str],
+) -> int:
+    """Fetch one absolute byte sub-range and write it into buffer at the
+    position corresponding to (sub_start - base_offset). Returns bytes written.
+    Raises on any failure; caller is responsible for retrying the whole chunk.
+    """
+    headers = dict(fetch_headers)
+    headers["Range"] = f"bytes={sub_start}-{sub_end}"
+    expected_len = sub_end - sub_start + 1
+    write_pos = sub_start - base_offset
+    written = 0
+
+    async with client.stream("GET", source_url, headers=headers, timeout=FETCH_TIMEOUT) as response:
+        if response.status_code not in (200, 206):
+            response.raise_for_status()
+        async for part in response.aiter_bytes(chunk_size=FETCH_STREAM_CHUNK_SIZE):
+            part_len = len(part)
+            if written + part_len > expected_len:
+                raise ValueError(
+                    f"sub-range {stream_index} exceeded expected size: "
+                    f"{written + part_len} bytes > expected {expected_len} "
+                    f"task={task_label(task_id)} offer={task_label(offer_id)}"
+                )
+            buffer[write_pos + written : write_pos + written + part_len] = part
+            written += part_len
+
+    if written != expected_len:
+        raise ValueError(
+            f"sub-range {stream_index} short read: got {written} bytes, "
+            f"expected {expected_len} task={task_label(task_id)} offer={task_label(offer_id)}"
+        )
+    return written
+
+
+async def fetch_parallel_and_put(
+    client: httpx.AsyncClient,
+    source_url: str,
+    destination_url: str,
+    chunk_index: int,
+    *,
+    chunk_offset: int,
+    chunk_size: int,
+    expected_chunk_hash: Optional[str] = None,
+    task_id: Optional[str] = None,
+    offer_id: Optional[str] = None,
+    extra_fetch_headers: Optional[Dict[str, str]] = None,
+    extra_dest_headers: Optional[Dict[str, str]] = None,
+    num_streams: int = PARALLEL_FETCH_STREAMS,
+) -> tuple[int, str, Optional[str], int, float, float]:
+    """Fetch a byte range from source using multiple concurrent sub-range GETs,
+    then issue a single PUT of the assembled buffer to a presigned object-storage
+    URL. Only the GET side is parallelized: a presigned PUT URL is a one-shot
+    whole-body upload, so the destination write is always a single request.
+
+    Returns:
+        (bytes_transferred, chunk_hash, etag, response_code, fetch_ms, send_ms)
+    """
+    abs_start = chunk_offset
+    abs_end = chunk_offset + chunk_size - 1
+
+    # Don't fan out more streams than makes sense for the chunk size.
+    max_streams_for_size = max(1, chunk_size // PARALLEL_FETCH_MIN_SUBRANGE_BYTES)
+    effective_streams = max(1, min(num_streams, max_streams_for_size))
+    subranges = _plan_subranges(abs_start, abs_end, effective_streams)
+
+    base_fetch_headers = {"ngrok-skip-browser-warning": "true"}
+    if extra_fetch_headers:
+        base_fetch_headers.update(extra_fetch_headers)
+    # Drop any pre-existing Range header from the offer; we set our own per sub-range.
+    base_fetch_headers.pop("Range", None)
+    base_fetch_headers.pop("range", None)
+
+    for attempt in range(MAX_RETRIES):
+        buffer = bytearray(chunk_size)
+        fetch_started = time.perf_counter()
+        try:
+            await asyncio.gather(
+                *[
+                    _fetch_subrange_into_buffer(
+                        client,
+                        source_url,
+                        buffer,
+                        abs_start,
+                        sub_start,
+                        sub_end,
+                        base_fetch_headers,
+                        idx,
+                        task_id,
+                        offer_id,
+                    )
+                    for idx, (sub_start, sub_end) in enumerate(subranges)
+                ]
+            )
+            fetch_ms = (time.perf_counter() - fetch_started) * 1000
+
+            hasher = hashlib.sha256()
+            hasher.update(buffer)
+            chunk_hash = hasher.hexdigest()
+            if expected_chunk_hash and chunk_hash.lower() != expected_chunk_hash.lower():
+                raise ValueError(
+                    f"chunk hash mismatch: expected {expected_chunk_hash}, got {chunk_hash}"
+                )
+
+            send_headers = {
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(chunk_size),
+            }
+            if extra_dest_headers:
+                send_headers.update(extra_dest_headers)
+
+            send_started = time.perf_counter()
+            response = await client.put(
+                destination_url,
+                content=bytes(buffer),
+                headers=send_headers,
+                timeout=SEND_TIMEOUT,
+            )
+            response.raise_for_status()
+            send_ms = (time.perf_counter() - send_started) * 1000
+
+            etag = response.headers.get("ETag") or response.headers.get("etag")
+            print(
+                f"[Worker] Parallel fetch+PUT ok chunk={chunk_index} "
+                f"streams={effective_streams} bytes={chunk_size} etag={etag!r}"
+            )
+            return (chunk_size, chunk_hash, etag, response.status_code, fetch_ms, send_ms)
+
+        except Exception as e:
+            is_transient_storage_404 = (
+                isinstance(e, httpx.HTTPStatusError)
+                and e.response.status_code == 404
+                and attempt < 2
+            )
+            can_retry = is_retryable(e) or is_transient_storage_404
+            if not can_retry or attempt == MAX_RETRIES - 1:
+                print(
+                    "[Worker] Parallel fetch+PUT failed "
+                    f"task={task_label(task_id)} offer={task_label(offer_id)} "
+                    f"chunk={chunk_index} streams={effective_streams} "
+                    f"error={exception_detail(e)}{http_status_detail(e)}"
+                )
+                raise
+            print(
+                "[Worker] Parallel fetch+PUT retry "
+                f"task={task_label(task_id)} offer={task_label(offer_id)} "
+                f"chunk={chunk_index} attempt={attempt + 1}/{MAX_RETRIES} "
+                f"error={exception_detail(e)}{http_status_detail(e)}"
+            )
+            await asyncio.sleep(RETRY_BACKOFF * (2**attempt))
+
+    raise Exception("Max retries exceeded")
 
 
 async def fetch_and_send_chunk(
@@ -1019,15 +1025,65 @@ async def fetch_and_send_chunk(
     extra_fetch_headers: Optional[Dict[str, str]] = None,
     extra_dest_headers: Optional[Dict[str, str]] = None,
 ) -> tuple[int, str, Optional[str], int, float, float]:
-    """Fetch from source and upload to destination.
+    """Fetch from source and stream each received part to destination concurrently.
 
     Returns:
         (bytes_transferred, chunk_hash, etag, response_code, fetch_ms, send_ms)
     """
+    is_object_storage_dest = is_object_storage_presigned_url(destination_url)
+
+    # Figure out the absolute source byte range for this chunk. The real
+    # call site (execute_transfer) never passes chunk_offset/chunk_size —
+    # it sets the Range header directly via extra_fetch_headers (the offer's
+    # own signed Range) and surfaces the absolute start via send_chunk_offset.
+    # Parse that header so the parallel-fetch path can split it into sub-ranges.
+    resolved_abs_start: Optional[int] = None
+    resolved_size: Optional[int] = None
+    if chunk_offset is not None and chunk_size is not None:
+        resolved_abs_start = chunk_offset
+        resolved_size = chunk_size
+    else:
+        offer_range_header = None
+        if extra_fetch_headers:
+            offer_range_header = extra_fetch_headers.get("Range") or extra_fetch_headers.get("range")
+        if offer_range_header:
+            try:
+                parsed = parse_offer_range({"Range": offer_range_header})
+            except ValueError:
+                parsed = None
+            if parsed is not None:
+                resolved_abs_start, _abs_end, resolved_size = parsed
+        elif send_chunk_offset is not None and (expected_max_bytes or total_size):
+            resolved_abs_start = send_chunk_offset
+            resolved_size = expected_max_bytes or total_size
+
+    can_parallelize = (
+        not is_canary
+        and is_object_storage_dest
+        and resolved_abs_start is not None
+        and resolved_size is not None
+        and resolved_size >= PARALLEL_FETCH_MIN_CHUNK_BYTES
+        and PARALLEL_FETCH_STREAMS > 1
+    )
+    if can_parallelize:
+        return await fetch_parallel_and_put(
+            client,
+            source_url,
+            destination_url,
+            chunk_index,
+            chunk_offset=resolved_abs_start,
+            chunk_size=resolved_size,
+            expected_chunk_hash=expected_chunk_hash,
+            task_id=task_id,
+            offer_id=offer_id,
+            extra_fetch_headers=extra_fetch_headers,
+            extra_dest_headers=extra_dest_headers,
+        )
+
     fetch_headers = _build_fetch_headers(chunk_offset, chunk_size, total_size)
     if extra_fetch_headers:
         fetch_headers.update(extra_fetch_headers)
-    is_object_storage = is_object_storage_presigned_url(destination_url)
+    is_object_storage = is_object_storage_dest
     route_context = (
         object_storage_route_context(destination_url, route_metadata)
         if is_object_storage
@@ -1067,6 +1123,8 @@ async def fetch_and_send_chunk(
                                 )
 
                     async for part in response.aiter_bytes(chunk_size=FETCH_STREAM_CHUNK_SIZE):
+                        # hashlib releases the GIL internally for large buffers,
+                        # so a thread-executor hop here is pure overhead, not a speedup.
                         hasher.update(part)
                         bytes_transferred += len(part)
                         if (
@@ -1310,8 +1368,6 @@ async def execute_transfer(
         chunk_hashes[chunk_index] = task_message["chunk_hash"]
 
     client = state.http_client
-    await prewarm_for_transfer(state, source_url, destination_url)
-
     total_bytes = 0
     is_canary = is_canary_destination(destination_url)
     computed_chunk_hash = ""
@@ -1511,24 +1567,6 @@ async def ws_send_task_accept(
         return False
 
 
-async def ws_send_worker_hello(websocket, state: WorkerState) -> bool:
-    """Announce worker host metadata to the gateway for pool scheduling."""
-    try:
-        ip = state.worker_ip or await get_public_ip()
-        state.worker_ip = ip
-        msg = {
-            "type": "worker_hello",
-            "worker_id": state.worker_id,
-            "ip": ip,
-            "claimed_bandwidth_mbps": 100,
-        }
-        await ws_send_json(websocket, state, msg)
-        return True
-    except Exception as e:
-        print(f"[Worker] WS worker_hello error: {e}")
-        return False
-
-
 async def ws_send_task_result(
     websocket,
     state: WorkerState,
@@ -1539,7 +1577,6 @@ async def ws_send_task_result(
     etag: str = None,
     error: str = None,
     offer_id: str = None,
-    transfer_mbps: float = 0.0,
 ) -> bool:
     """Send task completion receipt over WebSocket."""
     try:
@@ -1549,10 +1586,7 @@ async def ws_send_task_result(
             "offer_id": offer_id or task_id,
             "worker_id": state.worker_id,
             "success": success,
-            "bytes_transferred": bytes_transferred,
         }
-        if transfer_mbps > 0:
-            msg["transfer_mbps"] = round(transfer_mbps, 1)
         if chunk_hash:
             msg["chunk_hash"] = chunk_hash
         if etag:
@@ -1576,7 +1610,6 @@ async def finalize_ws_task_result(
     etag: str = None,
     error: str = None,
     offer_id: str = None,
-    transfer_mbps: float = 0.0,
 ) -> TaskSummaryAck:
     """Send task_result and wait for BeamCore ack (received / completed)."""
     result_key = offer_id or task_id
@@ -1597,7 +1630,6 @@ async def finalize_ws_task_result(
                 etag=etag,
                 error=error,
                 offer_id=offer_id,
-                transfer_mbps=transfer_mbps,
             )
             if not sent:
                 continue
@@ -1690,7 +1722,6 @@ async def _finalize_ws_task(
         etag=result.etag,
         error=result.error_msg,
         offer_id=offer_id,
-        transfer_mbps=transfer_mbps(result.bytes_transferred, result.duration_ms),
     )
 
     if result.success and summary_ack.completed:
@@ -1967,7 +1998,6 @@ async def websocket_loop(state: WorkerState):
 
                             if msg_type == "connected":
                                 print("[Worker] [WS] Server confirmed connection")
-                                await ws_send_worker_hello(websocket, state)
 
                             elif msg_type == "task_offer":
                                 track_ws_task(state, handle_ws_task(state, websocket, message))
@@ -2083,22 +2113,25 @@ async def run_worker(state: WorkerState):
     if state.ws_send_lock is None:
         state.ws_send_lock = asyncio.Lock()
 
+    # Create HTTP client. Each concurrent task can open up to
+    # PARALLEL_FETCH_STREAMS simultaneous source GET connections plus one
+    # destination PUT connection, so size the pool for that fan-out rather
+    # than for one connection per task.
+    per_task_connections = PARALLEL_FETCH_STREAMS + 1
     client_kwargs: Dict[str, Any] = dict(
         timeout=httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=5.0),
         limits=httpx.Limits(
-            max_connections=MAX_CONCURRENT_TASKS * 4,
-            max_keepalive_connections=MAX_CONCURRENT_TASKS * 2,
+            max_connections=max(8, MAX_CONCURRENT_TASKS * per_task_connections),
+            max_keepalive_connections=max(4, MAX_CONCURRENT_TASKS * per_task_connections),
         ),
     )
-    state.http_client = httpx.AsyncClient(**client_kwargs)
-    state.prewarm_origins = load_prewarm_origins_from_disk()
-    if PREWARM_ENABLED:
-        await prewarm_origins(
-            state.http_client,
-            state.prewarm_origins,
-            "startup",
-            PREWARM_TIMEOUT,
-        )
+    try:
+        state.http_client = httpx.AsyncClient(http2=True, **client_kwargs)
+    except ImportError:
+        # httpx[http2] extra (the `h2` package) isn't installed; HTTP/1.1
+        # still works fine, it just can't multiplex over one connection.
+        print("[Worker] h2 package not installed, falling back to HTTP/1.1 (pip install h2 to enable HTTP/2)")
+        state.http_client = httpx.AsyncClient(**client_kwargs)
 
     try:
         async with httpx.AsyncClient() as client:
@@ -2110,7 +2143,6 @@ async def run_worker(state: WorkerState):
             result = await register_worker(client, state)
             state.worker_id = result.get("worker_id")
             state.api_key = result.get("api_key")
-            state.worker_ip = _public_ip or state.worker_ip
             print(f"[Worker] Registered: {state.worker_id}")
 
         if CONNECTION_MODE not in {"websocket", "auto"}:

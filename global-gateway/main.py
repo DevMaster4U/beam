@@ -14,6 +14,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from config import get_settings
+from core import WorkerScoringWeights, gateway_state
 from routes.orchestrators import router as orchestrators_router
 from routes.workers import router as workers_router
 
@@ -24,6 +25,13 @@ logger = logging.getLogger(__name__)
 async def lifespan(_app: FastAPI):
     settings = get_settings()
     logging.basicConfig(level=settings.log_level)
+    gateway_state.scoring_weights = WorkerScoringWeights(
+        weight_trust=settings.weight_trust,
+        weight_latency=settings.weight_latency,
+        weight_load=settings.weight_load,
+        weight_bandwidth=settings.weight_bandwidth,
+        weight_success=settings.weight_success,
+    )
     logger.info(
         "Global gateway starting on %s:%s (max_workers=%d)",
         settings.gateway_host,

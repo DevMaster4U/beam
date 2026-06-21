@@ -5,12 +5,20 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/root/subnets/sn105/global-gateway
-EnvironmentFile=-/root/subnets/sn105/config/global-gateway.env
-Environment=PYTHONPATH=/root/subnets/sn105/global-gateway
-ExecStart=/usr/bin/python3 main.py
+User=@BEAM_USER@
+Group=@BEAM_GROUP@
+WorkingDirectory=@BEAM_ROOT@/global-gateway
+Environment="PATH=@BEAM_VENV@/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONPATH=@BEAM_ROOT@/global-gateway"
+Environment="PYTHONUNBUFFERED=1"
+EnvironmentFile=-@BEAM_ROOT@/config/global-gateway.env
+ExecStart=@BEAM_VENV@/bin/python @BEAM_ROOT@/global-gateway/main.py
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=30
+
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

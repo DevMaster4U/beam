@@ -37,6 +37,12 @@ class GatewaySettings(BaseSettings):
     ws_ping_interval: float = Field(default=30.0, env="GATEWAY_WS_PING_INTERVAL")
     ws_ping_timeout: float = Field(default=45.0, env="GATEWAY_WS_PING_TIMEOUT")
 
+    weight_trust: float = Field(default=0.30, env="WEIGHT_TRUST")
+    weight_latency: float = Field(default=0.25, env="WEIGHT_LATENCY")
+    weight_load: float = Field(default=0.20, env="WEIGHT_LOAD")
+    weight_bandwidth: float = Field(default=0.15, env="WEIGHT_BANDWIDTH")
+    weight_success: float = Field(default=0.10, env="WEIGHT_SUCCESS")
+
     class Config:
         env_file = ".env"
         extra = "ignore"

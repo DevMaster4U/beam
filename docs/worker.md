@@ -7,7 +7,7 @@ Run a worker on BEAM mainnet.
 | Service | Environment variable | URL |
 | ------- | -------------------- | --- |
 | Core server | `CORE_SERVER_URL` | `https://beamcore.b1m.ai` |
-| Worker gateway | `WORKER_GATEWAY_URL` | Your orchestrator HTTP origin (in-process gateway on `API_PORT`) |
+| Worker gateway | `WORKER_GATEWAY_URL` | Orchestrator HTTP origin (in-process) or shared global gateway URL |
 
 ## Requirements
 
@@ -47,6 +47,15 @@ NETUID=105
 ```
 
 The worker uses BeamCore HTTP for registration and signed bootstrap calls. Transfer runtime uses `WORKER_GATEWAY_URL` over WebSocket.
+
+### Task flow (per offer)
+
+1. Gateway delivers `task_offer` to the worker WebSocket.
+2. Worker starts the GET/PUT transfer and sends `task_accept` immediately in parallel.
+3. Worker waits for `task_accept_ack` — if rejected, cancels the in-flight transfer; if accepted, continues and sends `task_result`.
+4. Worker waits for `task_result_ack` (`completed=true` counts toward epoch stats).
+
+With a **global gateway**, workers connect to the shared gateway URL; routing back to the correct orchestrator is handled by `offer_id` / `task_id` on the gateway.
 
 ## Run
 
