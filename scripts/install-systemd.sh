@@ -190,6 +190,7 @@ fi
 mkdir -p \
   "${ROOT}/logs/orchestrators" \
   "${ROOT}/logs/workers" \
+  "${ROOT}/logs/global-gateway" \
   "${ROOT}/run"
 
 render_unit() {
@@ -227,7 +228,7 @@ if [[ "$ENABLE" -eq 1 ]]; then
   echo
   echo "  cp config/global-gateway.env.example config/global-gateway.env"
   echo "  ./scripts/install-systemd.sh --enable-global-gateway"
-  echo "  sudo systemctl start beam-global-gateway.service"
+  echo "  ./scripts/run-global-gateway.sh start"
 fi
 
 if [[ "$ENABLE_ORCHESTRATORS" -eq 1 ]]; then
@@ -259,6 +260,6 @@ if [[ "$ENABLE_GLOBAL_GATEWAY" -eq 1 ]]; then
   fi
   enable_global_gateway
   echo "Enabled global gateway. Start with:"
-  echo "  sudo systemctl start beam-global-gateway.service"
-  echo "  ./scripts/run-global-gateway.sh"
+  echo "  ./scripts/run-global-gateway.sh start"
+  echo "  ./scripts/run-global-gateway.sh foreground"
 fi

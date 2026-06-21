@@ -1,6 +1,7 @@
 """BeamCore API key validation for workers and orchestrators."""
 
 import logging
+from typing import Optional
 
 import httpx
 

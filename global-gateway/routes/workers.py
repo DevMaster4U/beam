@@ -47,17 +47,34 @@ def _int_field(data: dict, *keys: str, default: int = 0) -> int:
     return default
 
 
-def _profile_fields(profile_data: Optional[dict]) -> dict[str, Any]:
+def _extract_ip(profile_data: Optional[dict], peer_ip: str = "") -> str:
+    if profile_data:
+        for key in ("ip", "public_ip", "external_ip", "ip_address", "host"):
+            raw = profile_data.get(key)
+            if raw and str(raw).strip():
+                return str(raw).strip()
+        nested = profile_data.get("worker")
+        if isinstance(nested, dict):
+            for key in ("ip", "public_ip", "external_ip", "ip_address", "host"):
+                raw = nested.get(key)
+                if raw and str(raw).strip():
+                    return str(raw).strip()
+    if peer_ip:
+        return peer_ip.strip()
+    return ""
+
+
+def _profile_fields(profile_data: Optional[dict], peer_ip: str = "") -> dict[str, Any]:
     if not profile_data:
         return {
-            "ip": "",
+            "ip": peer_ip,
             "claimed_bandwidth_mbps": 0.0,
             "trust_score": 0.5,
             "success_rate": 1.0,
             "max_concurrent_tasks": 5,
         }
     return {
-        "ip": str(profile_data.get("ip") or "").strip(),
+        "ip": _extract_ip(profile_data, peer_ip),
         "claimed_bandwidth_mbps": _float_field(
             profile_data,
             "claimed_bandwidth_mbps",
@@ -87,12 +104,16 @@ async def _handle_worker_message(worker_id: str, message: dict) -> None:
         gateway_state.update_worker_hello(worker_id, ip=ip or None, claimed_bandwidth_mbps=claimed)
         profile = gateway_state.get_profile(worker_id)
         logger.info(
-            "worker_hello %s ip=%s avg_mbps=%.1f tasks=%d",
+            "Worker connected: %s ip=%s avg_mbps=%.1f score=%.4f tasks=%d (%d/%d)",
             worker_id,
             profile.ip or "?",
             profile.average_mbps,
+            profile.score(gateway_state.scoring_weights),
             profile.transfer_count,
+            gateway_state.worker_count(),
+            gateway_state.max_workers,
         )
+        await gateway_state.notify_pool_status()
         return
 
     if msg_type == "task_reject":
@@ -159,7 +180,10 @@ async def worker_ws(websocket: WebSocket, worker_id: str) -> None:
         return
 
     await websocket.accept()
-    fields = _profile_fields(profile_data)
+    peer_ip = ""
+    if websocket.client and websocket.client.host:
+        peer_ip = str(websocket.client.host).strip()
+    fields = _profile_fields(profile_data, peer_ip=peer_ip)
     gateway_state.register_worker_session(
         worker_id,
         websocket,
@@ -169,13 +193,10 @@ async def worker_ws(websocket: WebSocket, worker_id: str) -> None:
         success_rate=fields["success_rate"],
         max_concurrent_tasks=fields["max_concurrent_tasks"],
     )
-    profile = gateway_state.get_profile(worker_id)
-    logger.info(
-        "Worker connected: %s ip=%s avg_mbps=%.1f score=%.4f (%d/%d)",
+    logger.debug(
+        "Worker WS accepted: %s peer=%s (%d/%d)",
         worker_id,
-        profile.ip or "?",
-        profile.average_mbps,
-        profile.score(gateway_state.scoring_weights),
+        fields["ip"] or peer_ip or "?",
         gateway_state.worker_count(),
         settings.max_workers,
     )

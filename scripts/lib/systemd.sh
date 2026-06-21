@@ -278,3 +278,16 @@ beam_ensure_orchestrator_instance() {
   beam_sync_orchestrators
   beam_systemctl enable "beam-orchestrator@${instance}.service"
 }
+
+beam_ensure_global_gateway() {
+  local env_file="${BEAM_ROOT}/config/global-gateway.env"
+
+  if [[ ! -f "$env_file" ]]; then
+    echo "Missing env file: ${env_file}" >&2
+    echo "Copy config/global-gateway.env.example to config/global-gateway.env" >&2
+    exit 1
+  fi
+
+  beam_require_unit "beam-global-gateway.service"
+  beam_systemctl enable "beam-global-gateway.service"
+}

@@ -10,6 +10,7 @@ Group=@BEAM_GROUP@
 WorkingDirectory=@BEAM_ROOT@/global-gateway
 Environment="PATH=@BEAM_VENV@/bin:/usr/local/bin:/usr/bin:/bin"
 Environment="PYTHONPATH=@BEAM_ROOT@/global-gateway"
+Environment="LOG_DIR=@BEAM_ROOT@/logs"
 Environment="PYTHONUNBUFFERED=1"
 EnvironmentFile=-@BEAM_ROOT@/config/global-gateway.env
 ExecStart=@BEAM_VENV@/bin/python @BEAM_ROOT@/global-gateway/main.py
@@ -17,7 +18,8 @@ Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30
 
-StandardOutput=journal
+# Application logs go to ${LOG_DIR}/global-gateway/global-gateway.log
+StandardOutput=null
 StandardError=journal
 
 [Install]
