@@ -22,12 +22,21 @@ def gateway_log_path() -> Path:
     return log_dir / _LOG_FILENAME
 
 
+def quiet_third_party_loggers() -> None:
+    """Keep httpx/uvicorn noise out of the gateway log file."""
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+
+
 def configure_gateway_logging(force: bool = False) -> Path:
     """Write gateway logs to logs/global-gateway/global-gateway.log."""
     global _LOGGING_CONFIGURED
     log_path = gateway_log_path()
 
     if _LOGGING_CONFIGURED and not force:
+        quiet_third_party_loggers()
         return log_path
 
     log_format = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
@@ -54,15 +63,8 @@ def configure_gateway_logging(force: bool = False) -> Path:
         handlers=handlers,
         force=True,
     )
-
-    # Keep gateway logs focused on routing/worker events.
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-    logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+    quiet_third_party_loggers()
 
     _LOGGING_CONFIGURED = True
     logging.getLogger(__name__).info("Global gateway logging initialized: %s", log_path)
     return log_path
-
-
-configure_gateway_logging()

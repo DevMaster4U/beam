@@ -30,20 +30,49 @@ async def _handle_task_offer_batch(orchestrator_hotkey: str, message: dict) -> d
     if not isinstance(offers, list) or not offers:
         return {"type": "task_offer_batch_result", "batch_id": batch_id, "delivered": 0, "failed": 0}
 
+    total_offers = len(offers)
+    logger.info(
+        "task_offer_batch %s: %d offer(s) from orch=%s (%s)",
+        batch_id,
+        total_offers,
+        orchestrator_hotkey[:16],
+        gateway_state.worker_pool_summary(),
+    )
+
     delivered = 0
     failed = 0
+    offer_index = 0
     for offer in offers:
+        offer_index += 1
         if not isinstance(offer, dict):
             failed += 1
+            logger.warning(
+                "task_offer_batch %s offer %d/%d: invalid offer payload (%s)",
+                batch_id,
+                offer_index,
+                total_offers,
+                gateway_state.worker_pool_summary(),
+            )
             continue
-        workers = gateway_state.select_best_worker()
-        if not workers:
-            logger.warning("task_offer_batch %s: no free workers", batch_id)
-            failed += 1
-            continue
-        worker_id = workers
+
         offer_id = offer.get("offer_id") or offer.get("task_id")
         task_id = offer.get("task_id") or offer_id
+
+        worker_id = gateway_state.select_best_worker()
+        if not worker_id:
+            logger.warning(
+                "task_offer_batch %s offer %d/%d: no worker with capacity (%s) "
+                "task=%s offer=%s",
+                batch_id,
+                offer_index,
+                total_offers,
+                gateway_state.worker_pool_summary(),
+                task_id,
+                offer_id,
+            )
+            failed += 1
+            continue
+
         gateway_state.register_route(orchestrator_hotkey, worker_id, offer_id, task_id)
 
         payload = {"type": "task_offer", **offer}
@@ -52,17 +81,43 @@ async def _handle_task_offer_batch(orchestrator_hotkey: str, message: dict) -> d
             delivered += 1
             profile = gateway_state.get_profile(worker_id)
             logger.info(
-                "task_offer orch=%s -> worker=%s score=%.4f avg_mbps=%.1f ip=%s task=%s offer=%s",
+                "task_offer_batch %s offer %d/%d: orch=%s -> worker=%s score=%.4f "
+                "avg_mbps=%.1f ip=%s active=%d/%d task=%s offer=%s (%s)",
+                batch_id,
+                offer_index,
+                total_offers,
                 orchestrator_hotkey[:16],
                 worker_id,
                 profile.score(gateway_state.scoring_weights),
                 profile.average_mbps,
                 profile.ip or "?",
+                profile.active_count,
+                profile.max_concurrent_tasks,
                 task_id,
                 offer_id,
+                gateway_state.worker_pool_summary(),
             )
         else:
             failed += 1
+            logger.warning(
+                "task_offer_batch %s offer %d/%d: send failed worker=%s task=%s offer=%s (%s)",
+                batch_id,
+                offer_index,
+                total_offers,
+                worker_id,
+                task_id,
+                offer_id,
+                gateway_state.worker_pool_summary(),
+            )
+
+    logger.info(
+        "task_offer_batch %s done: delivered=%d failed=%d offers=%d (%s)",
+        batch_id,
+        delivered,
+        failed,
+        total_offers,
+        gateway_state.worker_pool_summary(),
+    )
 
     return {
         "type": "task_offer_batch_result",

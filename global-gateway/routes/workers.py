@@ -97,19 +97,30 @@ async def _handle_worker_message(worker_id: str, message: dict) -> None:
     if msg_type == "worker_hello":
         ip = str(message.get("ip") or "").strip()
         claimed_raw = message.get("claimed_bandwidth_mbps")
+        max_tasks_raw = message.get("max_concurrent_tasks")
         try:
             claimed = float(claimed_raw) if claimed_raw is not None else None
         except (TypeError, ValueError):
             claimed = None
-        gateway_state.update_worker_hello(worker_id, ip=ip or None, claimed_bandwidth_mbps=claimed)
+        try:
+            max_concurrent = int(max_tasks_raw) if max_tasks_raw is not None else None
+        except (TypeError, ValueError):
+            max_concurrent = None
+        gateway_state.update_worker_hello(
+            worker_id,
+            ip=ip or None,
+            claimed_bandwidth_mbps=claimed,
+            max_concurrent_tasks=max_concurrent,
+        )
         profile = gateway_state.get_profile(worker_id)
         logger.info(
-            "Worker connected: %s ip=%s avg_mbps=%.1f score=%.4f tasks=%d (%d/%d)",
+            "Worker connected: %s ip=%s max_tasks=%d active=%d avg_mbps=%.1f score=%.4f (%d/%d)",
             worker_id,
             profile.ip or "?",
+            profile.max_concurrent_tasks,
+            profile.active_count,
             profile.average_mbps,
             profile.score(gateway_state.scoring_weights),
-            profile.transfer_count,
             gateway_state.worker_count(),
             gateway_state.max_workers,
         )
@@ -117,21 +128,36 @@ async def _handle_worker_message(worker_id: str, message: dict) -> None:
         return
 
     if msg_type == "task_reject":
-        gateway_state.mark_worker_idle(worker_id)
+        offer_id = str(message.get("offer_id") or message.get("task_id") or "")
+        gateway_state.mark_worker_idle(worker_id, offer_id or None)
+        profile = gateway_state.get_profile(worker_id)
+        logger.info(
+            "worker %s task_reject offer=%s active_tasks=%d (%s)",
+            worker_id,
+            offer_id or "?",
+            profile.active_count,
+            gateway_state.worker_pool_summary(),
+        )
     elif msg_type == "task_result":
+        offer_id = str(message.get("offer_id") or message.get("task_id") or "")
         gateway_state.observe_worker_transfer(
             worker_id,
             message.get("transfer_mbps"),
             success=bool(message.get("success", False)),
         )
-        gateway_state.mark_worker_idle(worker_id)
+        gateway_state.mark_worker_idle(worker_id, offer_id or None)
         profile = gateway_state.get_profile(worker_id)
         logger.info(
-            "worker %s transfer observed avg_mbps=%.1f (n=%d) success_rate=%.3f",
+            "worker %s task_result offer=%s active_tasks=%d avg_mbps=%.1f (n=%d) "
+            "success_rate=%.3f transfer_mbps=%s (%s)",
             worker_id,
+            offer_id or "?",
+            profile.active_count,
             profile.average_mbps,
             profile.transfer_count,
             profile.success_rate,
+            message.get("transfer_mbps"),
+            gateway_state.worker_pool_summary(),
         )
 
     if msg_type not in ("task_accept", "task_reject", "task_result"):

@@ -1521,6 +1521,7 @@ async def ws_send_worker_hello(websocket, state: WorkerState) -> bool:
             "worker_id": state.worker_id,
             "ip": ip,
             "claimed_bandwidth_mbps": 100,
+            "max_concurrent_tasks": MAX_CONCURRENT_TASKS,
         }
         await ws_send_json(websocket, state, msg)
         return True

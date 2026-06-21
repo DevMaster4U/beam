@@ -33,8 +33,19 @@ class WorkerProfile:
     total_tasks: int = 0
     successful_tasks: int = 0
     max_concurrent_tasks: int = 5
-    active: bool = False
-    active_offer_id: Optional[str] = None
+    active_offer_ids: set[str] = field(default_factory=set)
+
+    @property
+    def active_count(self) -> int:
+        return len(self.active_offer_ids)
+
+    @property
+    def active(self) -> bool:
+        return bool(self.active_offer_ids)
+
+    @property
+    def has_capacity(self) -> bool:
+        return self.active_count < self.max_concurrent_tasks
 
     @property
     def average_mbps(self) -> float:
@@ -49,8 +60,7 @@ class WorkerProfile:
     def load_factor(self) -> float:
         if self.max_concurrent_tasks <= 0:
             return 1.0
-        effective_tasks = 1 if self.active else 0
-        return effective_tasks / self.max_concurrent_tasks
+        return min(1.0, self.active_count / self.max_concurrent_tasks)
 
     def observe_transfer(self, transfer_mbps: Optional[float], success: bool) -> None:
         if transfer_mbps is not None:
@@ -136,14 +146,14 @@ class GlobalGatewayState:
         self.worker_sessions.pop(worker_id, None)
         profile = self.worker_profiles.get(worker_id)
         if profile:
-            profile.active = False
-            profile.active_offer_id = None
+            profile.active_offer_ids.clear()
 
     def update_worker_hello(
         self,
         worker_id: str,
         ip: Optional[str] = None,
         claimed_bandwidth_mbps: Optional[float] = None,
+        max_concurrent_tasks: Optional[int] = None,
     ) -> None:
         profile = self.get_profile(worker_id)
         if ip and ip.strip():
@@ -151,6 +161,8 @@ class GlobalGatewayState:
         if claimed_bandwidth_mbps is not None and claimed_bandwidth_mbps > 0:
             if profile.claimed_bandwidth_mbps <= 0:
                 profile.claimed_bandwidth_mbps = float(claimed_bandwidth_mbps)
+        if max_concurrent_tasks is not None and max_concurrent_tasks > 0:
+            profile.max_concurrent_tasks = int(max_concurrent_tasks)
 
     def busy_ips(self) -> set[str]:
         ips: set[str] = set()
@@ -159,27 +171,64 @@ class GlobalGatewayState:
                 ips.add(profile.ip)
         return ips
 
+    def worker_pool_stats(self) -> dict[str, Any]:
+        """Connected / idle / busy counts for logging."""
+        connected_ids = self.list_worker_ids()
+        connected = len(connected_ids)
+        busy_ids = [
+            wid for wid in connected_ids if self.get_profile(wid).active
+        ]
+        busy = len(busy_ids)
+        with_capacity = sum(
+            1 for wid in connected_ids if self.get_profile(wid).has_capacity
+        )
+        idle = sum(1 for wid in connected_ids if self.get_profile(wid).active_count == 0)
+        return {
+            "connected": connected,
+            "idle": idle,
+            "busy": busy,
+            "with_capacity": with_capacity,
+            "busy_worker_ids": busy_ids,
+            "busy_ips": sorted(self.busy_ips()),
+        }
+
+    def worker_pool_summary(self) -> str:
+        stats = self.worker_pool_stats()
+        parts = [
+            f"connected={stats['connected']}",
+            f"idle={stats['idle']}",
+            f"busy={stats['busy']}",
+            f"with_capacity={stats['with_capacity']}",
+        ]
+        busy_ips = stats["busy_ips"]
+        if busy_ips:
+            parts.append(f"busy_ips={','.join(busy_ips)}")
+        busy_ids = stats["busy_worker_ids"]
+        if busy_ids:
+            short = [f"{wid[:8]}..." for wid in busy_ids]
+            parts.append(f"busy_workers={','.join(short)}")
+        return " ".join(parts)
+
     def select_best_worker(self) -> Optional[str]:
-        """Score idle workers (orchestrator-style), prefer IPs not already busy."""
+        """Pick the best worker that still has capacity (active < max_concurrent_tasks)."""
         connected = self.list_worker_ids()
         if not connected:
             return None
 
-        free_ids = [
-            wid
-            for wid in connected
-            if not self.worker_profiles.get(wid, WorkerProfile(worker_id=wid)).active
+        capacity_ids = [
+            wid for wid in connected if self.get_profile(wid).has_capacity
         ]
-        if not free_ids:
+        if not capacity_ids:
             return None
 
         busy = self.busy_ips()
         prefer_other_ip = [
             wid
-            for wid in free_ids
+            for wid in capacity_ids
             if not self.get_profile(wid).ip or self.get_profile(wid).ip not in busy
         ]
-        pool = prefer_other_ip if prefer_other_ip else free_ids
+        pool = prefer_other_ip if prefer_other_ip else capacity_ids
+        prefer_other_ip_used = bool(prefer_other_ip)
 
         weights = self.scoring_weights
         scored: list[tuple[str, float]] = []
@@ -193,14 +242,18 @@ class GlobalGatewayState:
         scored.sort(key=lambda item: item[1], reverse=True)
         best_id, best_score = scored[0]
         profile = self.get_profile(best_id)
-        logger.info(
-            "selected worker %s score=%.4f avg_mbps=%.1f ip=%s pool=%d prefer_ip=%s",
+        logger.debug(
+            "selected worker %s score=%.4f avg_mbps=%.1f ip=%s active=%d/%d "
+            "candidates=%d prefer_other_ip=%s (%s)",
             best_id,
             best_score,
             profile.average_mbps,
             profile.ip or "?",
+            profile.active_count,
+            profile.max_concurrent_tasks,
             len(pool),
-            bool(prefer_other_ip),
+            prefer_other_ip_used,
+            self.worker_pool_summary(),
         )
         return best_id
 
@@ -216,13 +269,15 @@ class GlobalGatewayState:
 
     def mark_worker_busy(self, worker_id: str, offer_id: Optional[str] = None) -> None:
         profile = self.get_profile(worker_id)
-        profile.active = True
-        profile.active_offer_id = str(offer_id) if offer_id else None
+        if offer_id:
+            profile.active_offer_ids.add(str(offer_id))
 
-    def mark_worker_idle(self, worker_id: str) -> None:
+    def mark_worker_idle(self, worker_id: str, offer_id: Optional[str] = None) -> None:
         profile = self.get_profile(worker_id)
-        profile.active = False
-        profile.active_offer_id = None
+        if offer_id:
+            profile.active_offer_ids.discard(str(offer_id))
+        else:
+            profile.active_offer_ids.clear()
 
     def observe_worker_transfer(
         self,
@@ -247,6 +302,8 @@ class GlobalGatewayState:
                     "success_rate": round(profile.success_rate, 4),
                     "score": round(profile.score(self.scoring_weights), 4),
                     "active": profile.active,
+                    "active_tasks": profile.active_count,
+                    "max_concurrent_tasks": profile.max_concurrent_tasks,
                 }
             )
         return rows

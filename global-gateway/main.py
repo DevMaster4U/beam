@@ -15,7 +15,7 @@ if str(_ROOT) not in sys.path:
 
 from config import get_settings
 from core import WorkerScoringWeights, gateway_state
-from logging_config import configure_gateway_logging
+from logging_config import configure_gateway_logging, quiet_third_party_loggers
 from routes.orchestrators import router as orchestrators_router
 from routes.workers import router as workers_router
 
@@ -25,8 +25,7 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     settings = get_settings()
-    log_path = configure_gateway_logging(force=True)
-    logging.getLogger().setLevel(settings.log_level)
+    quiet_third_party_loggers()
     gateway_state.scoring_weights = WorkerScoringWeights(
         weight_trust=settings.weight_trust,
         weight_latency=settings.weight_latency,
@@ -35,11 +34,10 @@ async def lifespan(_app: FastAPI):
         weight_success=settings.weight_success,
     )
     logger.info(
-        "Global gateway starting on %s:%s (max_workers=%d) log=%s",
+        "Global gateway ready on %s:%s (max_workers=%d)",
         settings.gateway_host,
         settings.gateway_port,
         settings.max_workers,
-        log_path,
     )
     yield
     logger.info("Global gateway stopped")
@@ -65,11 +63,12 @@ def main() -> None:
     settings = get_settings()
     configure_gateway_logging(force=True)
     logging.getLogger().setLevel(settings.log_level)
+    quiet_third_party_loggers()
     uvicorn.run(
         "main:app",
         host=settings.gateway_host,
         port=settings.gateway_port,
-        log_level=settings.log_level.lower(),
+        log_level="warning",
         log_config=None,
         ws_ping_interval=settings.ws_ping_interval,
         ws_ping_timeout=settings.ws_ping_timeout,
