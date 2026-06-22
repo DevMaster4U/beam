@@ -404,7 +404,7 @@ class Orchestrator:
 
     def _on_worker_gateway_ready_change(self, ready: bool) -> None:
         """Toggle orchestrator readiness when the first/last local worker connects."""
-        if self.settings.worker_gateway_mode == "global":
+        if self.settings.worker_gateway_mode in ("global", "coordinator"):
             return
         if self.subnet_core_client is None:
             return
@@ -1113,30 +1113,56 @@ class Orchestrator:
             self.subnet_core_client.set_worker_gateway(self.worker_gateway)
 
             gateway_mode = (self.settings.worker_gateway_mode or "in_process").strip().lower()
-            if gateway_mode == "global":
+            if gateway_mode in ("global", "coordinator"):
                 control_secret = self.settings.orchestrator_gateway_secret
-                control_base = self.settings.global_gateway_url or self.settings.worker_gateway_url
-                if not control_base or not control_secret:
+                if not control_secret:
                     raise ValueError(
-                        "WORKER_GATEWAY_MODE=global requires GLOBAL_GATEWAY_URL (or "
-                        "ORCHESTRATOR_WORKER_GATEWAY_URL) and ORCHESTRATOR_GATEWAY_SECRET"
+                        "WORKER_GATEWAY_MODE=%s requires ORCHESTRATOR_GATEWAY_SECRET"
+                        % gateway_mode
                     )
-
-                from clients.global_gateway_client import GlobalGatewayClient
 
                 async def _control_api_key() -> Optional[str]:
                     if self.subnet_core_client is None:
                         return None
                     return await self.subnet_core_client._ensure_api_key()
 
-                self.global_gateway_client = GlobalGatewayClient(
-                    control_base_url=control_base,
-                    orchestrator_hotkey=self.hotkey or "unknown",
-                    control_secret=control_secret,
-                    api_key_provider=_control_api_key,
-                    ping_interval=self.settings.orch_ws_ping_interval,
-                    ping_timeout=self.settings.orch_ws_ping_timeout,
-                )
+                if gateway_mode == "coordinator":
+                    from pathlib import Path as _Path
+
+                    ipc_path = self.settings.pool_coordinator_ipc or "run/pool-coordinator.sock"
+                    if not _Path(ipc_path).is_absolute():
+                        repo_root = _Path(__file__).resolve().parents[3]
+                        ipc_path = str(repo_root / ipc_path)
+
+                    from clients.pool_coordinator_client import PoolCoordinatorClient
+
+                    self.global_gateway_client = PoolCoordinatorClient(
+                        ipc_socket_path=ipc_path,
+                        orchestrator_hotkey=self.hotkey or "unknown",
+                        control_secret=control_secret,
+                        api_key_provider=_control_api_key,
+                    )
+                    pool_control_label = ipc_path
+                else:
+                    control_base = self.settings.global_gateway_url or self.settings.worker_gateway_url
+                    if not control_base:
+                        raise ValueError(
+                            "WORKER_GATEWAY_MODE=global requires GLOBAL_GATEWAY_URL (or "
+                            "ORCHESTRATOR_WORKER_GATEWAY_URL)"
+                        )
+
+                    from clients.global_gateway_client import GlobalGatewayClient
+
+                    self.global_gateway_client = GlobalGatewayClient(
+                        control_base_url=control_base,
+                        orchestrator_hotkey=self.hotkey or "unknown",
+                        control_secret=control_secret,
+                        api_key_provider=_control_api_key,
+                        ping_interval=self.settings.orch_ws_ping_interval,
+                        ping_timeout=self.settings.orch_ws_ping_timeout,
+                    )
+                    pool_control_label = control_base
+
                 self.global_gateway_client.set_worker_message_handler(
                     self._handle_global_gateway_worker_message
                 )
@@ -1145,8 +1171,9 @@ class Orchestrator:
                 self.subnet_core_client.set_global_gateway_client(self.global_gateway_client)
                 await self.global_gateway_client.start()
                 logger.info(
-                    "Global worker gateway control channel started: %s (hotkey=%s)",
-                    control_base,
+                    "Shared worker pool control channel started (%s): %s (hotkey=%s)",
+                    gateway_mode,
+                    pool_control_label,
                     self.hotkey,
                 )
 
@@ -1167,7 +1194,7 @@ class Orchestrator:
                 self.settings.worker_gateway_url
                 or (
                     self.settings.global_gateway_url
-                    if gateway_mode == "global"
+                    if gateway_mode in ("global", "coordinator")
                     else f"http://{local_ip}:{self.settings.api_port}"
                 )
             )

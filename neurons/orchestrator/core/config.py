@@ -264,6 +264,11 @@ class OrchestratorSettings(BaseSettings):
     )
     worker_gateway_mode: str = Field(default="in_process", env="WORKER_GATEWAY_MODE")
     global_gateway_url: Optional[str] = Field(default=None, env="GLOBAL_GATEWAY_URL")
+    pool_coordinator_ipc: Optional[str] = Field(
+        default=None,
+        env="POOL_COORDINATOR_IPC",
+        description="Unix socket path for colocated pool coordinator (WORKER_GATEWAY_MODE=coordinator)",
+    )
     orchestrator_gateway_secret: Optional[str] = Field(
         default=None,
         validation_alias=AliasChoices(

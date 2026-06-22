@@ -197,7 +197,12 @@ class GlobalGatewayClient:
             worker_id = str(data.get("worker_id") or "")
             message = data.get("message")
             if worker_id and isinstance(message, dict) and self._worker_message_handler:
-                await self._worker_message_handler(worker_id, message)
+                # Do not block the control recv loop on BeamCore round-trips; workers
+                # finish in parallel and each needs its own ack path.
+                asyncio.create_task(
+                    self._dispatch_worker_message(worker_id, message),
+                    name=f"global-gateway-relay-{worker_id[:8]}",
+                )
             return
 
         if msg_type == "task_offer_batch_result":
@@ -210,6 +215,23 @@ class GlobalGatewayClient:
             return
 
         logger.debug("Unhandled global gateway message type=%s", msg_type)
+
+    async def _dispatch_worker_message(self, worker_id: str, message: dict) -> None:
+        handler = self._worker_message_handler
+        if handler is None:
+            return
+        msg_type = message.get("type")
+        offer_id = message.get("offer_id") or message.get("task_id")
+        try:
+            await handler(worker_id, message)
+        except Exception as exc:
+            logger.warning(
+                "global gateway worker relay failed: worker=%s type=%s offer=%s: %s",
+                worker_id,
+                msg_type,
+                offer_id,
+                exc,
+            )
 
 
 def build_global_gateway_control_url(host: str, port: int) -> str:

@@ -127,8 +127,11 @@ async def _handle_worker_message(worker_id: str, message: dict) -> None:
         await gateway_state.notify_pool_status()
         return
 
-    if msg_type == "task_reject":
+    if msg_type == "task_accept":
+        gateway_state.record_task_accepted(worker_id, message)
+    elif msg_type == "task_reject":
         offer_id = str(message.get("offer_id") or message.get("task_id") or "")
+        gateway_state.record_task_rejected(worker_id, message)
         gateway_state.mark_worker_idle(worker_id, offer_id or None)
         profile = gateway_state.get_profile(worker_id)
         logger.info(
@@ -140,25 +143,34 @@ async def _handle_worker_message(worker_id: str, message: dict) -> None:
         )
     elif msg_type == "task_result":
         offer_id = str(message.get("offer_id") or message.get("task_id") or "")
-        gateway_state.observe_worker_transfer(
-            worker_id,
-            message.get("transfer_mbps"),
-            success=bool(message.get("success", False)),
-        )
-        gateway_state.mark_worker_idle(worker_id, offer_id or None)
-        profile = gateway_state.get_profile(worker_id)
-        logger.info(
-            "worker %s task_result offer=%s active_tasks=%d avg_mbps=%.1f (n=%d) "
-            "success_rate=%.3f transfer_mbps=%s (%s)",
-            worker_id,
-            offer_id or "?",
-            profile.active_count,
-            profile.average_mbps,
-            profile.transfer_count,
-            profile.success_rate,
-            message.get("transfer_mbps"),
-            gateway_state.worker_pool_summary(),
-        )
+        duplicate = offer_id and gateway_state.is_duplicate_task_result(offer_id)
+        if not duplicate:
+            gateway_state.observe_worker_transfer(
+                worker_id,
+                message.get("transfer_mbps"),
+                success=bool(message.get("success", False)),
+            )
+            gateway_state.record_task_result(worker_id, message)
+            gateway_state.mark_worker_idle(worker_id, offer_id or None)
+            profile = gateway_state.get_profile(worker_id)
+            logger.info(
+                "worker %s task_result offer=%s active_tasks=%d avg_mbps=%.1f (n=%d) "
+                "success_rate=%.3f transfer_mbps=%s (%s)",
+                worker_id,
+                offer_id or "?",
+                profile.active_count,
+                profile.average_mbps,
+                profile.transfer_count,
+                profile.success_rate,
+                message.get("transfer_mbps"),
+                gateway_state.worker_pool_summary(),
+            )
+        else:
+            logger.info(
+                "worker %s duplicate task_result offer=%s (relay only, stats skipped)",
+                worker_id,
+                offer_id or "?",
+            )
 
     if msg_type not in ("task_accept", "task_reject", "task_result"):
         return

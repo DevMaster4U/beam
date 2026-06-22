@@ -4,10 +4,37 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from collections import deque
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Deque, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+@dataclass
+class WorkerTaskRecord:
+    task_id: str
+    offer_id: str
+    worker_id: str
+    orchestrator_hotkey: str = ""
+    assigned_at: str = ""
+    completed_at: Optional[str] = None
+    status: str = "assigned"  # assigned, accepted, completed, rejected
+    success: Optional[bool] = None
+    transfer_mbps: Optional[float] = None
+    bytes_transferred: Optional[int] = None
+    error: Optional[str] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        row = asdict(self)
+        if row["transfer_mbps"] is not None:
+            row["transfer_mbps"] = round(float(row["transfer_mbps"]), 2)
+        return row
 
 
 @dataclass
@@ -96,6 +123,7 @@ class WorkerProfile:
 @dataclass
 class GlobalGatewayState:
     max_workers: int = 100
+    worker_history_max: int = 100
     scoring_weights: WorkerScoringWeights = field(default_factory=WorkerScoringWeights)
     worker_sessions: Dict[str, Any] = field(default_factory=dict)
     worker_profiles: Dict[str, WorkerProfile] = field(default_factory=dict)
@@ -103,6 +131,9 @@ class GlobalGatewayState:
     worker_cursor: int = 0
     offer_routes: Dict[str, str] = field(default_factory=dict)
     task_routes: Dict[str, str] = field(default_factory=dict)
+    active_task_records: Dict[str, WorkerTaskRecord] = field(default_factory=dict)
+    worker_histories: Dict[str, Deque[WorkerTaskRecord]] = field(default_factory=dict)
+    finalized_offer_ids: set[str] = field(default_factory=set)
 
     def worker_count(self) -> int:
         return len(self.worker_sessions)
@@ -287,25 +318,185 @@ class GlobalGatewayState:
     ) -> None:
         self.get_profile(worker_id).observe_transfer(transfer_mbps, success)
 
+    def is_duplicate_task_result(self, offer_id: str) -> bool:
+        key = str(offer_id)
+        return key in self.finalized_offer_ids
+
+    def note_task_result_finalized(self, offer_id: str) -> None:
+        key = str(offer_id)
+        self.finalized_offer_ids.add(key)
+        if len(self.finalized_offer_ids) > 10000:
+            # Drop arbitrary half when oversized; retries are recent.
+            drop = len(self.finalized_offer_ids) // 2
+            for old in list(self.finalized_offer_ids)[:drop]:
+                self.finalized_offer_ids.discard(old)
+
+    def _history_deque(self, worker_id: str) -> Deque[WorkerTaskRecord]:
+        dq = self.worker_histories.get(worker_id)
+        if dq is None:
+            dq = deque(maxlen=max(1, self.worker_history_max))
+            self.worker_histories[worker_id] = dq
+        return dq
+
+    def record_task_assigned(
+        self,
+        worker_id: str,
+        *,
+        task_id: str,
+        offer_id: str,
+        orchestrator_hotkey: str = "",
+    ) -> None:
+        self.get_profile(worker_id)
+        offer_key = str(offer_id)
+        record = WorkerTaskRecord(
+            task_id=str(task_id),
+            offer_id=offer_key,
+            worker_id=worker_id,
+            orchestrator_hotkey=orchestrator_hotkey,
+            assigned_at=_utc_now_iso(),
+            status="assigned",
+        )
+        self.active_task_records[offer_key] = record
+
+    def record_task_accepted(self, worker_id: str, message: dict) -> None:
+        offer_id = str(message.get("offer_id") or message.get("task_id") or "")
+        if not offer_id:
+            return
+        record = self.active_task_records.get(offer_id)
+        if record is None or record.worker_id != worker_id:
+            return
+        record.status = "accepted"
+
+    def _finalize_task_record(
+        self,
+        worker_id: str,
+        message: dict,
+        *,
+        status: str,
+        success: Optional[bool] = None,
+    ) -> None:
+        offer_id = str(message.get("offer_id") or message.get("task_id") or "")
+        if not offer_id:
+            return
+
+        record = self.active_task_records.pop(offer_id, None)
+        if record is None:
+            record = WorkerTaskRecord(
+                task_id=str(message.get("task_id") or offer_id),
+                offer_id=offer_id,
+                worker_id=worker_id,
+                assigned_at=_utc_now_iso(),
+            )
+        elif record.worker_id != worker_id:
+            return
+
+        record.status = status
+        record.completed_at = _utc_now_iso()
+        record.success = success
+        if message.get("transfer_mbps") is not None:
+            try:
+                record.transfer_mbps = float(message["transfer_mbps"])
+            except (TypeError, ValueError):
+                record.transfer_mbps = None
+        if message.get("bytes_transferred") is not None:
+            try:
+                record.bytes_transferred = int(message["bytes_transferred"])
+            except (TypeError, ValueError):
+                record.bytes_transferred = None
+        if message.get("error"):
+            record.error = str(message["error"])
+
+        orch = self.resolve_orchestrator_hotkey(message)
+        if orch and not record.orchestrator_hotkey:
+            record.orchestrator_hotkey = orch
+
+        self._history_deque(worker_id).appendleft(record)
+        if status in ("completed", "rejected"):
+            self.note_task_result_finalized(offer_id)
+
+    def record_task_result(self, worker_id: str, message: dict) -> None:
+        self._finalize_task_record(
+            worker_id,
+            message,
+            status="completed",
+            success=bool(message.get("success", False)),
+        )
+
+    def record_task_rejected(self, worker_id: str, message: dict) -> None:
+        self._finalize_task_record(
+            worker_id,
+            message,
+            status="rejected",
+            success=False,
+        )
+
+    def active_tasks_for_worker(self, worker_id: str) -> List[dict]:
+        rows: List[dict] = []
+        for record in self.active_task_records.values():
+            if record.worker_id == worker_id:
+                rows.append(record.to_dict())
+        rows.sort(key=lambda row: row.get("assigned_at") or "", reverse=True)
+        return rows
+
+    def worker_history(
+        self,
+        worker_id: Optional[str] = None,
+        *,
+        limit: int = 50,
+    ) -> List[dict]:
+        limit = max(1, min(limit, 500))
+        if worker_id:
+            records = list(self._history_deque(worker_id))
+        else:
+            records = []
+            for dq in self.worker_histories.values():
+                records.extend(dq)
+            records.sort(
+                key=lambda rec: rec.completed_at or rec.assigned_at,
+                reverse=True,
+            )
+        return [rec.to_dict() for rec in records[:limit]]
+
+    def all_worker_ids(self) -> list[str]:
+        ids = (
+            set(self.worker_sessions.keys())
+            | set(self.worker_profiles.keys())
+            | set(self.worker_histories.keys())
+        )
+        return sorted(ids)
+
+    def worker_detail_payload(self, worker_id: str) -> Optional[dict]:
+        profile = self.worker_profiles.get(worker_id)
+        if profile is None and worker_id not in self.worker_sessions:
+            return None
+        if profile is None:
+            profile = self.get_profile(worker_id)
+        connected = worker_id in self.worker_sessions
+        return {
+            "worker_id": worker_id,
+            "connected": connected,
+            "ip": profile.ip,
+            "average_mbps": round(profile.average_mbps, 1),
+            "transfer_count": profile.transfer_count,
+            "claimed_bandwidth_mbps": round(profile.claimed_bandwidth_mbps, 1),
+            "trust_score": round(profile.trust_score, 4),
+            "success_rate": round(profile.success_rate, 4),
+            "total_tasks": profile.total_tasks,
+            "successful_tasks": profile.successful_tasks,
+            "score": round(profile.score(self.scoring_weights), 4),
+            "active": profile.active,
+            "active_tasks": profile.active_count,
+            "max_concurrent_tasks": profile.max_concurrent_tasks,
+            "active_offer_ids": sorted(profile.active_offer_ids),
+            "active_task_records": self.active_tasks_for_worker(worker_id),
+        }
+
     def worker_status_payload(self) -> list[dict]:
         rows: list[dict] = []
-        for worker_id in self.list_worker_ids():
-            profile = self.get_profile(worker_id)
-            rows.append(
-                {
-                    "worker_id": worker_id,
-                    "ip": profile.ip,
-                    "average_mbps": round(profile.average_mbps, 1),
-                    "transfer_count": profile.transfer_count,
-                    "claimed_bandwidth_mbps": round(profile.claimed_bandwidth_mbps, 1),
-                    "trust_score": round(profile.trust_score, 4),
-                    "success_rate": round(profile.success_rate, 4),
-                    "score": round(profile.score(self.scoring_weights), 4),
-                    "active": profile.active,
-                    "active_tasks": profile.active_count,
-                    "max_concurrent_tasks": profile.max_concurrent_tasks,
-                }
-            )
+        for worker_id in self.all_worker_ids():
+            detail = self.worker_detail_payload(worker_id)
+            if detail:
+                rows.append(detail)
         return rows
 
     def register_route(
@@ -350,13 +541,13 @@ class GlobalGatewayState:
             "worker_count": self.worker_count(),
             "workers": self.worker_status_payload(),
         }
-        for hotkey, ws in list(self.orchestrator_sessions.items()):
-            if not await self.send_json(ws, payload):
+        for hotkey, channel in list(self.orchestrator_sessions.items()):
+            if not await channel.send(payload):
                 self.orchestrator_sessions.pop(hotkey, None)
 
     async def forward_to_orchestrator(self, orchestrator_hotkey: str, message: dict) -> bool:
-        ws = self.orchestrator_sessions.get(orchestrator_hotkey)
-        if ws is None:
+        channel = self.orchestrator_sessions.get(orchestrator_hotkey)
+        if channel is None:
             logger.warning("no orchestrator session for hotkey %s", orchestrator_hotkey)
             return False
         payload = {
@@ -364,7 +555,7 @@ class GlobalGatewayState:
             "worker_id": message.get("worker_id"),
             "message": message,
         }
-        return await self.send_json(ws, payload)
+        return await channel.send(payload)
 
     async def send_to_worker(self, worker_id: str, payload: dict) -> bool:
         ws = self.worker_sessions.get(worker_id)

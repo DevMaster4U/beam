@@ -228,10 +228,14 @@ if _cors_origins:
 app.include_router(health.router)
 app.include_router(orchestrators.router)
 _settings = get_settings()
-if (_settings.worker_gateway_mode or "in_process").strip().lower() != "global":
+_gateway_mode = (_settings.worker_gateway_mode or "in_process").strip().lower()
+if _gateway_mode not in ("global", "coordinator"):
     app.include_router(workers.router)
 else:
-    logger.info("WORKER_GATEWAY_MODE=global — worker WS served by global gateway, not this process")
+    logger.info(
+        "WORKER_GATEWAY_MODE=%s — worker WS served by pool coordinator, not this process",
+        _gateway_mode,
+    )
 
 
 # =============================================================================
