@@ -139,6 +139,14 @@ async def handle_orchestrator_message(
         worker_id = str(message.get("worker_id") or "")
         payload = message.get("payload")
         if worker_id and isinstance(payload, dict):
+            worker_msg_type = payload.get("type")
+            if worker_msg_type == "task_accept_ack":
+                ack_task_id = payload.get("task_id")
+                ack_offer_id = payload.get("offer_id") or ack_task_id
+                server_accepted = payload.get("accepted", True)
+                if not server_accepted:
+                    gateway_state.mark_worker_idle(worker_id, payload.get("offer_id"))
+            
             await gateway_state.send_to_worker(worker_id, payload)
         return
 

@@ -1708,6 +1708,43 @@ async def _finalize_ws_task(
         f"{result.bytes_transferred} bytes"
     )
     return result.success
+    
+    # finalize_task = asyncio.create_task(
+    #     finalize_ws_task_result(
+    #         websocket,
+    #         state,
+    #         task_id,
+    #         result.success,
+    #         result.bytes_transferred,
+    #         chunk_hash=result.chunk_hash,
+    #         etag=result.etag,
+    #         error=result.error_msg,
+    #         offer_id=offer_id,
+    #         transfer_mbps=transfer_mbps(result.bytes_transferred, result.duration_ms),
+    #     )
+    # )
+
+    # done, _pending = await asyncio.wait({finalize_task}, timeout=0.5)
+
+    # payment_task = asyncio.create_task(
+    #     submit_worker_payment_evidence(
+    #         state,
+    #         task_id,
+    #         offer_id,
+    #         chunk_hash=result.chunk_hash,
+    #     )
+    # )
+
+    # # Make sure both have actually finished before moving on, regardless of
+    # # which fired first.
+    # summary_ack, _ = await asyncio.gather(finalize_task, payment_task)
+
+    # status = "OK" if result.success else f"FAIL: {result.error_msg}"
+    # print(
+    #     f"[Worker] [WS] Task {task_label(task_id)} offer={task_label(offer_id)}: {status} | "
+    #     f"{result.bytes_transferred} bytes"
+    # )
+    # return result.success
 
 
 async def _handle_ws_task_sequential_accept(
