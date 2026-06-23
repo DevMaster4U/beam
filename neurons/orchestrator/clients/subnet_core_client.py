@@ -458,7 +458,7 @@ class SubnetCoreClient:
             )
             self._api_key = None
             self._api_key_expires = None
-	    self._clear_cached_key()
+            self._clear_cached_key()
             self._skip_env_key = True
             return
 

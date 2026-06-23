@@ -275,7 +275,7 @@ class GlobalGatewayState:
         profile = self.get_profile(best_id)
         logger.debug(
             "selected worker %s score=%.4f avg_mbps=%.1f ip=%s active=%d/%d "
-            "candidates=%d prefer_other_ip=%s (%s)",
+            "candidates=%d prefer_other_ip=%s",
             best_id,
             best_score,
             profile.average_mbps,
@@ -283,8 +283,7 @@ class GlobalGatewayState:
             profile.active_count,
             profile.max_concurrent_tasks,
             len(pool),
-            prefer_other_ip_used,
-            self.worker_pool_summary(),
+            prefer_other_ip_used
         )
         return best_id
 

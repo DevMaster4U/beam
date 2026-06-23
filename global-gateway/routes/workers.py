@@ -155,15 +155,14 @@ async def _handle_worker_message(worker_id: str, message: dict) -> None:
             profile = gateway_state.get_profile(worker_id)
             logger.info(
                 "worker %s task_result offer=%s active_tasks=%d avg_mbps=%.1f (n=%d) "
-                "success_rate=%.3f transfer_mbps=%s (%s)",
+                "success_rate=%.3f transfer_mbps=%s",
                 worker_id,
                 offer_id or "?",
                 profile.active_count,
                 profile.average_mbps,
                 profile.transfer_count,
                 profile.success_rate,
-                message.get("transfer_mbps"),
-                gateway_state.worker_pool_summary(),
+                message.get("transfer_mbps")
             )
         else:
             logger.info(
