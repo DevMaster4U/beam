@@ -14,6 +14,7 @@ from transports import OrchestratorChannel
 logger = logging.getLogger(__name__)
 
 
+
 async def handle_task_offer_batch(orchestrator_hotkey: str, message: dict) -> dict:
     offers = message.get("offers") or []
     batch_id = message.get("batch_id") or uuid.uuid4().hex
