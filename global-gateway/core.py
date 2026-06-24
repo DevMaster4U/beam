@@ -134,6 +134,7 @@ class GlobalGatewayState:
     active_task_records: Dict[str, WorkerTaskRecord] = field(default_factory=dict)
     worker_histories: Dict[str, Deque[WorkerTaskRecord]] = field(default_factory=dict)
     finalized_offer_ids: set[str] = field(default_factory=set)
+    task_result_acks: Dict[str, dict] = field(default_factory=dict)
 
     def worker_count(self) -> int:
         return len(self.worker_sessions)
@@ -329,6 +330,15 @@ class GlobalGatewayState:
             drop = len(self.finalized_offer_ids) // 2
             for old in list(self.finalized_offer_ids)[:drop]:
                 self.finalized_offer_ids.discard(old)
+                self.task_result_acks.pop(old, None)
+
+    def cache_task_result_ack(self, offer_id: str, payload: dict) -> None:
+        key = str(offer_id)
+        if key:
+            self.task_result_acks[key] = dict(payload)
+
+    def get_task_result_ack(self, offer_id: str) -> Optional[dict]:
+        return self.task_result_acks.get(str(offer_id))
 
     def _history_deque(self, worker_id: str) -> Deque[WorkerTaskRecord]:
         dq = self.worker_histories.get(worker_id)
@@ -557,6 +567,10 @@ class GlobalGatewayState:
         return await channel.send(payload)
 
     async def send_to_worker(self, worker_id: str, payload: dict) -> bool:
+        if payload.get("type") == "task_result_ack":
+            offer_id = payload.get("offer_id") or payload.get("task_id")
+            if offer_id:
+                self.cache_task_result_ack(str(offer_id), payload)
         ws = self.worker_sessions.get(worker_id)
         if ws is None:
             logger.warning("worker %s not connected", worker_id)

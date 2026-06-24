@@ -23,11 +23,10 @@ async def handle_task_offer_batch(orchestrator_hotkey: str, message: dict) -> di
 
     total_offers = len(offers)
     logger.info(
-        "task_offer_batch %s: %d offer(s) from orch=%s (%s)",
+        "task_offer_batch %s: %d offer(s) from orch=%s",
         batch_id,
         total_offers,
-        orchestrator_hotkey[:16],
-        gateway_state.worker_pool_summary(),
+        orchestrator_hotkey[:16]
     )
 
     delivered = 0
@@ -79,7 +78,7 @@ async def handle_task_offer_batch(orchestrator_hotkey: str, message: dict) -> di
             profile = gateway_state.get_profile(worker_id)
             logger.info(
                 "task_offer_batch %s offer %d/%d: orch=%s -> worker=%s score=%.4f "
-                "avg_mbps=%.1f ip=%s active=%d/%d task=%s offer=%s (%s)",
+                "avg_mbps=%.1f ip=%s active=%d/%d task=%s offer=%s",
                 batch_id,
                 offer_index,
                 total_offers,
@@ -91,8 +90,7 @@ async def handle_task_offer_batch(orchestrator_hotkey: str, message: dict) -> di
                 profile.active_count,
                 profile.max_concurrent_tasks,
                 task_id,
-                offer_id,
-                gateway_state.worker_pool_summary(),
+                offer_id
             )
         else:
             failed += 1
@@ -108,12 +106,11 @@ async def handle_task_offer_batch(orchestrator_hotkey: str, message: dict) -> di
             )
 
     logger.info(
-        "task_offer_batch %s done: delivered=%d failed=%d offers=%d (%s)",
+        "task_offer_batch %s done: delivered=%d failed=%d offers=%d",
         batch_id,
         delivered,
         failed,
-        total_offers,
-        gateway_state.worker_pool_summary(),
+        total_offers
     )
 
     return {

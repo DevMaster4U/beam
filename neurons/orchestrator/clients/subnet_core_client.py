@@ -277,6 +277,15 @@ class SubnetCoreClient:
                 },
             )
 
+            if challenge_resp.status_code == 429:
+                retry_after = challenge_resp.headers.get("Retry-After", "300")
+                logger.error(
+                    "Too many auth challenge requests for this hotkey. "
+                    "Update your code and try again after %s second cooldown period.",
+                    retry_after,
+                )
+                return None
+
             if challenge_resp.status_code != 200:
                 logger.error(f"Failed to get auth challenge: {challenge_resp.status_code}")
                 return None
@@ -646,11 +655,6 @@ class SubnetCoreClient:
             logger.error(f"Registration failed: {data.get('error') or data.get('message')}")
             self._registered = False
             self._schedule_registration_retry_if_needed()
-
-        elif msg_type == "ping":
-            # Respond to server ping
-            if self._ws:
-                await self._ws.send(json.dumps({"type": "pong"}))
 
         elif msg_type == "error":
             if data.get("code") == "unauthorized":

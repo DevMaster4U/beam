@@ -165,11 +165,21 @@ async def _handle_worker_message(worker_id: str, message: dict) -> None:
                 message.get("transfer_mbps")
             )
         else:
-            logger.info(
-                "worker %s duplicate task_result offer=%s (relay only, stats skipped)",
-                worker_id,
-                offer_id or "?",
-            )
+            cached_ack = gateway_state.get_task_result_ack(offer_id)
+            if cached_ack:
+                await gateway_state.send_to_worker(worker_id, cached_ack)
+                logger.info(
+                    "worker %s duplicate task_result offer=%s — replayed cached ack",
+                    worker_id,
+                    offer_id or "?",
+                )
+            else:
+                logger.info(
+                    "worker %s duplicate task_result offer=%s (ack pending, not re-relayed)",
+                    worker_id,
+                    offer_id or "?",
+                )
+            return
 
     if msg_type not in ("task_accept", "task_reject", "task_result"):
         return
