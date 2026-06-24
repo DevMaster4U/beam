@@ -1495,6 +1495,7 @@ def get_ws_url(
         params["api_key"] = api_key
     if worker_secret:
         params["worker_secret"] = worker_secret
+    params["worker_version"] = WORKER_VERSION
     if params:
         url = f"{url}?{urlencode(params)}"
     return url
@@ -1548,6 +1549,7 @@ async def ws_send_worker_hello(websocket, state: WorkerState) -> bool:
         msg = {
             "type": "worker_hello",
             "worker_id": state.worker_id,
+            "worker_version": WORKER_VERSION,
             "ip": ip,
             "claimed_bandwidth_mbps": 100,
             "max_concurrent_tasks": MAX_CONCURRENT_TASKS,

@@ -98,6 +98,7 @@ async def _handle_worker_message(worker_id: str, message: dict) -> None:
         ip = str(message.get("ip") or "").strip()
         claimed_raw = message.get("claimed_bandwidth_mbps")
         max_tasks_raw = message.get("max_concurrent_tasks")
+        worker_version = str(message.get("worker_version") or "").strip()
         try:
             claimed = float(claimed_raw) if claimed_raw is not None else None
         except (TypeError, ValueError):
@@ -111,12 +112,14 @@ async def _handle_worker_message(worker_id: str, message: dict) -> None:
             ip=ip or None,
             claimed_bandwidth_mbps=claimed,
             max_concurrent_tasks=max_concurrent,
+            worker_version=worker_version or None,
         )
         profile = gateway_state.get_profile(worker_id)
         logger.info(
-            "Worker connected: %s ip=%s max_tasks=%d active=%d avg_mbps=%.1f score=%.4f (%d/%d)",
+            "Worker connected: %s ip=%s version=%s max_tasks=%d active=%d avg_mbps=%.1f score=%.4f (%d/%d)",
             worker_id,
             profile.ip or "?",
+            profile.worker_version or "?",
             profile.max_concurrent_tasks,
             profile.active_count,
             profile.average_mbps,
@@ -231,6 +234,7 @@ async def worker_ws(websocket: WebSocket, worker_id: str) -> None:
     if websocket.client and websocket.client.host:
         peer_ip = str(websocket.client.host).strip()
     fields = _profile_fields(profile_data, peer_ip=peer_ip)
+    worker_version = str(websocket.query_params.get("worker_version") or "").strip()
     gateway_state.register_worker_session(
         worker_id,
         websocket,
@@ -239,11 +243,13 @@ async def worker_ws(websocket: WebSocket, worker_id: str) -> None:
         trust_score=fields["trust_score"],
         success_rate=fields["success_rate"],
         max_concurrent_tasks=fields["max_concurrent_tasks"],
+        worker_version=worker_version,
     )
     logger.debug(
-        "Worker WS accepted: %s peer=%s (%d/%d)",
+        "Worker WS accepted: %s peer=%s version=%s (%d/%d)",
         worker_id,
         fields["ip"] or peer_ip or "?",
+        worker_version or "?",
         gateway_state.worker_count(),
         settings.max_workers,
     )

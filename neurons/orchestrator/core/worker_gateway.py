@@ -24,6 +24,7 @@ class WorkerGateway:
         on_ready_change: Optional[Callable[[bool], None]] = None,
     ) -> None:
         self._sessions: Dict[str, object] = {}  # worker_id → WebSocket
+        self._worker_versions: Dict[str, str] = {}
         self._cursor = 0
         self._on_ready_change = on_ready_change
         self._upstream: Optional[object] = None  # SubnetCoreClient ref
@@ -53,13 +54,25 @@ class WorkerGateway:
             return False
         was_empty = len(self._sessions) == 0
         self._sessions[worker_id] = ws
-        logger.info("Worker connected: %s (%d/%d)", worker_id, len(self._sessions), MAX_WORKERS)
+        version = self._worker_versions.get(worker_id, "?")
+        logger.info(
+            "Worker connected: %s version=%s (%d/%d)",
+            worker_id,
+            version,
+            len(self._sessions),
+            MAX_WORKERS,
+        )
         if was_empty and self._on_ready_change:
             self._on_ready_change(True)
         return True
 
+    def note_worker_version(self, worker_id: str, worker_version: str) -> None:
+        if worker_version.strip():
+            self._worker_versions[worker_id] = worker_version.strip()
+
     def disconnect(self, worker_id: str) -> None:
         self._sessions.pop(worker_id, None)
+        self._worker_versions.pop(worker_id, None)
         logger.info("Worker disconnected: %s (%d/%d)", worker_id, len(self._sessions), MAX_WORKERS)
         if len(self._sessions) == 0 and self._on_ready_change:
             self._on_ready_change(False)
@@ -97,7 +110,17 @@ class WorkerGateway:
             return
 
         msg_type = msg.get("type")
-        if msg_type in ("task_accept", "task_reject"):
+        if msg_type == "worker_hello":
+            worker_version = str(msg.get("worker_version") or "").strip()
+            if worker_version:
+                self._worker_versions[worker_id] = worker_version
+            logger.info(
+                "Worker hello: %s version=%s max_tasks=%s",
+                worker_id,
+                worker_version or self._worker_versions.get(worker_id) or "?",
+                msg.get("max_concurrent_tasks"),
+            )
+        elif msg_type in ("task_accept", "task_reject"):
             await self._relay_task_decision(worker_id, msg)
         elif msg_type == "task_result":
             await self._relay_task_result(worker_id, msg)

@@ -60,6 +60,7 @@ class WorkerProfile:
     total_tasks: int = 0
     successful_tasks: int = 0
     max_concurrent_tasks: int = 5
+    worker_version: str = ""
     active_offer_ids: set[str] = field(default_factory=set)
 
     @property
@@ -162,6 +163,7 @@ class GlobalGatewayState:
         trust_score: float = 0.5,
         success_rate: float = 1.0,
         max_concurrent_tasks: int = 5,
+        worker_version: str = "",
     ) -> None:
         self.worker_sessions[worker_id] = websocket
         profile = self.get_profile(worker_id)
@@ -173,6 +175,8 @@ class GlobalGatewayState:
         profile.success_rate = float(success_rate)
         if max_concurrent_tasks > 0:
             profile.max_concurrent_tasks = int(max_concurrent_tasks)
+        if worker_version:
+            profile.worker_version = worker_version.strip()
 
     def unregister_worker_session(self, worker_id: str) -> None:
         self.worker_sessions.pop(worker_id, None)
@@ -186,6 +190,7 @@ class GlobalGatewayState:
         ip: Optional[str] = None,
         claimed_bandwidth_mbps: Optional[float] = None,
         max_concurrent_tasks: Optional[int] = None,
+        worker_version: Optional[str] = None,
     ) -> None:
         profile = self.get_profile(worker_id)
         if ip and ip.strip():
@@ -195,6 +200,8 @@ class GlobalGatewayState:
                 profile.claimed_bandwidth_mbps = float(claimed_bandwidth_mbps)
         if max_concurrent_tasks is not None and max_concurrent_tasks > 0:
             profile.max_concurrent_tasks = int(max_concurrent_tasks)
+        if worker_version and worker_version.strip():
+            profile.worker_version = worker_version.strip()
 
     def busy_ips(self) -> set[str]:
         ips: set[str] = set()
@@ -484,6 +491,7 @@ class GlobalGatewayState:
         return {
             "worker_id": worker_id,
             "connected": connected,
+            "worker_version": profile.worker_version,
             "ip": profile.ip,
             "average_mbps": round(profile.average_mbps, 1),
             "transfer_count": profile.transfer_count,
