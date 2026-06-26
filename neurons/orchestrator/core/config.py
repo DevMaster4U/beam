@@ -246,6 +246,11 @@ class OrchestratorSettings(BaseSettings):
     orch_ws_close_timeout: float = Field(default=20.0, env="ORCH_WS_CLOSE_TIMEOUT")
     orch_ws_ping_interval: float = Field(default=30.0, env="ORCH_WS_PING_INTERVAL")
     orch_ws_ping_timeout: float = Field(default=45.0, env="ORCH_WS_PING_TIMEOUT")
+    # BeamCore control-plane round-trips over the orch-gateway WebSocket.
+    # Keep ORCH_TASK_RESULT_TIMEOUT below WORKER_TASK_RESULT_ACK_TIMEOUT on workers.
+    orch_ws_request_timeout: float = Field(default=15.0, env="ORCH_WS_REQUEST_TIMEOUT")
+    orch_task_accept_timeout: float = Field(default=8.0, env="ORCH_TASK_ACCEPT_TIMEOUT")
+    orch_task_result_timeout: float = Field(default=30.0, env="ORCH_TASK_RESULT_TIMEOUT")
 
     worker_gateway_url: Optional[str] = Field(
         default=None,

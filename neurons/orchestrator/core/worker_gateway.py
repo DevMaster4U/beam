@@ -9,7 +9,10 @@ and relays task_accept / task_reject / task_result upstream.
 import asyncio
 import json
 import logging
+import time
 from typing import Callable, Dict, Optional
+
+from core.relay_log import defer_relay_log, is_failure_summary, log_relay, relay_summary, short_id
 
 logger = logging.getLogger(__name__)
 
@@ -121,8 +124,18 @@ class WorkerGateway:
                 msg.get("max_concurrent_tasks"),
             )
         elif msg_type in ("task_accept", "task_reject"):
+            task_id = msg.get("task_id") or msg.get("offer_id")
+            log_relay(
+                f"worker ws <- recv type={msg_type} worker={short_id(worker_id)} "
+                f"task={short_id(task_id)} offer={short_id(msg.get('offer_id') or task_id)}"
+            )
             await self._relay_task_decision(worker_id, msg)
         elif msg_type == "task_result":
+            log_relay(
+                f"worker ws <- recv type=task_result worker={short_id(worker_id)} "
+                f"task={short_id(msg.get('task_id'))} offer={short_id(msg.get('offer_id') or msg.get('task_id'))} "
+                f"success={msg.get('success')} bytes={msg.get('bytes_transferred')}"
+            )
             await self._relay_task_result(worker_id, msg)
         else:
             logger.debug("Unhandled worker message type %s from %s", msg_type, worker_id)
@@ -148,15 +161,24 @@ class WorkerGateway:
 
     async def _relay_task_decision(self, worker_id: str, msg: dict) -> None:
         ack_type = "task_accept_ack" if msg.get("type") == "task_accept" else "task_reject_ack"
-        if self._upstream is None:
-            await self._send_to_worker(
-                worker_id,
-                {"type": ack_type, "task_id": msg.get("task_id"), "offer_id": msg.get("offer_id"), "accepted": False, "reason": "beamcore_unavailable"},
-            )
-            return
         task_id = msg.get("task_id") or msg.get("offer_id")
         offer_id = msg.get("offer_id") or task_id
         reason = msg.get("reason")
+        started = time.monotonic()
+        failed = False
+        if self._upstream is None:
+            logger.warning(
+                "worker relay blocked: no beamcore upstream worker=%s type=%s task=%s offer=%s",
+                short_id(worker_id),
+                msg.get("type"),
+                short_id(task_id),
+                short_id(offer_id),
+            )
+            await self._send_to_worker(
+                worker_id,
+                {"type": ack_type, "task_id": task_id, "offer_id": offer_id, "accepted": False, "reason": "beamcore_unavailable"},
+            )
+            return
         try:
             if msg.get("type") == "task_accept":
                 ack = await self._upstream.send_task_accept(
@@ -173,7 +195,18 @@ class WorkerGateway:
                     reason=reason,
                 )
         except Exception as exc:
-            logger.warning("relay task decision failed: %s", exc)
+            failed = True
+            elapsed_ms = (time.monotonic() - started) * 1000
+            logger.warning(
+                "worker relay -> beamcore failed type=%s worker=%s task=%s offer=%s "
+                "latency_ms=%.1f err=%s",
+                msg.get("type"),
+                short_id(worker_id),
+                short_id(task_id),
+                short_id(offer_id),
+                elapsed_ms,
+                exc,
+            )
             ack = {
                 "type": ack_type,
                 "task_id": task_id,
@@ -187,10 +220,27 @@ class WorkerGateway:
             "task_id": task_id,
             "offer_id": offer_id,
         }
+        summary = relay_summary(ack_payload)
+        failed = failed or is_failure_summary(summary)
         await self._send_to_worker(worker_id, ack_payload)
+        elapsed_ms = (time.monotonic() - started) * 1000
+        defer_relay_log(
+            f"worker ws -> send type={ack_type} worker={short_id(worker_id)} "
+            f"task={short_id(task_id)} offer={short_id(offer_id)} {summary}",
+            latency_ms=elapsed_ms,
+            force_info=failed,
+        )
 
     async def _relay_task_result(self, worker_id: str, msg: dict) -> None:
+        started = time.monotonic()
+        failed = False
         if self._upstream is None:
+            logger.warning(
+                "worker relay blocked: no beamcore upstream worker=%s type=task_result task=%s offer=%s",
+                short_id(worker_id),
+                short_id(msg.get("task_id")),
+                short_id(msg.get("offer_id") or msg.get("task_id")),
+            )
             await self._send_to_worker(
                 worker_id,
                 {
@@ -232,7 +282,17 @@ class WorkerGateway:
                     payload[key] = msg[key]
             ack = await self._upstream.send_task_result(payload)
         except Exception as exc:
-            logger.warning("relay task_result failed: %s", exc)
+            failed = True
+            elapsed_ms = (time.monotonic() - started) * 1000
+            logger.warning(
+                "worker relay -> beamcore failed type=task_result worker=%s task=%s offer=%s "
+                "latency_ms=%.1f err=%s",
+                short_id(worker_id),
+                short_id(msg.get("task_id")),
+                short_id(msg.get("offer_id") or msg.get("task_id")),
+                elapsed_ms,
+                exc,
+            )
             ack = {
                 "type": "task_result_ack",
                 "task_id": msg.get("task_id"),
@@ -247,4 +307,14 @@ class WorkerGateway:
             "task_id": msg.get("task_id"),
             "offer_id": msg.get("offer_id") or msg.get("task_id"),
         }
+        summary = relay_summary(ack_payload)
+        failed = failed or is_failure_summary(summary)
         await self._send_to_worker(worker_id, ack_payload)
+        elapsed_ms = (time.monotonic() - started) * 1000
+        defer_relay_log(
+            f"worker ws -> send type=task_result_ack worker={short_id(worker_id)} "
+            f"task={short_id(ack_payload.get('task_id'))} offer={short_id(ack_payload.get('offer_id'))} "
+            f"{summary}",
+            latency_ms=elapsed_ms,
+            force_info=failed,
+        )

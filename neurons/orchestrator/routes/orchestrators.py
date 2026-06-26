@@ -14,7 +14,7 @@ from datetime import datetime
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from core.orchestrator import Orchestrator, get_orchestrator
 
@@ -120,6 +120,42 @@ class WorkerAffiliationResponse(BaseModel):
     message: str
 
 
+class ClearHistoryRequest(BaseModel):
+    """Request to wipe orchestrator transfer history on BeamCore."""
+
+    confirm: bool = Field(
+        ...,
+        description="Must be true to prevent accidental deletion (BeamCore requirement)",
+    )
+
+
+class ClearHistoryResponse(BaseModel):
+    """Response from BeamCore history reset."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    success: bool
+    orchestrator_id: Optional[str] = None
+    previous_pool: Optional[str] = None
+    new_pool: Optional[str] = None
+    demoted: Optional[bool] = None
+    history_deleted_at: Optional[str] = None
+    deleted: Optional[dict] = None
+    message: Optional[str] = None
+
+
+class RoutingStateResponse(BaseModel):
+    """Orchestrator routing readiness (BeamCore ``set_ready``)."""
+
+    success: bool
+    active: bool
+    ready: Optional[bool] = None
+    desired_ready: Optional[bool] = None
+    applied: bool = False
+    queued: bool = False
+    message: str
+
+
 # =============================================================================
 # Dependency
 # =============================================================================
@@ -189,6 +225,81 @@ async def register_orchestrator(
     except Exception as e:
         logger.error(f"Orchestrator registration error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/history", response_model=ClearHistoryResponse)
+async def clear_history(
+    request: ClearHistoryRequest,
+    orchestrator: Orchestrator = Depends(get_orchestrator_instance),
+):
+    """
+    Wipe this orchestrator's transfer history on BeamCore.
+
+    Proxies to BeamCore ``DELETE /orchestrators/history`` using this instance's
+    orchestrator API key. Requires ``confirm: true``.
+
+    See: https://data.b1m.ai/guide/orchestrators#history-reset
+    """
+    if not request.confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="confirm must be true — this operation is irreversible",
+        )
+
+    client = orchestrator.subnet_core_client
+    if client is None:
+        raise HTTPException(status_code=503, detail="BeamCore client not initialized")
+
+    try:
+        result = await client.clear_history()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    status_code = result.pop("_http_status", 200)
+    if status_code == 409:
+        raise HTTPException(
+            status_code=409,
+            detail=result.get("detail") or result.get("message") or "active transfers in progress",
+        )
+    if status_code >= 400:
+        raise HTTPException(
+            status_code=status_code,
+            detail=result.get("detail") or result.get("message") or "history reset failed",
+        )
+
+    return ClearHistoryResponse(**result)
+
+
+@router.post("/inactive", response_model=RoutingStateResponse)
+async def set_inactive(
+    orchestrator: Orchestrator = Depends(get_orchestrator_instance),
+):
+    """
+    Stop BeamCore from routing transfers to this orchestrator.
+
+    Sets ``ready=false`` on BeamCore and pauses automatic re-ready from worker
+    pool events until ``POST /orchestrators/active`` is called.
+    """
+    try:
+        return await orchestrator.set_routing_active(False)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@router.post("/active", response_model=RoutingStateResponse)
+async def set_active(
+    orchestrator: Orchestrator = Depends(get_orchestrator_instance),
+):
+    """
+    Resume BeamCore transfer routing for this orchestrator.
+
+    Clears the routing pause and sets ``ready`` based on ``READY`` env and
+    connected workers.
+    """
+    try:
+        return await orchestrator.set_routing_active(True)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @router.delete("/{uid}")

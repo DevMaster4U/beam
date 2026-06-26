@@ -373,6 +373,7 @@ class Orchestrator:
         # Async control
         self._running: bool = False
         self._background_tasks: List[asyncio.Task] = []
+        self._routing_paused: bool = False
 
         # Orchestrator manager for incentive mechanism
         self.orch_manager: Optional[Any] = None
@@ -406,6 +407,8 @@ class Orchestrator:
         """Toggle orchestrator readiness when the first/last local worker connects."""
         if self.settings.worker_gateway_mode in ("global", "coordinator"):
             return
+        if self._routing_paused:
+            return
         if self.subnet_core_client is None:
             return
         import asyncio
@@ -418,6 +421,8 @@ class Orchestrator:
 
     async def _on_global_pool_ready(self, worker_count: int) -> None:
         """Toggle readiness based on shared global worker pool size."""
+        if self._routing_paused:
+            return
         if self.subnet_core_client is None:
             return
         try:
@@ -430,6 +435,51 @@ class Orchestrator:
         import json
 
         await self.worker_gateway.handle_worker_message(worker_id, json.dumps(message))
+
+    async def set_routing_active(self, active: bool) -> dict:
+        """
+        Pause or resume BeamCore transfer routing for this orchestrator.
+
+        Inactive sets ``ready=false`` on BeamCore and blocks automatic re-ready
+        from worker pool events until ``active`` is called again.
+        """
+        if self.subnet_core_client is None:
+            raise RuntimeError("BeamCore client not initialized")
+
+        self._routing_paused = not active
+        if not active:
+            applied = await self.subnet_core_client.set_ready(False)
+            message = (
+                "Orchestrator marked inactive — BeamCore will stop routing transfers"
+                if applied
+                else "Inactive queued — will apply when orch-gateway websocket connects"
+            )
+        else:
+            mode = self.settings.worker_gateway_mode
+            if mode == "in_process":
+                should_ready = (
+                    self.worker_gateway.connected_count > 0 or bool(self.settings.ready)
+                )
+            else:
+                # Shared pool modes: workers connect via global gateway, not local sessions.
+                should_ready = bool(self.settings.ready)
+            applied = await self.subnet_core_client.set_ready(should_ready)
+            message = (
+                f"Orchestrator marked active — ready={should_ready}"
+                if applied
+                else f"Active queued — target ready={should_ready} when websocket connects"
+            )
+
+        state = self.subnet_core_client.ready_state()
+        return {
+            "success": True,
+            "active": active,
+            "ready": state["confirmed_ready"],
+            "desired_ready": state["desired_ready"],
+            "applied": applied,
+            "queued": not applied,
+            "message": message,
+        }
 
     # =========================================================================
     # Lifecycle
@@ -1099,6 +1149,9 @@ class Orchestrator:
                 ws_close_timeout=self.settings.orch_ws_close_timeout,
                 ws_ping_interval=self.settings.orch_ws_ping_interval,
                 ws_ping_timeout=self.settings.orch_ws_ping_timeout,
+                ws_request_timeout=self.settings.orch_ws_request_timeout,
+                task_accept_timeout=self.settings.orch_task_accept_timeout,
+                task_result_timeout=self.settings.orch_task_result_timeout,
             )
             logger.info(
                 "SubnetCoreClient initialized: http=%s ws=%s",

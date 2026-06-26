@@ -84,8 +84,8 @@ export WORKER_GATEWAY_SECRET=your-long-random-worker-secret
 | `CORE_SERVER_URL`   | no       | BeamCore HTTP base. |
 | `WORKER_GATEWAY_URL`        | **yes**  | Worker-gateway base URL (`http(s)://host:port` — orchestrator or global gateway). |
 | `WORKER_GATEWAY_SECRET`     | **yes**  | Sent as `worker_secret` on the gateway WebSocket query string. |
-| `WORKER_TASK_ACCEPT_ACK_TIMEOUT` | no | Seconds to wait for `task_accept_ack` after `task_accept` is sent (default `5`). |
-| `WORKER_TASK_RESULT_ACK_TIMEOUT` | no | Seconds to wait for `task_result_ack` (default `3`). |
+| `WORKER_TASK_ACCEPT_ACK_TIMEOUT` | no | Seconds to wait for `task_accept_ack` after `task_accept` is sent (default `8`). |
+| `WORKER_TASK_RESULT_ACK_TIMEOUT` | no | Seconds to wait for `task_result_ack` (default `45`; must exceed orchestrator `ORCH_TASK_RESULT_TIMEOUT`). |
 | `WORKER_EARLY_TRANSFER` | no | Start transfer on `task_offer` before accept ack (default `true`). Set `false` for legacy sequential accept. |
 | `WORKER_PREWARM_ENABLED` | no | `HEAD` origins on startup and before each transfer to warm DNS/TLS (default `true`). |
 | `WORKER_PREWARM_TIMEOUT` | no | Seconds per origin prewarm request (default `5`). |

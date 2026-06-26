@@ -10,11 +10,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import uuid
 from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import urlencode
 
 import websockets
+
+from core.relay_log import defer_relay_log, is_failure_summary, log_relay, relay_summary, short_id, SLOW_RELAY_MS
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +100,11 @@ class GlobalGatewayClient:
                     }
                 )
             )
+            log_relay(
+                f"global gateway ws -> send task_offer_batch batch={short_id(batch_id, 12)} "
+                f"offers={len(offers)}",
+                force_info=True,
+            )
             return len(offers), 0
         except Exception as exc:
             logger.error("Failed to send task_offer_batch to global gateway: %s", exc)
@@ -105,6 +113,7 @@ class GlobalGatewayClient:
     async def send_to_worker(self, worker_id: str, payload: dict) -> bool:
         if not self._connected or not self._ws:
             return False
+        msg_type = str(payload.get("type") or "?")
         try:
             await self._ws.send(
                 json.dumps(
@@ -115,9 +124,16 @@ class GlobalGatewayClient:
                     }
                 )
             )
+            defer_relay_log(
+                f"global gateway ws -> send to_worker worker={short_id(worker_id)} "
+                f"payload_type={msg_type} task={short_id(payload.get('task_id'))} "
+                f"offer={short_id(payload.get('offer_id') or payload.get('task_id'))} "
+                f"{relay_summary(payload)}",
+                force_info=is_failure_summary(relay_summary(payload)),
+            )
             return True
         except Exception as exc:
-            logger.warning("send_to_worker failed for %s: %s", worker_id, exc)
+            logger.warning("send_to_worker failed for %s payload_type=%s: %s", worker_id, msg_type, exc)
             return False
 
     async def _build_connect_url(self) -> str:
@@ -197,6 +213,11 @@ class GlobalGatewayClient:
             worker_id = str(data.get("worker_id") or "")
             message = data.get("message")
             if worker_id and isinstance(message, dict) and self._worker_message_handler:
+                log_relay(
+                    f"global gateway ws <- recv from_worker worker={short_id(worker_id)} "
+                    f"type={message.get('type') or '?'} task={short_id(message.get('task_id'))} "
+                    f"offer={short_id(message.get('offer_id') or message.get('task_id'))}"
+                )
                 # Do not block the control recv loop on BeamCore round-trips; workers
                 # finish in parallel and each needs its own ack path.
                 asyncio.create_task(
@@ -222,16 +243,29 @@ class GlobalGatewayClient:
             return
         msg_type = message.get("type")
         offer_id = message.get("offer_id") or message.get("task_id")
+        started = time.monotonic()
+        failed = False
         try:
             await handler(worker_id, message)
         except Exception as exc:
+            failed = True
+            elapsed_ms = (time.monotonic() - started) * 1000
             logger.warning(
-                "global gateway worker relay failed: worker=%s type=%s offer=%s: %s",
-                worker_id,
+                "global gateway relay failed worker=%s type=%s offer=%s latency_ms=%.1f: %s",
+                short_id(worker_id),
                 msg_type,
-                offer_id,
+                short_id(offer_id),
+                elapsed_ms,
                 exc,
             )
+            return
+        elapsed_ms = (time.monotonic() - started) * 1000
+        defer_relay_log(
+            f"global gateway relay done worker={short_id(worker_id)} type={msg_type} "
+            f"offer={short_id(offer_id)}",
+            latency_ms=elapsed_ms,
+            force_info=failed or elapsed_ms >= SLOW_RELAY_MS,
+        )
 
 
 def build_global_gateway_control_url(host: str, port: int) -> str:

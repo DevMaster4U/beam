@@ -296,8 +296,8 @@ def _env_bool(name: str, default: bool) -> bool:
     return str(raw).strip().lower() in ("1", "true", "yes")
 
 
-WS_TASK_ACCEPT_ACK_TIMEOUT = float(os.environ.get("WORKER_TASK_ACCEPT_ACK_TIMEOUT", "5.0"))
-WS_TASK_RESULT_ACK_TIMEOUT = float(os.environ.get("WORKER_TASK_RESULT_ACK_TIMEOUT", "3.0"))
+WS_TASK_ACCEPT_ACK_TIMEOUT = float(os.environ.get("WORKER_TASK_ACCEPT_ACK_TIMEOUT", "8.0"))
+WS_TASK_RESULT_ACK_TIMEOUT = float(os.environ.get("WORKER_TASK_RESULT_ACK_TIMEOUT", "45.0"))
 WORKER_EARLY_TRANSFER = _env_bool("WORKER_EARLY_TRANSFER", True)
 PREWARM_ENABLED = _env_bool("WORKER_PREWARM_ENABLED", True)
 PREWARM_TIMEOUT = float(os.environ.get("WORKER_PREWARM_TIMEOUT", "5"))

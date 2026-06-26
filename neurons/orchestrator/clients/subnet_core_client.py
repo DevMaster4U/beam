@@ -22,8 +22,26 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from middleware.metrics import BEAMCORE_UPSTREAM_DEGRADED, BEAMCORE_UPSTREAM_DOWN_EVENTS
+from core.relay_log import (
+    defer_relay_log,
+    is_failure_summary,
+    log_relay,
+    relay_summary,
+    short_id as _short_id,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _beamcore_msg_context(message: dict) -> dict[str, str]:
+    """Extract common task/worker identifiers for structured WS logs."""
+    task_id = message.get("task_id") or message.get("offer_id")
+    offer_id = message.get("offer_id") or message.get("task_id")
+    return {
+        "task": _short_id(task_id),
+        "offer": _short_id(offer_id),
+        "worker": _short_id(message.get("worker_id")),
+    }
 
 
 class SubnetCoreClient:
@@ -50,6 +68,9 @@ class SubnetCoreClient:
         ws_close_timeout: float = 20.0,
         ws_ping_interval: float = 30.0,
         ws_ping_timeout: float = 45.0,
+        ws_request_timeout: float = 15.0,
+        task_accept_timeout: float = 8.0,
+        task_result_timeout: float = 30.0,
     ):
         """
         Initialize the client.
@@ -64,6 +85,8 @@ class SubnetCoreClient:
             ws_open_timeout: Seconds to wait for the WebSocket opening handshake (orch-gateway).
             ws_close_timeout: Seconds to wait when closing the WebSocket cleanly.
             ws_ping_interval / ws_ping_timeout: Transport keepalive; higher values help flaky paths.
+            ws_request_timeout: Default round-trip timeout for orch-gateway WS control requests.
+            task_accept_timeout / task_result_timeout: Timeouts for worker accept/result relay.
         """
         self.base_url = base_url.rstrip("/")
         self.ws_base_url = ws_base_url.rstrip("/")
@@ -75,6 +98,9 @@ class SubnetCoreClient:
         self._ws_close_timeout = ws_close_timeout
         self._ws_ping_interval = ws_ping_interval
         self._ws_ping_timeout = ws_ping_timeout
+        self._ws_request_timeout = ws_request_timeout
+        self._task_accept_timeout = task_accept_timeout
+        self._task_result_timeout = task_result_timeout
         self._client: Optional[httpx.AsyncClient] = None
 
         # WebSocket push handlers (task offer batches and worker updates via WS)
@@ -592,6 +618,17 @@ class SubnetCoreClient:
             if fut and not fut.done():
                 fut.set_result(data)
                 return
+            if fut is None:
+                ctx = _beamcore_msg_context(data)
+                logger.warning(
+                    "beamcore ws <- orphan-reply type=%s request_id=%s task=%s offer=%s %s",
+                    msg_type or "?",
+                    _short_id(request_id, 8),
+                    ctx["task"],
+                    ctx["offer"],
+                    relay_summary(data),
+                )
+                return
 
         if msg_type == "connected":
             logger.info(
@@ -608,6 +645,14 @@ class SubnetCoreClient:
             self._note_beamcore_upstream_recovered(detail)
 
         elif msg_type == "worker_task_offer_batch":
+            batch_id = data.get("batch_id")
+            offers = data.get("offers") or []
+            offer_count = len(offers) if isinstance(offers, list) else 0
+            log_relay(
+                f"beamcore ws <- push type=worker_task_offer_batch batch={_short_id(batch_id, 12)} "
+                f"offers={offer_count}",
+                force_info=True,
+            )
             self._note_beamcore_upstream_recovered("worker_task_offer_batch from BeamCore")
             asyncio.create_task(self._handle_task_offer_batch(data))
 
@@ -616,7 +661,11 @@ class SubnetCoreClient:
             # replies for list_workers / control-plane requests are dispatched here too.
             worker_id = data.get("worker_id")
             event = data.get("event")
-            logger.debug(f"Worker update: {worker_id} - {event}")
+            logger.debug(
+                "beamcore ws <- push type=worker_update worker=%s event=%s",
+                _short_id(worker_id),
+                event or "?",
+            )
             if self._worker_update_handler and worker_id and event:
 
                 async def _run_worker_update(wid: str, ev: str, handler: Any) -> None:
@@ -668,25 +717,80 @@ class SubnetCoreClient:
                 self._maybe_upstream_error_payload(data)
 
         else:
-            logger.debug(f"Unknown WebSocket message type: {msg_type}")
+            logger.debug(
+                "beamcore ws <- push type=%s keys=%s",
+                msg_type or "?",
+                sorted(k for k in data.keys() if k != "type")[:8],
+            )
 
     async def _send_ws_request(
-        self, message: dict[str, Any], timeout: float = 10.0
+        self,
+        message: dict[str, Any],
+        timeout: Optional[float] = None,
     ) -> dict[str, Any]:
         """Send a request over the orchestrator gateway WS and await the correlated reply."""
         if not self._ws or not self._ws_connected:
             raise RuntimeError("orchestrator websocket is not connected")
 
+        wait_timeout = (
+            self._ws_request_timeout if timeout is None else timeout
+        )
+        msg_type = str(message.get("type") or "?")
+        ctx = _beamcore_msg_context(message)
         request_id = message.get("request_id") or uuid.uuid4().hex
         future: asyncio.Future = asyncio.get_event_loop().create_future()
         self._pending_ws_requests[request_id] = future
+        started = time.monotonic()
+
+        log_relay(
+            f"beamcore ws -> send type={msg_type} request_id={_short_id(request_id, 8)} "
+            f"timeout={wait_timeout:.1f}s task={ctx['task']} offer={ctx['offer']} worker={ctx['worker']}"
+        )
 
         try:
             await self._ws.send(json.dumps({**message, "request_id": request_id}))
-            response = await asyncio.wait_for(future, timeout=timeout)
-        except Exception:
+            response = await asyncio.wait_for(future, timeout=wait_timeout)
+        except asyncio.TimeoutError:
+            elapsed_ms = (time.monotonic() - started) * 1000
             self._pending_ws_requests.pop(request_id, None)
+            logger.warning(
+                "beamcore ws <- timeout type=%s request_id=%s latency_ms=%.1f timeout=%.1fs "
+                "task=%s offer=%s worker=%s",
+                msg_type,
+                _short_id(request_id, 8),
+                elapsed_ms,
+                wait_timeout,
+                ctx["task"],
+                ctx["offer"],
+                ctx["worker"],
+            )
             raise
+        except Exception as exc:
+            elapsed_ms = (time.monotonic() - started) * 1000
+            self._pending_ws_requests.pop(request_id, None)
+            logger.warning(
+                "beamcore ws <- error type=%s request_id=%s latency_ms=%.1f task=%s offer=%s "
+                "worker=%s err=%s",
+                msg_type,
+                _short_id(request_id, 8),
+                elapsed_ms,
+                ctx["task"],
+                ctx["offer"],
+                ctx["worker"],
+                exc,
+            )
+            raise
+
+        elapsed_ms = (time.monotonic() - started) * 1000
+        resp_type = str(response.get("type") or "?")
+        resp_ctx = _beamcore_msg_context(response)
+        summary = relay_summary(response)
+        defer_relay_log(
+            f"beamcore ws <- recv type={resp_type} request_id={_short_id(request_id, 8)} "
+            f"task={resp_ctx['task']} offer={resp_ctx['offer']} worker={resp_ctx['worker']} {summary}",
+            latency_ms=elapsed_ms,
+            force_info=is_failure_summary(summary),
+        )
 
         if response.get("type") == "error":
             self._maybe_upstream_error_payload(response)
@@ -849,18 +953,15 @@ class SubnetCoreClient:
             message["gateway_url"] = gateway_url
 
         try:
-            await self._ws.send(json.dumps(message))
-            logger.info(
-                "Sent registration via WebSocket for %s (orch-gateway relays it only after "
-                "orchestrator API key authorization): region=%s, fee=%s%%, desired_ready=%s",
-                self.orchestrator_hotkey,
-                region,
-                fee_percentage,
-                self._desired_ready,
+            payload = json.dumps(message)
+            await self._ws.send(payload)
+            defer_relay_log(
+                f"beamcore ws -> send type=register hotkey={_short_id(self.orchestrator_hotkey)} "
+                f"region={region} max_workers={max_workers} desired_ready={self._desired_ready}"
             )
             return True
         except Exception as e:
-            logger.error(f"Failed to send registration via WebSocket: {e}")
+            logger.error("beamcore ws -> send type=register failed: %s", e)
             return False
 
     def set_worker_gateway(self, gateway) -> None:
@@ -896,9 +997,15 @@ class SubnetCoreClient:
             "worker_version": worker_version,
         }
         try:
-            return await self._send_ws_request(msg)
+            return await self._send_ws_request(msg, timeout=self._task_accept_timeout)
         except Exception as exc:
-            logger.warning("send_task_accept send error: %s", exc)
+            logger.warning(
+                "send_task_accept failed task=%s offer=%s worker=%s: %s",
+                _short_id(task_id),
+                _short_id(offer_id or task_id),
+                _short_id(worker_id),
+                exc,
+            )
             return {
                 "type": "task_accept_ack",
                 "task_id": task_id,
@@ -932,9 +1039,16 @@ class SubnetCoreClient:
         if reason:
             msg["reason"] = reason
         try:
-            return await self._send_ws_request(msg)
+            return await self._send_ws_request(msg, timeout=self._task_accept_timeout)
         except Exception as exc:
-            logger.warning("send_task_reject send error: %s", exc)
+            logger.warning(
+                "send_task_reject failed task=%s offer=%s worker=%s reason=%s: %s",
+                _short_id(task_id),
+                _short_id(offer_id or task_id),
+                _short_id(worker_id),
+                reason or "-",
+                exc,
+            )
             return {
                 "type": "task_reject_ack",
                 "task_id": task_id,
@@ -977,9 +1091,16 @@ class SubnetCoreClient:
             for key in ("etag", "chunk_hash", "error"):
                 if payload.get(key) is not None:
                     message[key] = payload[key]
-            return await self._send_ws_request(message)
+            return await self._send_ws_request(message, timeout=self._task_result_timeout)
         except Exception as exc:
-            logger.warning("send_task_result send error: %s", exc)
+            logger.warning(
+                "send_task_result failed task=%s offer=%s worker=%s success=%s: %s",
+                _short_id(task_id),
+                _short_id(offer_id),
+                _short_id(payload.get("worker_id")),
+                bool(payload.get("success")),
+                exc,
+            )
             return {
                 "type": "task_result_ack",
                 "task_id": task_id,
@@ -1023,6 +1144,14 @@ class SubnetCoreClient:
                 exc,
             )
             return False
+
+    def ready_state(self) -> dict:
+        """Current desired/confirmed ready flags for this orchestrator."""
+        return {
+            "desired_ready": self._desired_ready,
+            "confirmed_ready": self._last_confirmed_ready,
+            "ws_connected": self._ws_connected,
+        }
 
     # =========================================================================
     # HTTP Auth & Client
@@ -1126,6 +1255,60 @@ class SubnetCoreClient:
             logger.debug(f"Hotkey lookup failed for {worker_id[:16]}...: {e}")
             return None
 
+    async def clear_history(self) -> dict:
+        """
+        Wipe this orchestrator's transfer history on BeamCore.
+
+        BeamCore: DELETE /orchestrators/history with body {"confirm": true}.
+        Returns 409 when transfers are pending, planning, or in_progress.
+        """
+        api_key = await self._ensure_api_key()
+        if not api_key:
+            raise RuntimeError("Cannot clear history: no orchestrator API key")
+
+        client = await self._get_client()
+        try:
+            response = await client.request(
+                "DELETE",
+                f"{self.base_url.rstrip('/')}/orchestrators/history",
+                json={"confirm": True},
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+        except httpx.HTTPError as exc:
+            logger.error("clear_history request failed: %s", exc)
+            raise RuntimeError(f"BeamCore history reset request failed: {exc}") from exc
+
+        try:
+            payload = response.json() if response.content else {}
+        except json.JSONDecodeError:
+            payload = {"message": response.text[:500] if response.text else ""}
+
+        if not isinstance(payload, dict):
+            payload = {"message": str(payload)}
+
+        payload["_http_status"] = response.status_code
+
+        if response.status_code == 200:
+            logger.info(
+                "Orchestrator history cleared: previous_pool=%s new_pool=%s demoted=%s",
+                payload.get("previous_pool"),
+                payload.get("new_pool"),
+                payload.get("demoted"),
+            )
+        elif response.status_code == 409:
+            logger.warning(
+                "clear_history rejected: active transfers in progress (%s)",
+                payload.get("detail") or payload.get("message") or response.text[:200],
+            )
+        else:
+            logger.error(
+                "clear_history failed: HTTP %s %s",
+                response.status_code,
+                payload.get("detail") or payload.get("message") or response.text[:200],
+            )
+
+        return payload
+
 
 # =============================================================================
 # Global Client Instance
@@ -1151,6 +1334,9 @@ def init_subnet_core_client(
     ws_close_timeout: float = 20.0,
     ws_ping_interval: float = 30.0,
     ws_ping_timeout: float = 45.0,
+    ws_request_timeout: float = 15.0,
+    task_accept_timeout: float = 8.0,
+    task_result_timeout: float = 30.0,
 ) -> SubnetCoreClient:
     """
     Initialize the global SubnetCoreClient instance.
@@ -1178,6 +1364,9 @@ def init_subnet_core_client(
         ws_close_timeout=ws_close_timeout,
         ws_ping_interval=ws_ping_interval,
         ws_ping_timeout=ws_ping_timeout,
+        ws_request_timeout=ws_request_timeout,
+        task_accept_timeout=task_accept_timeout,
+        task_result_timeout=task_result_timeout,
     )
     logger.info(
         "SubnetCoreClient initialized: http=%s ws=%s (signer=%s)",
