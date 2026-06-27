@@ -374,6 +374,7 @@ class Orchestrator:
         self._running: bool = False
         self._background_tasks: List[asyncio.Task] = []
         self._routing_paused: bool = False
+        self._pool_derived_ready: Optional[bool] = None
 
         # Orchestrator manager for incentive mechanism
         self.orch_manager: Optional[Any] = None
@@ -425,8 +426,12 @@ class Orchestrator:
             return
         if self.subnet_core_client is None:
             return
+        should_ready = worker_count > 0
+        if should_ready == self._pool_derived_ready:
+            return
+        self._pool_derived_ready = should_ready
         try:
-            await self.subnet_core_client.set_ready(worker_count > 0)
+            await self.subnet_core_client.set_ready(should_ready)
         except Exception as exc:
             logger.warning("global pool ready sync failed: %s", exc)
 

@@ -125,6 +125,7 @@ class SubnetCoreClient:
         self._last_confirmed_ready: Optional[bool] = None
         self._ready_sync_task: Optional[asyncio.Task] = None
         self._ready_sync_retry_interval = 5.0
+        self._ready_lock = asyncio.Lock()
 
         # API key authentication (for buffer service)
         self._api_key: Optional[str] = None
@@ -1127,23 +1128,27 @@ class SubnetCoreClient:
         """
         Toggle this orchestrator's readiness to receive transfers through the relay.
         """
-        self._desired_ready = ready
-        if not self._ws_connected:
-            logger.info(
-                "Queued ready=%s until orch-gateway websocket is connected",
-                ready,
-            )
-            return False
-        try:
-            return await self._apply_desired_ready_state()
-        except Exception as exc:
-            self._schedule_ready_sync_if_needed()
-            logger.info(
-                "Queued ready=%s after transient orch-gateway sync failure: %s",
-                ready,
-                exc,
-            )
-            return False
+        async with self._ready_lock:
+            if ready == self._desired_ready and self._last_confirmed_ready == ready:
+                return self._ws_connected
+
+            self._desired_ready = ready
+            if not self._ws_connected:
+                logger.info(
+                    "Queued ready=%s until orch-gateway websocket is connected",
+                    ready,
+                )
+                return False
+            try:
+                return await self._apply_desired_ready_state()
+            except Exception as exc:
+                self._schedule_ready_sync_if_needed()
+                logger.info(
+                    "Queued ready=%s after transient orch-gateway sync failure: %s",
+                    ready,
+                    exc,
+                )
+                return False
 
     def ready_state(self) -> dict:
         """Current desired/confirmed ready flags for this orchestrator."""

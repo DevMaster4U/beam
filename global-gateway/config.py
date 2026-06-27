@@ -44,6 +44,12 @@ class GatewaySettings(BaseSettings):
     weight_bandwidth: float = Field(default=0.15, env="WEIGHT_BANDWIDTH")
     weight_success: float = Field(default=0.10, env="WEIGHT_SUCCESS")
 
+    worker_selection: str = Field(
+        default="round_robin",
+        env="GATEWAY_WORKER_SELECTION",
+        description="Worker pick strategy: round_robin or best_score",
+    )
+
     ipc_socket_path: str = Field(
         default="run/pool-coordinator.sock",
         env="GATEWAY_IPC_SOCKET_PATH",

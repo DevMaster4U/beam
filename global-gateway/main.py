@@ -39,6 +39,7 @@ async def lifespan(_app: FastAPI):
     )
     gateway_state.worker_history_max = settings.worker_history_max
     gateway_state.max_workers = settings.max_workers
+    gateway_state.worker_selection = settings.worker_selection.strip().lower()
 
     ipc_server: Optional[PoolCoordinatorIpcServer] = None
     if settings.ipc_enabled:
@@ -49,10 +50,11 @@ async def lifespan(_app: FastAPI):
         await ipc_server.start()
 
     logger.info(
-        "Global gateway ready on %s:%s (max_workers=%d ipc=%s)",
+        "Global gateway ready on %s:%s (max_workers=%d worker_selection=%s ipc=%s)",
         settings.gateway_host,
         settings.gateway_port,
         settings.max_workers,
+        gateway_state.worker_selection,
         ipc_server.socket_path if ipc_server else "disabled",
     )
     yield

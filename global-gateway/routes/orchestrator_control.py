@@ -48,7 +48,7 @@ async def handle_task_offer_batch(orchestrator_hotkey: str, message: dict) -> di
         offer_id = offer.get("offer_id") or offer.get("task_id")
         task_id = offer.get("task_id") or offer_id
 
-        worker_id = gateway_state.select_best_worker()
+        worker_id = gateway_state.select_worker()
         if not worker_id:
             logger.warning(
                 "task_offer_batch %s offer %d/%d: no worker with capacity (%s) "
@@ -77,14 +77,14 @@ async def handle_task_offer_batch(orchestrator_hotkey: str, message: dict) -> di
             delivered += 1
             profile = gateway_state.get_profile(worker_id)
             logger.info(
-                "task_offer_batch %s offer %d/%d: orch=%s -> worker=%s score=%.4f "
-                "avg_mbps=%.1f ip=%s active=%d/%d task=%s offer=%s",
+                "task_offer_batch %s offer %d/%d: orch=%s -> worker=%s "
+                "selection=%s avg_mbps=%.1f ip=%s active=%d/%d task=%s offer=%s",
                 batch_id,
                 offer_index,
                 total_offers,
                 orchestrator_hotkey[:16],
                 worker_id,
-                profile.score(gateway_state.scoring_weights),
+                gateway_state.worker_selection,
                 profile.average_mbps,
                 profile.ip or "?",
                 profile.active_count,

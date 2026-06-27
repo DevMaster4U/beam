@@ -130,6 +130,7 @@ class GlobalGatewayState:
     worker_profiles: Dict[str, WorkerProfile] = field(default_factory=dict)
     orchestrator_sessions: Dict[str, Any] = field(default_factory=dict)
     worker_cursor: int = 0
+    worker_selection: str = "round_robin"
     offer_routes: Dict[str, str] = field(default_factory=dict)
     task_routes: Dict[str, str] = field(default_factory=dict)
     active_task_records: Dict[str, WorkerTaskRecord] = field(default_factory=dict)
@@ -295,14 +296,53 @@ class GlobalGatewayState:
         )
         return best_id
 
+    def select_worker(self) -> Optional[str]:
+        """Pick the next worker for a task offer."""
+        if self.worker_selection == "best_score":
+            return self.select_best_worker()
+        return self.select_worker_round_robin()
+
+    def select_worker_round_robin(self) -> Optional[str]:
+        """Pick the next connected worker with capacity in round-robin order."""
+        connected = sorted(self.list_worker_ids())
+        if not connected:
+            return None
+
+        pool_size = len(connected)
+        for _ in range(pool_size):
+            worker_id = connected[self.worker_cursor % pool_size]
+            self.worker_cursor = (self.worker_cursor + 1) % pool_size
+            profile = self.get_profile(worker_id)
+            if not profile.has_capacity:
+                continue
+            logger.debug(
+                "selected worker %s round_robin ip=%s active=%d/%d cursor=%d pool=%d",
+                worker_id,
+                profile.ip or "?",
+                profile.active_count,
+                profile.max_concurrent_tasks,
+                self.worker_cursor,
+                pool_size,
+            )
+            return worker_id
+        return None
+
     def get_workers_round_robin(self, n: int = 1) -> list[str]:
-        """Select up to n best idle workers (caller marks busy when delivering offers)."""
+        """Select up to n distinct workers in round-robin order."""
         selected: list[str] = []
-        for _ in range(n):
-            worker_id = self.select_best_worker()
+        connected = self.list_worker_ids()
+        if not connected or n <= 0:
+            return selected
+
+        max_attempts = len(connected) * n
+        for _ in range(max_attempts):
+            if len(selected) >= n:
+                break
+            worker_id = self.select_worker_round_robin()
             if not worker_id:
                 break
-            selected.append(worker_id)
+            if worker_id not in selected:
+                selected.append(worker_id)
         return selected
 
     def mark_worker_busy(self, worker_id: str, offer_id: Optional[str] = None) -> None:
