@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Install BEAM systemd units (orchestrator@, worker@, global-gateway).
 #
+# AWS EC2 (Ubuntu): run as ubuntu, use sudo for install:
+#   ./scripts/setup-ec2.sh
+#   sudo ./scripts/install-systemd.sh --enable
+#   sudo ./scripts/install-systemd.sh --enable-global-gateway
+#
 # Usage:
 #   ./scripts/install-systemd.sh --enable
 #   ./scripts/install-systemd.sh --enable-orchestrators
@@ -16,8 +21,8 @@ source "${ROOT}/scripts/lib/systemd.sh"
 
 SYSTEMD_DIR="${ROOT}/deploy/systemd"
 TARGET_DIR="/etc/systemd/system"
-BEAM_USER="${USER}"
-BEAM_GROUP="${USER}"
+BEAM_USER=""
+BEAM_GROUP=""
 ENABLE=0
 ENABLE_ORCHESTRATORS=0
 ENABLE_WORKERS=0
@@ -30,8 +35,8 @@ usage() {
 Usage: $0 [--user NAME] [--group NAME] [--enable | --enable-orchestrators | --enable-workers | --enable-global-gateway]
          [--instances NAME[,NAME...]]
 
-  --user                 User to run services as (default: ${USER})
-  --group                Group to run services as (default: same as --user)
+  --user                 User to run services as (default: ubuntu on EC2 when run via sudo/root)
+  --group                Group to run services as (default: primary group of --user)
   --enable               Install unit templates only (no instances enabled)
   --enable-orchestrators Enable orchestrator instances from config/orchestrators/*.env
   --sync-orchestrators   Alias for --enable-orchestrators
@@ -103,6 +108,9 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+BEAM_USER="${BEAM_USER:-$(beam_default_service_user)}"
+BEAM_GROUP="${BEAM_GROUP:-$(beam_default_service_group)}"
 
 if [[ "$ENABLE" -eq 0 && "$ENABLE_ORCHESTRATORS" -eq 0 && "$ENABLE_WORKERS" -eq 0 && "$ENABLE_GLOBAL_GATEWAY" -eq 0 ]]; then
   ENABLE=1
@@ -187,11 +195,12 @@ if ! VENV="$(beam_resolve_venv)"; then
   exit 1
 fi
 
-mkdir -p \
-  "${ROOT}/logs/orchestrators" \
-  "${ROOT}/logs/workers" \
-  "${ROOT}/logs/global-gateway" \
-  "${ROOT}/run"
+beam_prepare_repo_permissions
+
+echo "Service user: ${BEAM_USER} (group: ${BEAM_GROUP})"
+if [[ "${EUID}" -eq 0 && "${BEAM_USER}" == "ubuntu" && -z "${SUDO_USER:-}" ]]; then
+  echo "Note: detected root shell on EC2 — systemd units will run as ubuntu."
+fi
 
 render_unit() {
   local src="$1"

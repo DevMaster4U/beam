@@ -1,5 +1,89 @@
 #!/usr/bin/env bash
 # Shared helpers for BEAM systemd service scripts.
+
+# Resolve the OS user systemd services should run as.
+# Priority: BEAM_USER env > SUDO_USER (sudo ./script) > ubuntu when root on EC2 > $USER
+beam_default_service_user() {
+  if [[ -n "${BEAM_USER:-}" ]]; then
+    printf '%s' "$BEAM_USER"
+    return 0
+  fi
+  if [[ -n "${SUDO_USER:-}" ]]; then
+    printf '%s' "$SUDO_USER"
+    return 0
+  fi
+  if [[ "${EUID}" -eq 0 ]] && id -u ubuntu &>/dev/null; then
+    printf '%s' "ubuntu"
+    return 0
+  fi
+  printf '%s' "${USER:-$(id -un)}"
+}
+
+beam_default_service_group() {
+  if [[ -n "${BEAM_GROUP:-}" ]]; then
+    printf '%s' "$BEAM_GROUP"
+    return 0
+  fi
+  local user
+  user="$(beam_default_service_user)"
+  if id -gn "$user" &>/dev/null 2>&1; then
+    printf '%s' "$(id -gn "$user")"
+    return 0
+  fi
+  printf '%s' "$user"
+}
+
+beam_chown_if_needed() {
+  local path="$1"
+  local user="$2"
+  local group="$3"
+  [[ -e "$path" ]] || return 0
+  if [[ "$(stat -c '%U' "$path" 2>/dev/null || stat -f '%Su' "$path")" == "$user" ]]; then
+    return 0
+  fi
+  if [[ "${EUID}" -eq 0 ]]; then
+    chown -R "${user}:${group}" "$path"
+  else
+    sudo chown -R "${user}:${group}" "$path"
+  fi
+}
+
+beam_prepare_data_dirs() {
+  local user="${1:-$(beam_default_service_user)}"
+  local group="${2:-$(beam_default_service_group)}"
+
+  mkdir -p \
+    "${BEAM_ROOT}/logs/orchestrators" \
+    "${BEAM_ROOT}/logs/workers" \
+    "${BEAM_ROOT}/logs/global-gateway" \
+    "${BEAM_ROOT}/run"
+
+  beam_chown_if_needed "${BEAM_ROOT}/logs" "$user" "$group"
+  beam_chown_if_needed "${BEAM_ROOT}/run" "$user" "$group"
+}
+
+beam_prepare_repo_permissions() {
+  local user group
+  user="$(beam_default_service_user)"
+  group="$(beam_default_service_group)"
+  beam_prepare_data_dirs "$user" "$group"
+
+  for dir in venv .venv; do
+    beam_chown_if_needed "${BEAM_ROOT}/${dir}" "$user" "$group"
+  done
+}
+
+beam_require_non_root_interactive() {
+  if [[ "${EUID}" -eq 0 && -z "${SUDO_USER:-}" && -z "${BEAM_USER:-}" ]]; then
+    echo "Do not run this script as root on EC2." >&2
+    echo "Use the ubuntu user instead:" >&2
+    echo "  sudo -iu ubuntu" >&2
+    echo "  cd ${BEAM_ROOT:-~/beam}" >&2
+    echo "  ./scripts/$1" >&2
+    exit 1
+  fi
+}
+
 beam_systemctl() {
   if systemctl "$@" 2>/dev/null; then
     return 0

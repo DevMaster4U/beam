@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Manage one orchestrator instance via systemd (beam-orchestrator@<instance>.service).
 #
-# First-time setup:
-#   ./scripts/install-systemd.sh --enable
-#   ./scripts/install-systemd.sh --enable-orchestrators
+# First-time setup (AWS EC2 / Ubuntu):
+#   ./scripts/setup-ec2.sh
+#   sudo ./scripts/install-systemd.sh --enable
+#   sudo ./scripts/install-systemd.sh --enable-orchestrators
 #
 # Usage:
 #   ./scripts/run-orchestrator.sh orch1
@@ -87,7 +88,7 @@ ENV_FILE="${ROOT}/config/orchestrators/${INSTANCE}.env"
 LOG_FILE="${ROOT}/logs/orchestrators/${INSTANCE}.log"
 SERVICE="beam-orchestrator@${INSTANCE}.service"
 
-mkdir -p "${ROOT}/logs/orchestrators"
+beam_prepare_data_dirs
 
 if [[ "$STOP" -eq 1 ]]; then
   beam_require_unit "$SERVICE"

@@ -2,9 +2,13 @@
 
 Production services for orchestrator and workers.
 
-All commands run from the **repo root**.
+All commands run from the **repo root** as a normal user (on AWS EC2: `ubuntu`). Use `sudo` only for `install-systemd.sh`; service units run as that user, not root.
 
-Each service type uses the same multi-instance pattern: one env file per instance under `config/<service>/`, a systemd template unit, and a generated `.target` for all instances.
+```bash
+# EC2 first-time host setup
+./scripts/setup-ec2.sh
+sudo ./scripts/install-systemd.sh --enable
+```
 
 ---
 

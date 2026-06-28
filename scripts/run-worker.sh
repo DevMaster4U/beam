@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Manage one worker instance via systemd (beam-worker@<instance>.service).
 #
-# First-time setup:
-#   ./scripts/install-systemd.sh --enable-workers
+# First-time setup (AWS EC2 / Ubuntu):
+#   ./scripts/setup-ec2.sh
+#   sudo ./scripts/install-systemd.sh --enable
+#   sudo ./scripts/install-systemd.sh --enable-workers
 #
 # Usage:
 #   ./scripts/run-worker.sh worker1
@@ -84,7 +86,7 @@ ENV_FILE="${ROOT}/config/workers/${INSTANCE}.env"
 LOG_FILE="${ROOT}/logs/workers/${INSTANCE}.log"
 SERVICE="beam-worker@${INSTANCE}.service"
 
-mkdir -p "${ROOT}/logs/workers"
+beam_prepare_data_dirs
 
 if [[ "$STOP" -eq 1 ]]; then
   beam_require_unit "$SERVICE"

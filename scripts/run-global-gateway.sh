@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Manage the shared global worker gateway via systemd (beam-global-gateway.service).
 #
-# First-time setup:
-#   ./scripts/install-systemd.sh --enable
-#   ./scripts/install-systemd.sh --enable-global-gateway
+# First-time setup (AWS EC2 / Ubuntu):
+#   ./scripts/setup-ec2.sh
+#   sudo ./scripts/install-systemd.sh --enable
+#   sudo ./scripts/install-systemd.sh --enable-global-gateway
 #
 # Usage:
 #   ./scripts/run-global-gateway.sh start
@@ -50,7 +51,7 @@ ENV_FILE="${ROOT}/config/global-gateway.env"
 LOG_FILE="${ROOT}/logs/global-gateway/global-gateway.log"
 SERVICE="beam-global-gateway.service"
 
-mkdir -p "${ROOT}/logs/global-gateway"
+beam_prepare_data_dirs
 
 read_gateway_port() {
   local port="8001"
