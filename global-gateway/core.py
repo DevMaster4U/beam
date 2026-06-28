@@ -303,26 +303,55 @@ class GlobalGatewayState:
         return self.select_worker_round_robin()
 
     def select_worker_round_robin(self) -> Optional[str]:
-        """Pick the next connected worker with capacity in round-robin order."""
+        """Pick the next worker with capacity, spreading load across distinct IPs when possible."""
         connected = sorted(self.list_worker_ids())
         if not connected:
             return None
 
         pool_size = len(connected)
-        for _ in range(pool_size):
-            worker_id = connected[self.worker_cursor % pool_size]
-            self.worker_cursor = (self.worker_cursor + 1) % pool_size
+        busy_ips = self.busy_ips()
+        start = self.worker_cursor % pool_size
+
+        tier_new_ip: list[str] = []
+        tier_idle_busy_ip: list[str] = []
+        tier_any_capacity: list[str] = []
+
+        for offset in range(pool_size):
+            worker_id = connected[(start + offset) % pool_size]
             profile = self.get_profile(worker_id)
             if not profile.has_capacity:
                 continue
+
+            ip = profile.ip.strip()
+            if not ip or ip not in busy_ips:
+                tier_new_ip.append(worker_id)
+            elif profile.active_count == 0:
+                tier_idle_busy_ip.append(worker_id)
+            else:
+                tier_any_capacity.append(worker_id)
+
+        for tier_name, tier in (
+            ("new_ip", tier_new_ip),
+            ("idle_busy_ip", tier_idle_busy_ip),
+            ("any_capacity", tier_any_capacity),
+        ):
+            if not tier:
+                continue
+            worker_id = tier[0]
+            chosen_idx = connected.index(worker_id)
+            self.worker_cursor = (chosen_idx + 1) % pool_size
+            profile = self.get_profile(worker_id)
             logger.debug(
-                "selected worker %s round_robin ip=%s active=%d/%d cursor=%d pool=%d",
+                "selected worker %s round_robin tier=%s ip=%s active=%d/%d "
+                "cursor=%d pool=%d busy_ips=%s",
                 worker_id,
+                tier_name,
                 profile.ip or "?",
                 profile.active_count,
                 profile.max_concurrent_tasks,
                 self.worker_cursor,
                 pool_size,
+                ",".join(sorted(busy_ips)) or "-",
             )
             return worker_id
         return None
