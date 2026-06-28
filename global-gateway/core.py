@@ -296,82 +296,105 @@ class GlobalGatewayState:
         )
         return best_id
 
-    def select_worker(self) -> Optional[str]:
+    def select_worker(
+        self,
+        batch_used_ips: Optional[set[str]] = None,
+        batch_assigned_workers: Optional[set[str]] = None,
+    ) -> Optional[str]:
         """Pick the next worker for a task offer."""
         if self.worker_selection == "best_score":
             return self.select_best_worker()
-        return self.select_worker_round_robin()
+        return self.select_worker_round_robin(
+            batch_used_ips=batch_used_ips,
+            batch_assigned_workers=batch_assigned_workers,
+        )
 
-    def select_worker_round_robin(self) -> Optional[str]:
-        """Pick the next worker with capacity, spreading load across distinct IPs when possible."""
+    def select_worker_round_robin(
+        self,
+        batch_used_ips: Optional[set[str]] = None,
+        batch_assigned_workers: Optional[set[str]] = None,
+    ) -> Optional[str]:
+        """Pick the next worker with capacity in round-robin order.
+
+        When ``batch_used_ips`` / ``batch_assigned_workers`` are provided (same
+        task_offer_batch), prefer workers on IPs not already used in that batch,
+        then assign the next round-robin worker not yet used in the batch.
+        Across separate batches omit both sets for pure round-robin.
+        """
         connected = sorted(self.list_worker_ids())
         if not connected:
             return None
 
         pool_size = len(connected)
-        busy_ips = self.busy_ips()
         start = self.worker_cursor % pool_size
+        in_batch = batch_used_ips is not None or batch_assigned_workers is not None
 
-        tier_new_ip: list[str] = []
-        tier_idle_busy_ip: list[str] = []
-        tier_any_capacity: list[str] = []
-
-        for offset in range(pool_size):
-            worker_id = connected[(start + offset) % pool_size]
+        def _eligible(worker_id: str, *, allow_used_ip: bool) -> bool:
             profile = self.get_profile(worker_id)
             if not profile.has_capacity:
-                continue
-
+                return False
+            if batch_assigned_workers and worker_id in batch_assigned_workers:
+                return False
             ip = profile.ip.strip()
-            if not ip or ip not in busy_ips:
-                tier_new_ip.append(worker_id)
-            elif profile.active_count == 0:
-                tier_idle_busy_ip.append(worker_id)
-            else:
-                tier_any_capacity.append(worker_id)
+            if (
+                not allow_used_ip
+                and batch_used_ips is not None
+                and ip
+                and ip in batch_used_ips
+            ):
+                return False
+            return True
 
-        for tier_name, tier in (
-            ("new_ip", tier_new_ip),
-            ("idle_busy_ip", tier_idle_busy_ip),
-            ("any_capacity", tier_any_capacity),
-        ):
-            if not tier:
-                continue
-            worker_id = tier[0]
-            chosen_idx = connected.index(worker_id)
-            self.worker_cursor = (chosen_idx + 1) % pool_size
-            profile = self.get_profile(worker_id)
-            logger.debug(
-                "selected worker %s round_robin tier=%s ip=%s active=%d/%d "
-                "cursor=%d pool=%d busy_ips=%s",
-                worker_id,
-                tier_name,
-                profile.ip or "?",
-                profile.active_count,
-                profile.max_concurrent_tasks,
-                self.worker_cursor,
-                pool_size,
-                ",".join(sorted(busy_ips)) or "-",
-            )
-            return worker_id
-        return None
+        def _pick(allow_used_ip: bool) -> Optional[str]:
+            for offset in range(pool_size):
+                idx = (start + offset) % pool_size
+                worker_id = connected[idx]
+                if not _eligible(worker_id, allow_used_ip=allow_used_ip):
+                    continue
+                self.worker_cursor = (idx + 1) % pool_size
+                profile = self.get_profile(worker_id)
+                logger.debug(
+                    "selected worker %s round_robin ip=%s active=%d/%d "
+                    "cursor=%d pool=%d batch_ips=%s",
+                    worker_id,
+                    profile.ip or "?",
+                    profile.active_count,
+                    profile.max_concurrent_tasks,
+                    self.worker_cursor,
+                    pool_size,
+                    ",".join(sorted(batch_used_ips)) if batch_used_ips else "-",
+                )
+                return worker_id
+            return None
+
+        if in_batch:
+            worker_id = _pick(allow_used_ip=False)
+            if worker_id:
+                return worker_id
+            return _pick(allow_used_ip=True)
+
+        return _pick(allow_used_ip=True)
 
     def get_workers_round_robin(self, n: int = 1) -> list[str]:
-        """Select up to n distinct workers in round-robin order."""
+        """Select up to n workers in round-robin order for one batch."""
         selected: list[str] = []
-        connected = self.list_worker_ids()
-        if not connected or n <= 0:
+        if n <= 0:
             return selected
 
-        max_attempts = len(connected) * n
-        for _ in range(max_attempts):
-            if len(selected) >= n:
-                break
-            worker_id = self.select_worker_round_robin()
+        batch_used_ips: set[str] = set()
+        batch_assigned_workers: set[str] = set()
+        for _ in range(n):
+            worker_id = self.select_worker_round_robin(
+                batch_used_ips=batch_used_ips,
+                batch_assigned_workers=batch_assigned_workers,
+            )
             if not worker_id:
                 break
-            if worker_id not in selected:
-                selected.append(worker_id)
+            selected.append(worker_id)
+            batch_assigned_workers.add(worker_id)
+            ip = self.get_profile(worker_id).ip.strip()
+            if ip:
+                batch_used_ips.add(ip)
         return selected
 
     def mark_worker_busy(self, worker_id: str, offer_id: Optional[str] = None) -> None:

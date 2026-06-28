@@ -32,6 +32,8 @@ async def handle_task_offer_batch(orchestrator_hotkey: str, message: dict) -> di
     delivered = 0
     failed = 0
     offer_index = 0
+    batch_used_ips: set[str] = set()
+    batch_assigned_workers: set[str] = set()
     for offer in offers:
         offer_index += 1
         if not isinstance(offer, dict):
@@ -48,7 +50,10 @@ async def handle_task_offer_batch(orchestrator_hotkey: str, message: dict) -> di
         offer_id = offer.get("offer_id") or offer.get("task_id")
         task_id = offer.get("task_id") or offer_id
 
-        worker_id = gateway_state.select_worker()
+        worker_id = gateway_state.select_worker(
+            batch_used_ips=batch_used_ips,
+            batch_assigned_workers=batch_assigned_workers,
+        )
         if not worker_id:
             logger.warning(
                 "task_offer_batch %s offer %d/%d: no worker with capacity (%s) "
@@ -68,6 +73,10 @@ async def handle_task_offer_batch(orchestrator_hotkey: str, message: dict) -> di
         payload = {"type": "task_offer", **offer}
         if await gateway_state.send_to_worker(worker_id, payload):
             gateway_state.mark_worker_busy(worker_id, offer_id)
+            batch_assigned_workers.add(worker_id)
+            worker_ip = gateway_state.get_profile(worker_id).ip.strip()
+            if worker_ip:
+                batch_used_ips.add(worker_ip)
             gateway_state.record_task_assigned(
                 worker_id,
                 task_id=str(task_id),

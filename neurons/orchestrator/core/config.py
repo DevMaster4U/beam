@@ -113,7 +113,7 @@ def configure_orchestrator_logging(force: bool = False) -> Path:
     if _LOGGING_CONFIGURED and not force:
         return log_path
 
-    log_format = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    log_format = "%(asctime)s.%(msecs)03.0f | %(levelname)s | %(name)s | %(message)s"
     log_datefmt = "%Y-%m-%d %H:%M:%S"
     formatter = logging.Formatter(log_format, datefmt=log_datefmt)
 

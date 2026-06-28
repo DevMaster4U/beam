@@ -23,7 +23,7 @@ from core.validator import Validator
 LOG_DIR = os.environ.get("LOG_DIR", "/tmp/beam_validator_logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
-log_format = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+log_format = "%(asctime)s.%(msecs)03.0f | %(levelname)s | %(name)s | %(message)s"
 log_datefmt = "%Y-%m-%d %H:%M:%S"
 
 logging.basicConfig(

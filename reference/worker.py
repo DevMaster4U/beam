@@ -163,7 +163,7 @@ def configure_worker_logging() -> None:
     log_dir = log_root / "workers"
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    log_format = "%(asctime)s | %(levelname)s | %(message)s"
+    log_format = "%(asctime)s.%(msecs)03.0f | %(levelname)s | %(message)s"
     log_datefmt = "%Y-%m-%d %H:%M:%S"
     formatter = logging.Formatter(log_format, datefmt=log_datefmt)
 
