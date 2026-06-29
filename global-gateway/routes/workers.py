@@ -107,21 +107,28 @@ async def _handle_worker_message(worker_id: str, message: dict) -> None:
             max_concurrent = int(max_tasks_raw) if max_tasks_raw is not None else None
         except (TypeError, ValueError):
             max_concurrent = None
+        initial_order_raw = message.get("initial_order")
+        try:
+            initial_order = int(initial_order_raw) if initial_order_raw is not None else None
+        except (TypeError, ValueError):
+            initial_order = None
         gateway_state.update_worker_hello(
             worker_id,
             ip=ip or None,
             claimed_bandwidth_mbps=claimed,
             max_concurrent_tasks=max_concurrent,
             worker_version=worker_version or None,
+            initial_order=initial_order,
         )
         profile = gateway_state.get_profile(worker_id)
         logger.info(
-            "Worker connected: %s ip=%s version=%s max_tasks=%d active=%d avg_mbps=%.1f score=%.4f (%d/%d)",
+            "Worker connected: %s ip=%s version=%s max_tasks=%d active=%d initial_order=%d avg_mbps=%.1f score=%.4f (%d/%d)",
             worker_id,
             profile.ip or "?",
             profile.worker_version or "?",
             profile.max_concurrent_tasks,
             profile.active_count,
+            profile.initial_order,
             profile.average_mbps,
             profile.score(gateway_state.scoring_weights),
             gateway_state.worker_count(),

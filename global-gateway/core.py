@@ -61,6 +61,7 @@ class WorkerProfile:
     successful_tasks: int = 0
     max_concurrent_tasks: int = 5
     worker_version: str = ""
+    initial_order: int = 0
     active_offer_ids: set[str] = field(default_factory=set)
 
     @property
@@ -104,6 +105,12 @@ class WorkerProfile:
             self.successful_tasks += 1
         if self.total_tasks > 0:
             self.success_rate = self.successful_tasks / self.total_tasks
+
+    def round_robin_sort_key(self) -> tuple:
+        """Idle workers (n=0) rank by initial_order desc; busy workers by avg Mbps desc."""
+        if self.active_count == 0:
+            return (0, -self.initial_order, self.worker_id)
+        return (1, -self.average_mbps, self.worker_id)
 
     def score(self, weights: WorkerScoringWeights) -> float:
         """Multi-factor score aligned with orchestrator _select_best_worker."""
@@ -192,6 +199,7 @@ class GlobalGatewayState:
         claimed_bandwidth_mbps: Optional[float] = None,
         max_concurrent_tasks: Optional[int] = None,
         worker_version: Optional[str] = None,
+        initial_order: Optional[int] = None,
     ) -> None:
         profile = self.get_profile(worker_id)
         if ip and ip.strip():
@@ -203,6 +211,12 @@ class GlobalGatewayState:
             profile.max_concurrent_tasks = int(max_concurrent_tasks)
         if worker_version and worker_version.strip():
             profile.worker_version = worker_version.strip()
+        if initial_order is not None:
+            profile.initial_order = int(initial_order)
+
+    def ordered_worker_ids(self, worker_ids: list[str]) -> list[str]:
+        """Order pool for round-robin: idle by initial_order, busy by observed Mbps."""
+        return sorted(worker_ids, key=lambda wid: self.get_profile(wid).round_robin_sort_key())
 
     def busy_ips(self) -> set[str]:
         ips: set[str] = set()
@@ -321,7 +335,7 @@ class GlobalGatewayState:
         then assign the next round-robin worker not yet used in the batch.
         Across separate batches omit both sets for pure round-robin.
         """
-        connected = sorted(self.list_worker_ids())
+        connected = self.ordered_worker_ids(self.list_worker_ids())
         if not connected:
             return None
 
@@ -596,6 +610,7 @@ class GlobalGatewayState:
             "active": profile.active,
             "active_tasks": profile.active_count,
             "max_concurrent_tasks": profile.max_concurrent_tasks,
+            "initial_order": profile.initial_order,
             "active_offer_ids": sorted(profile.active_offer_ids),
             "active_task_records": self.active_tasks_for_worker(worker_id),
         }

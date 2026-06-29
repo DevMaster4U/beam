@@ -302,6 +302,10 @@ WORKER_EARLY_TRANSFER = _env_bool("WORKER_EARLY_TRANSFER", True)
 PREWARM_ENABLED = _env_bool("WORKER_PREWARM_ENABLED", True)
 PREWARM_TIMEOUT = float(os.environ.get("WORKER_PREWARM_TIMEOUT", "5"))
 PREWARM_MAX_ORIGINS = max(1, int(os.environ.get("WORKER_PREWARM_MAX_ORIGINS", "32")))
+try:
+    WORKER_INITIAL_ORDER = int(os.environ.get("WORKER_INITIAL_ORDER", "0"))
+except ValueError:
+    WORKER_INITIAL_ORDER = 0
 
 
 # Participant workers default to recording a payment obligation unless opted out.
@@ -1553,6 +1557,7 @@ async def ws_send_worker_hello(websocket, state: WorkerState) -> bool:
             "ip": ip,
             "claimed_bandwidth_mbps": 100,
             "max_concurrent_tasks": MAX_CONCURRENT_TASKS,
+            "initial_order": WORKER_INITIAL_ORDER,
         }
         await ws_send_json(websocket, state, msg)
         return True

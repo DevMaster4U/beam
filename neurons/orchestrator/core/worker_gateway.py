@@ -26,6 +26,10 @@ class _WorkerProfile:
     ip: str = ""
     max_concurrent_tasks: int = 5
     worker_version: str = ""
+    initial_order: int = 0
+    claimed_bandwidth_mbps: float = 0.0
+    transfer_mbps_sum: float = 0.0
+    transfer_count: int = 0
     active_offer_ids: Set[str] = field(default_factory=set)
 
     @property
@@ -35,6 +39,30 @@ class _WorkerProfile:
     @property
     def has_capacity(self) -> bool:
         return self.active_count < self.max_concurrent_tasks
+
+    @property
+    def average_mbps(self) -> float:
+        if self.transfer_count > 0:
+            return self.transfer_mbps_sum / self.transfer_count
+        if self.claimed_bandwidth_mbps > 0:
+            return self.claimed_bandwidth_mbps
+        return 0.0
+
+    def round_robin_sort_key(self) -> tuple:
+        if self.active_count == 0:
+            return (0, -self.initial_order, self.worker_id)
+        return (1, -self.average_mbps, self.worker_id)
+
+    def observe_transfer(self, transfer_mbps: Optional[float]) -> None:
+        if transfer_mbps is None:
+            return
+        try:
+            mbps = float(transfer_mbps)
+        except (TypeError, ValueError):
+            return
+        if mbps > 0:
+            self.transfer_mbps_sum += mbps
+            self.transfer_count += 1
 
 
 class WorkerGateway:
@@ -108,6 +136,8 @@ class WorkerGateway:
         ip: Optional[str] = None,
         max_concurrent_tasks: Optional[int] = None,
         worker_version: Optional[str] = None,
+        initial_order: Optional[int] = None,
+        claimed_bandwidth_mbps: Optional[float] = None,
     ) -> None:
         profile = self._get_profile(worker_id)
         if ip and ip.strip():
@@ -116,6 +146,17 @@ class WorkerGateway:
             profile.max_concurrent_tasks = int(max_concurrent_tasks)
         if worker_version and worker_version.strip():
             profile.worker_version = worker_version.strip()
+        if initial_order is not None:
+            profile.initial_order = int(initial_order)
+        if claimed_bandwidth_mbps is not None and claimed_bandwidth_mbps > 0:
+            if profile.claimed_bandwidth_mbps <= 0:
+                profile.claimed_bandwidth_mbps = float(claimed_bandwidth_mbps)
+
+    def _ordered_connected_worker_ids(self) -> list[str]:
+        return sorted(
+            self._sessions.keys(),
+            key=lambda wid: self._get_profile(wid).round_robin_sort_key(),
+        )
 
     def mark_worker_busy(self, worker_id: str, offer_id: Optional[str] = None) -> None:
         if offer_id:
@@ -166,7 +207,7 @@ class WorkerGateway:
         batch_assigned_workers: Optional[set[str]] = None,
     ) -> Optional[str]:
         """Pick the next worker with capacity, matching global-gateway batch IP spread."""
-        connected = sorted(self._sessions.keys())
+        connected = self._ordered_connected_worker_ids()
         if not connected:
             return None
 
@@ -301,20 +342,37 @@ class WorkerGateway:
                     max_concurrent = int(max_tasks_raw)
                 except (TypeError, ValueError):
                     max_concurrent = None
+            initial_order_raw = msg.get("initial_order")
+            initial_order: Optional[int] = None
+            if initial_order_raw is not None:
+                try:
+                    initial_order = int(initial_order_raw)
+                except (TypeError, ValueError):
+                    initial_order = None
+            claimed_raw = msg.get("claimed_bandwidth_mbps")
+            claimed: Optional[float] = None
+            if claimed_raw is not None:
+                try:
+                    claimed = float(claimed_raw)
+                except (TypeError, ValueError):
+                    claimed = None
             self.update_worker_hello(
                 worker_id,
                 ip=ip or None,
                 max_concurrent_tasks=max_concurrent,
                 worker_version=worker_version or None,
+                initial_order=initial_order,
+                claimed_bandwidth_mbps=claimed,
             )
             profile = self._get_profile(worker_id)
             logger.info(
-                "Worker hello: %s version=%s ip=%s max_tasks=%d active=%d",
+                "Worker hello: %s version=%s ip=%s max_tasks=%d active=%d initial_order=%d",
                 worker_id,
                 profile.worker_version or "?",
                 profile.ip or "?",
                 profile.max_concurrent_tasks,
                 profile.active_count,
+                profile.initial_order,
             )
         elif msg_type in ("task_accept", "task_reject"):
             task_id = msg.get("task_id") or msg.get("offer_id")
@@ -333,6 +391,9 @@ class WorkerGateway:
                 f"success={msg.get('success')} bytes={msg.get('bytes_transferred')}"
             )
             await self._relay_task_result(worker_id, msg)
+            transfer_mbps = msg.get("transfer_mbps")
+            if transfer_mbps is not None:
+                self._get_profile(worker_id).observe_transfer(transfer_mbps)
             offer_id = msg.get("offer_id") or msg.get("task_id")
             self.mark_worker_idle(worker_id, str(offer_id) if offer_id else None)
         else:
