@@ -826,31 +826,15 @@ class SubnetCoreClient:
             logger.warning("No local worker gateway available for batch %s", batch_id)
             return
 
-        delivered = 0
-        for offer in offers:
-            if not isinstance(offer, dict):
-                continue
-            workers = self._worker_gateway.get_workers_round_robin(1)
-            if not workers:
-                logger.warning("No connected local workers for batch %s", batch_id)
-                break
-            worker_id = workers[0]
-            logger.info(f"Delivering offer to worker {worker_id}: {offer}")
-            if await self._worker_gateway.deliver_task_offer(worker_id, offer):
-                delivered += 1
-            else:
-                logger.warning(
-                    "Failed to forward task offer to local worker: batch=%s worker=%s task=%s",
-                    batch_id,
-                    worker_id,
-                    offer.get("task_id"),
-                )
-
-        logger.info(
-            "worker_task_offer_batch delivered locally: batch=%s offers=%s delivered=%s",
+        delivered, failed = await self._worker_gateway.deliver_task_offer_batch(
+            [o for o in offers if isinstance(o, dict)],
+        )
+        logger.debug(
+            "worker_task_offer_batch delivered locally: batch=%s offers=%s delivered=%s failed=%s",
             batch_id,
             len(offers),
             delivered,
+            failed,
         )
 
     def _schedule_ready_sync_if_needed(self) -> None:

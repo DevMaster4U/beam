@@ -96,11 +96,15 @@ async def worker_ws(websocket: WebSocket, worker_id: str) -> None:
 
     await websocket.accept()
 
+    peer_ip = ""
+    if websocket.client:
+        peer_ip = websocket.client.host or ""
+
     worker_version = str(websocket.query_params.get("worker_version") or "").strip()
     if worker_version:
         gateway.note_worker_version(worker_id, worker_version)
 
-    if not gateway.connect(worker_id, websocket):
+    if not gateway.connect(worker_id, websocket, ip=peer_ip):
         await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER)
         return
 

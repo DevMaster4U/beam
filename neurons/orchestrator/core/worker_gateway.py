@@ -10,13 +10,31 @@ import asyncio
 import json
 import logging
 import time
-from typing import Callable, Dict, Optional
+from dataclasses import dataclass, field
+from typing import Callable, Dict, Optional, Set
 
 from core.relay_log import defer_relay_log, is_failure_summary, log_relay, relay_summary, short_id
 
 logger = logging.getLogger(__name__)
 
 MAX_WORKERS = 10
+
+
+@dataclass
+class _WorkerProfile:
+    worker_id: str
+    ip: str = ""
+    max_concurrent_tasks: int = 5
+    worker_version: str = ""
+    active_offer_ids: Set[str] = field(default_factory=set)
+
+    @property
+    def active_count(self) -> int:
+        return len(self.active_offer_ids)
+
+    @property
+    def has_capacity(self) -> bool:
+        return self.active_count < self.max_concurrent_tasks
 
 
 class WorkerGateway:
@@ -27,7 +45,7 @@ class WorkerGateway:
         on_ready_change: Optional[Callable[[bool], None]] = None,
     ) -> None:
         self._sessions: Dict[str, object] = {}  # worker_id → WebSocket
-        self._worker_versions: Dict[str, str] = {}
+        self._profiles: Dict[str, _WorkerProfile] = {}
         self._cursor = 0
         self._on_ready_change = on_ready_change
         self._upstream: Optional[object] = None  # SubnetCoreClient ref
@@ -51,17 +69,27 @@ class WorkerGateway:
     def is_full(self) -> bool:
         return len(self._sessions) >= MAX_WORKERS
 
-    def connect(self, worker_id: str, ws: object) -> bool:
+    def _get_profile(self, worker_id: str) -> _WorkerProfile:
+        profile = self._profiles.get(worker_id)
+        if profile is None:
+            profile = _WorkerProfile(worker_id=worker_id)
+            self._profiles[worker_id] = profile
+        return profile
+
+    def connect(self, worker_id: str, ws: object, *, ip: str = "") -> bool:
         if self.is_full() and worker_id not in self._sessions:
             logger.warning("Worker cap reached (%d); rejecting %s", MAX_WORKERS, worker_id)
             return False
         was_empty = len(self._sessions) == 0
         self._sessions[worker_id] = ws
-        version = self._worker_versions.get(worker_id, "?")
+        profile = self._get_profile(worker_id)
+        if ip.strip():
+            profile.ip = ip.strip()
         logger.info(
-            "Worker connected: %s version=%s (%d/%d)",
+            "Worker connected: %s version=%s ip=%s (%d/%d)",
             worker_id,
-            version,
+            profile.worker_version or "?",
+            profile.ip or "?",
             len(self._sessions),
             MAX_WORKERS,
         )
@@ -71,38 +99,188 @@ class WorkerGateway:
 
     def note_worker_version(self, worker_id: str, worker_version: str) -> None:
         if worker_version.strip():
-            self._worker_versions[worker_id] = worker_version.strip()
+            self._get_profile(worker_id).worker_version = worker_version.strip()
+
+    def update_worker_hello(
+        self,
+        worker_id: str,
+        *,
+        ip: Optional[str] = None,
+        max_concurrent_tasks: Optional[int] = None,
+        worker_version: Optional[str] = None,
+    ) -> None:
+        profile = self._get_profile(worker_id)
+        if ip and ip.strip():
+            profile.ip = ip.strip()
+        if max_concurrent_tasks is not None and max_concurrent_tasks > 0:
+            profile.max_concurrent_tasks = int(max_concurrent_tasks)
+        if worker_version and worker_version.strip():
+            profile.worker_version = worker_version.strip()
+
+    def mark_worker_busy(self, worker_id: str, offer_id: Optional[str] = None) -> None:
+        if offer_id:
+            self._get_profile(worker_id).active_offer_ids.add(str(offer_id))
+
+    def mark_worker_idle(self, worker_id: str, offer_id: Optional[str] = None) -> None:
+        profile = self._get_profile(worker_id)
+        if offer_id:
+            profile.active_offer_ids.discard(str(offer_id))
+        else:
+            profile.active_offer_ids.clear()
 
     def disconnect(self, worker_id: str) -> None:
         self._sessions.pop(worker_id, None)
-        self._worker_versions.pop(worker_id, None)
+        profile = self._profiles.get(worker_id)
+        if profile:
+            profile.active_offer_ids.clear()
         logger.info("Worker disconnected: %s (%d/%d)", worker_id, len(self._sessions), MAX_WORKERS)
         if len(self._sessions) == 0 and self._on_ready_change:
             self._on_ready_change(False)
 
-    async def deliver_task_offer(self, worker_id: str, offer: dict) -> bool:
+    async def deliver_task_offer(
+        self,
+        worker_id: str,
+        offer: dict,
+        *,
+        mark_busy: bool = True,
+    ) -> bool:
         ws = self._sessions.get(worker_id)
         if ws is None:
             logger.warning("deliver_task_offer: worker %s not connected", worker_id)
             return False
         try:
             await ws.send_text(json.dumps({"type": "task_offer", **offer}))
+            if mark_busy:
+                offer_id = offer.get("offer_id") or offer.get("task_id")
+                if offer_id:
+                    self.mark_worker_busy(worker_id, str(offer_id))
             return True
         except Exception as exc:
             logger.warning("deliver_task_offer send failed for %s: %s", worker_id, exc)
             self._sessions.pop(worker_id, None)
             return False
 
-    def get_workers_round_robin(self, n: int = 1) -> list:
-        """Return up to n worker_ids in round-robin order."""
-        ids = list(self._sessions.keys())
-        if not ids:
-            return []
-        selected = []
-        for _ in range(min(n, len(ids))):
-            selected.append(ids[self._cursor % len(ids)])
-            self._cursor += 1
+    def select_worker_round_robin(
+        self,
+        batch_used_ips: Optional[set[str]] = None,
+        batch_assigned_workers: Optional[set[str]] = None,
+    ) -> Optional[str]:
+        """Pick the next worker with capacity, matching global-gateway batch IP spread."""
+        connected = sorted(self._sessions.keys())
+        if not connected:
+            return None
+
+        pool_size = len(connected)
+        start = self._cursor % pool_size
+        in_batch = batch_used_ips is not None or batch_assigned_workers is not None
+
+        def _eligible(worker_id: str, *, allow_used_ip: bool) -> bool:
+            profile = self._get_profile(worker_id)
+            if not profile.has_capacity:
+                return False
+            if batch_assigned_workers and worker_id in batch_assigned_workers:
+                return False
+            ip = profile.ip.strip()
+            if (
+                not allow_used_ip
+                and batch_used_ips is not None
+                and ip
+                and ip in batch_used_ips
+            ):
+                return False
+            return True
+
+        def _pick(allow_used_ip: bool) -> Optional[str]:
+            for offset in range(pool_size):
+                idx = (start + offset) % pool_size
+                worker_id = connected[idx]
+                if not _eligible(worker_id, allow_used_ip=allow_used_ip):
+                    continue
+                self._cursor = (idx + 1) % pool_size
+                profile = self._get_profile(worker_id)
+                logger.debug(
+                    "selected worker %s round_robin ip=%s active=%d/%d "
+                    "cursor=%d pool=%d batch_ips=%s",
+                    worker_id,
+                    profile.ip or "?",
+                    profile.active_count,
+                    profile.max_concurrent_tasks,
+                    self._cursor,
+                    pool_size,
+                    ",".join(sorted(batch_used_ips)) if batch_used_ips else "-",
+                )
+                return worker_id
+            return None
+
+        if in_batch:
+            worker_id = _pick(allow_used_ip=False)
+            if worker_id:
+                return worker_id
+            return _pick(allow_used_ip=True)
+
+        return _pick(allow_used_ip=True)
+
+    def get_workers_round_robin(self, n: int = 1) -> list[str]:
+        """Return up to n worker_ids with batch-aware round-robin (IP + capacity)."""
+        selected: list[str] = []
+        if n <= 0:
+            return selected
+
+        batch_used_ips: set[str] = set()
+        batch_assigned_workers: set[str] = set()
+        for _ in range(n):
+            worker_id = self.select_worker_round_robin(
+                batch_used_ips=batch_used_ips,
+                batch_assigned_workers=batch_assigned_workers,
+            )
+            if not worker_id:
+                break
+            selected.append(worker_id)
+            batch_assigned_workers.add(worker_id)
+            ip = self._get_profile(worker_id).ip.strip()
+            if ip:
+                batch_used_ips.add(ip)
         return selected
+
+    async def deliver_task_offer_batch(self, offers: list[dict]) -> tuple[int, int]:
+        """Deliver a task offer batch with global-gateway-style worker selection."""
+        delivered = 0
+        failed = 0
+        batch_used_ips: set[str] = set()
+        batch_assigned_workers: set[str] = set()
+
+        for offer in offers:
+            if not isinstance(offer, dict):
+                failed += 1
+                continue
+
+            worker_id = self.select_worker_round_robin(
+                batch_used_ips=batch_used_ips,
+                batch_assigned_workers=batch_assigned_workers,
+            )
+            if not worker_id:
+                logger.warning(
+                    "No local worker with capacity for batch offer task=%s",
+                    offer.get("task_id"),
+                )
+                failed += 1
+                continue
+
+            if await self.deliver_task_offer(worker_id, offer):
+                delivered += 1
+                batch_assigned_workers.add(worker_id)
+                ip = self._get_profile(worker_id).ip.strip()
+                if ip:
+                    batch_used_ips.add(ip)
+            else:
+                failed += 1
+                logger.warning(
+                    "Failed to forward task offer to local worker: worker=%s task=%s",
+                    worker_id,
+                    offer.get("task_id"),
+                )
+
+        return delivered, failed
 
     async def handle_worker_message(self, worker_id: str, raw: str) -> None:
         """Process an inbound message from a connected worker."""
@@ -114,14 +292,29 @@ class WorkerGateway:
 
         msg_type = msg.get("type")
         if msg_type == "worker_hello":
+            ip = str(msg.get("ip") or "").strip()
+            max_tasks_raw = msg.get("max_concurrent_tasks")
             worker_version = str(msg.get("worker_version") or "").strip()
-            if worker_version:
-                self._worker_versions[worker_id] = worker_version
-            logger.info(
-                "Worker hello: %s version=%s max_tasks=%s",
+            max_concurrent: Optional[int] = None
+            if max_tasks_raw is not None:
+                try:
+                    max_concurrent = int(max_tasks_raw)
+                except (TypeError, ValueError):
+                    max_concurrent = None
+            self.update_worker_hello(
                 worker_id,
-                worker_version or self._worker_versions.get(worker_id) or "?",
-                msg.get("max_concurrent_tasks"),
+                ip=ip or None,
+                max_concurrent_tasks=max_concurrent,
+                worker_version=worker_version or None,
+            )
+            profile = self._get_profile(worker_id)
+            logger.info(
+                "Worker hello: %s version=%s ip=%s max_tasks=%d active=%d",
+                worker_id,
+                profile.worker_version or "?",
+                profile.ip or "?",
+                profile.max_concurrent_tasks,
+                profile.active_count,
             )
         elif msg_type in ("task_accept", "task_reject"):
             task_id = msg.get("task_id") or msg.get("offer_id")
@@ -130,6 +323,9 @@ class WorkerGateway:
                 f"task={short_id(task_id)} offer={short_id(msg.get('offer_id') or task_id)}"
             )
             await self._relay_task_decision(worker_id, msg)
+            if msg_type == "task_reject":
+                offer_id = msg.get("offer_id") or msg.get("task_id")
+                self.mark_worker_idle(worker_id, str(offer_id) if offer_id else None)
         elif msg_type == "task_result":
             log_relay(
                 f"worker ws <- recv type=task_result worker={short_id(worker_id)} "
@@ -137,6 +333,8 @@ class WorkerGateway:
                 f"success={msg.get('success')} bytes={msg.get('bytes_transferred')}"
             )
             await self._relay_task_result(worker_id, msg)
+            offer_id = msg.get("offer_id") or msg.get("task_id")
+            self.mark_worker_idle(worker_id, str(offer_id) if offer_id else None)
         else:
             logger.debug("Unhandled worker message type %s from %s", msg_type, worker_id)
 
