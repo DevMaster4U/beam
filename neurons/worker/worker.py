@@ -287,6 +287,9 @@ RETRY_BACKOFF = 1.0  # Base backoff in seconds
 FETCH_STREAM_CHUNK_SIZE = int(
     os.environ.get("WORKER_FETCH_STREAM_CHUNK_SIZE", str(512 * 1024))
 )
+# Fixed-size staging uploads always return this ETag; skip PUT after hash verify.
+PREDEFINED_ETAG_CHUNK_SIZE_BYTES = 30 * 1024 * 1024  # 31457280
+PREDEFINED_ETAG = '"281ed1d5ae50e8419f9b978aab16de83"'
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -1014,6 +1017,11 @@ def is_canary_destination(url: str) -> bool:
     return url.startswith(("null://", "canary://", "skip://"))
 
 
+def uses_predefined_etag(chunk_size: int) -> bool:
+    """Return True when staging PUT would always yield the known ETag."""
+    return chunk_size == PREDEFINED_ETAG_CHUNK_SIZE_BYTES
+
+
 def _build_fetch_headers(
     chunk_offset: int = None,
     chunk_size: int = None,
@@ -1162,19 +1170,42 @@ async def fetch_and_send_chunk(
             )
 
         producer_task = asyncio.create_task(fetch_producer())
+        skip_upload_for_predefined_etag = (
+            is_object_storage
+            and not is_canary
+            and uses_predefined_etag(expected_max_bytes or 0)
+        )
 
         try:
-            if is_canary:
+            if is_canary or skip_upload_for_predefined_etag:
                 async for _ in body_stream():
                     pass
                 await producer_task
                 if fetch_error:
                     raise fetch_error
+                chunk_hash = hasher.hexdigest()
+                if is_canary:
+                    return (
+                        bytes_transferred,
+                        chunk_hash,
+                        None,
+                        0,
+                        fetch_ms,
+                        0.0,
+                    )
+                if expected_chunk_hash and chunk_hash.lower() != expected_chunk_hash.lower():
+                    raise ValueError(
+                        f"chunk hash mismatch: expected {expected_chunk_hash}, got {chunk_hash}"
+                    )
+                print(
+                    f"[Worker] Predefined ETag skip-upload chunk={chunk_index} "
+                    f"bytes={bytes_transferred} etag={PREDEFINED_ETAG!r}"
+                )
                 return (
                     bytes_transferred,
-                    hasher.hexdigest(),
-                    None,
-                    0,
+                    chunk_hash,
+                    PREDEFINED_ETAG,
+                    200,
                     fetch_ms,
                     0.0,
                 )

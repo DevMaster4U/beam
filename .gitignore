@@ -42,6 +42,8 @@ env/
 .env.*
 *.env
 !.env.example
+servers.credentials
+config/servers.credentials
 
 # Logs
 logs/
