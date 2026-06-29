@@ -140,6 +140,7 @@ class SubnetCoreClient:
         # In-process worker gateway (set after init)
         self._worker_gateway = None
         self._global_gateway_client: Optional[Any] = None
+        self._embedded_worker_pool: Optional[Any] = None
 
         # orch-gateway → BeamCore upstream relay (independent of orch ↔ orch-gateway edge socket)
         self._beamcore_upstream_degraded: bool = False
@@ -808,6 +809,20 @@ class SubnetCoreClient:
             logger.warning("worker_task_offer_batch missing offers: batch=%s", batch_id)
             return
 
+        if self._embedded_worker_pool is not None:
+            delivered, failed = await self._embedded_worker_pool.deliver_task_offer_batch(
+                str(batch_id or "unknown"),
+                [o for o in offers if isinstance(o, dict)],
+            )
+            logger.info(
+                "worker_task_offer_batch handled by embedded workers: batch=%s offers=%s delivered=%s failed=%s",
+                batch_id,
+                len(offers),
+                delivered,
+                failed,
+            )
+            return
+
         if self._global_gateway_client:
             sent, failed = await self._global_gateway_client.send_task_offer_batch(
                 str(batch_id or "unknown"),
@@ -953,6 +968,10 @@ class SubnetCoreClient:
         """Wire in the in-process WorkerGateway so task offer batches are dispatched."""
         self._worker_gateway = gateway
         gateway.set_upstream(self)
+
+    def set_embedded_worker_pool(self, pool: Any) -> None:
+        """Use in-process embedded workers instead of an external worker gateway."""
+        self._embedded_worker_pool = pool
 
     def set_global_gateway_client(self, client: Any) -> None:
         """Use shared global worker gateway for task offer delivery and worker relay."""

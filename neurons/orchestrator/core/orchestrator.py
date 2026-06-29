@@ -370,6 +370,9 @@ class Orchestrator:
         # Global gateway control client (mode=global)
         self.global_gateway_client: Optional[Any] = None
 
+        # Embedded workers (mode=embedded)
+        self.embedded_worker_pool: Optional[Any] = None
+
         # Async control
         self._running: bool = False
         self._background_tasks: List[asyncio.Task] = []
@@ -406,7 +409,7 @@ class Orchestrator:
 
     def _on_worker_gateway_ready_change(self, ready: bool) -> None:
         """Toggle orchestrator readiness when the first/last local worker connects."""
-        if self.settings.worker_gateway_mode in ("global", "coordinator"):
+        if self.settings.worker_gateway_mode in ("global", "coordinator", "embedded"):
             return
         if self._routing_paused:
             return
@@ -461,7 +464,12 @@ class Orchestrator:
             )
         else:
             mode = self.settings.worker_gateway_mode
-            if mode == "in_process":
+            if mode == "embedded":
+                should_ready = (
+                    self.embedded_worker_pool is not None
+                    and self.embedded_worker_pool.worker_count > 0
+                ) or bool(self.settings.ready)
+            elif mode == "in_process":
                 should_ready = (
                     self.worker_gateway.connected_count > 0 or bool(self.settings.ready)
                 )
@@ -633,6 +641,10 @@ class Orchestrator:
         if self.global_gateway_client:
             await self.global_gateway_client.stop()
             self.global_gateway_client = None
+
+        if self.embedded_worker_pool is not None:
+            await self.embedded_worker_pool.stop()
+            self.embedded_worker_pool = None
 
         logger.info("Orchestrator stopped")
 
@@ -1171,7 +1183,20 @@ class Orchestrator:
             self.subnet_core_client.set_worker_gateway(self.worker_gateway)
 
             gateway_mode = (self.settings.worker_gateway_mode or "in_process").strip().lower()
-            if gateway_mode in ("global", "coordinator"):
+            if gateway_mode == "embedded":
+                from core.embedded_workers import EmbeddedWorkerPool
+
+                self.embedded_worker_pool = EmbeddedWorkerPool(
+                    self.settings,
+                    self.subnet_core_client,
+                )
+                await self.embedded_worker_pool.start()
+                self.subnet_core_client.set_embedded_worker_pool(self.embedded_worker_pool)
+                logger.info(
+                    "Embedded worker pool started: %s worker(s)",
+                    self.embedded_worker_pool.worker_count,
+                )
+            elif gateway_mode in ("global", "coordinator"):
                 control_secret = self.settings.orchestrator_gateway_secret
                 if not control_secret:
                     raise ValueError(
@@ -1256,6 +1281,8 @@ class Orchestrator:
                     else f"http://{local_ip}:{self.settings.api_port}"
                 )
             )
+            if gateway_mode == "embedded":
+                gateway_url = self.settings.worker_gateway_url or f"http://{local_ip}:{self.settings.api_port}"
             self.subnet_core_client.set_registration_config(
                 url=orch_url,
                 region=self.settings.region,

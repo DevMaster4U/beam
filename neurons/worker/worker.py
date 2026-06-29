@@ -216,8 +216,11 @@ def _load_workspace_env() -> None:
         sys.exit(2)
 
 
-_load_workspace_env()
-configure_worker_logging()
+if os.environ.get("BEAM_SKIP_WORKER_BOOTSTRAP") != "1":
+    _load_workspace_env()
+    configure_worker_logging()
+elif not LOADED_ENV_FILES:
+    _load_workspace_env()
 
 # =============================================================================
 # Configuration
@@ -369,6 +372,7 @@ class FetchReadyState:
     chunk_hash: str = ""
     fetch_ms: float = 0.0
     etag: Optional[str] = None
+    buffer: Optional[bytes] = None
 
     def signal_ready(
         self,
@@ -376,17 +380,199 @@ class FetchReadyState:
         chunk_hash: str,
         fetch_ms: float,
         etag: str,
+        buffer: Optional[bytes] = None,
     ) -> None:
         self.bytes_transferred = bytes_transferred
         self.chunk_hash = chunk_hash
         self.fetch_ms = fetch_ms
         self.etag = etag
+        self.buffer = buffer
         self.ready = True
         self.event.set()
 
     def signal_error(self, error: str) -> None:
         self.error = error
         self.event.set()
+
+
+async def upload_buffered_predefined_etag(
+    client: httpx.AsyncClient,
+    *,
+    destination_url: str,
+    body: bytes,
+    chunk_hash: str,
+    transfer_id: str = "",
+    chunk_index: int = 0,
+    upload_offset: int = 0,
+    expected_max_bytes: int = 0,
+    total_size: int = 0,
+    extra_dest_headers: Optional[Dict[str, str]] = None,
+    auth_token: str = None,
+    task_id: str = None,
+    offer_id: str = None,
+) -> float:
+    """PUT/POST a buffered predefined-etag chunk; returns send_ms."""
+    is_object_storage = is_object_storage_presigned_url(destination_url)
+    send_started = time.perf_counter()
+
+    if is_object_storage:
+        send_headers = {"Content-Type": "application/octet-stream"}
+        if expected_max_bytes and expected_max_bytes > 0:
+            send_headers["Content-Length"] = str(expected_max_bytes)
+        if extra_dest_headers:
+            send_headers.update(extra_dest_headers)
+        response = await client.put(
+            destination_url,
+            content=body,
+            headers=send_headers,
+            timeout=SEND_TIMEOUT,
+        )
+    else:
+        send_headers = {
+            "Content-Type": "application/octet-stream",
+            "X-Transfer-ID": transfer_id,
+            "X-Chunk-ID": f"chunk_{chunk_index}",
+            "X-Offset": str(upload_offset),
+            "X-Length": str(expected_max_bytes or len(body)),
+            "X-Total-Size": str(total_size or 0),
+            "X-Chunk-SHA256": chunk_hash or "",
+        }
+        if expected_max_bytes and expected_max_bytes > 0:
+            send_headers["Content-Length"] = str(expected_max_bytes)
+        if extra_dest_headers:
+            send_headers.update(extra_dest_headers)
+        if auth_token:
+            send_headers["Authorization"] = f"Bearer {auth_token}"
+        response = await client.post(
+            destination_url,
+            content=body,
+            headers=send_headers,
+            timeout=SEND_TIMEOUT,
+        )
+
+    response.raise_for_status()
+    send_ms = (time.perf_counter() - send_started) * 1000
+    etag = response.headers.get("ETag") or response.headers.get("etag")
+    if is_object_storage:
+        print(
+            f"[Worker] Staging PUT ok chunk={chunk_index} "
+            f"bytes={len(body)} etag={etag!r} send_ms={send_ms:.1f} "
+            f"task={task_label(task_id)} offer={task_label(offer_id)}"
+        )
+    return send_ms
+
+
+async def run_predefined_etag_background_upload(
+    client: httpx.AsyncClient,
+    fetch_ready: FetchReadyState,
+    transfer_context: dict,
+    *,
+    task_id: str = None,
+    offer_id: str = None,
+) -> bool:
+    """Start upload as soon as the buffered download finishes (even before accept ack)."""
+    await fetch_ready.event.wait()
+    if fetch_ready.error or not fetch_ready.ready or not fetch_ready.buffer:
+        return False
+
+    chunk_size = int(transfer_context["chunk_size"])
+    range_start = int(transfer_context["range_start"])
+    dest_headers = transfer_context.get("dest_headers") or {}
+
+    print(
+        f"[Worker] Predefined ETag background upload starting "
+        f"bytes={len(fetch_ready.buffer)} task={task_label(task_id)} "
+        f"offer={task_label(offer_id)}"
+    )
+    try:
+        await upload_buffered_predefined_etag(
+            client,
+            destination_url=transfer_context["dest_url"],
+            body=fetch_ready.buffer,
+            chunk_hash=fetch_ready.chunk_hash,
+            transfer_id=str(transfer_context.get("transfer_id") or task_id or ""),
+            chunk_index=0,
+            upload_offset=range_start,
+            expected_max_bytes=chunk_size,
+            total_size=chunk_size,
+            extra_dest_headers=dest_headers or None,
+            task_id=task_id,
+            offer_id=offer_id,
+        )
+        print(
+            f"[Worker] Predefined ETag background upload complete "
+            f"task={task_label(task_id)} offer={task_label(offer_id)}"
+        )
+        return True
+    except Exception as exc:
+        print(
+            f"[Worker] Predefined ETag background upload failed "
+            f"task={task_label(task_id)} offer={task_label(offer_id)} "
+            f"error={exception_detail(exc)}{http_status_detail(exc)}"
+        )
+        return False
+
+
+async def wait_accept_and_buffered_fetch(
+    accept_coro,
+    fetch_ready: FetchReadyState,
+    *,
+    accept_timeout: float,
+    fetch_timeout: float,
+) -> tuple[bool, Optional[str]]:
+    """Wait for accept ack and buffered download+hash; fail fast on reject."""
+    accept_task = asyncio.create_task(asyncio.wait_for(accept_coro, timeout=accept_timeout))
+    fetch_task = asyncio.create_task(
+        asyncio.wait_for(fetch_ready.event.wait(), timeout=fetch_timeout)
+    )
+    pending = {accept_task, fetch_task}
+
+    try:
+        while pending:
+            done, pending = await asyncio.wait(
+                pending,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if accept_task in done:
+                try:
+                    accepted = accept_task.result()
+                except asyncio.TimeoutError:
+                    fetch_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await fetch_task
+                    return False, f"task_accept_ack timeout ({accept_timeout:.0f}s)"
+                except Exception as exc:
+                    fetch_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await fetch_task
+                    return False, str(exc)
+                if not accepted:
+                    fetch_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await fetch_task
+                    return False, "task_accept rejected"
+
+            if fetch_task in done:
+                try:
+                    fetch_task.result()
+                except asyncio.TimeoutError:
+                    accept_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await accept_task
+                    return False, f"download timeout ({fetch_timeout:.0f}s)"
+                except Exception as exc:
+                    accept_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await accept_task
+                    return False, str(exc)
+
+        if fetch_ready.error or not fetch_ready.ready:
+            return True, fetch_ready.error or "download failed"
+        return True, None
+    except asyncio.CancelledError:
+        accept_task.cancel()
+        fetch_task.cancel()
+        raise
 
 
 @dataclass
@@ -1124,6 +1310,12 @@ async def fetch_and_send_chunk(
     upload_offset = (
         send_chunk_offset if send_chunk_offset is not None else (chunk_offset or 0)
     )
+    signal_fetch_ready = (
+        fetch_ready is not None
+        and is_object_storage
+        and not is_canary
+        and uses_predefined_etag(expected_max_bytes or 0)
+    )
 
     for attempt in range(MAX_RETRIES):
         queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=32)
@@ -1135,96 +1327,164 @@ async def fetch_and_send_chunk(
         fetch_ms = 0.0
         send_ms = 0.0
 
-        async def fetch_producer() -> None:
-            nonlocal bytes_transferred, fetch_error, fetch_ms
-            try:
-                async with client.stream(
-                    "GET", source_url, headers=fetch_headers, timeout=FETCH_TIMEOUT
-                ) as response:
-                    if response.status_code not in (200, 206):
-                        response.raise_for_status()
+        try:
+            if signal_fetch_ready:
+                buffer = bytearray()
+                hasher = hashlib.sha256()
+                bytes_transferred = 0
+                fetch_started = time.perf_counter()
+                try:
+                    async with client.stream(
+                        "GET", source_url, headers=fetch_headers, timeout=FETCH_TIMEOUT
+                    ) as response:
+                        if response.status_code not in (200, 206):
+                            response.raise_for_status()
 
-                    if expected_max_bytes and expected_max_bytes > 0:
-                        content_length = response.headers.get("Content-Length")
-                        if content_length:
-                            response_size = int(content_length)
-                            if response_size > expected_max_bytes:
-                                raise ValueError(
-                                    f"response too large: {response_size} bytes > "
-                                    f"expected {expected_max_bytes}"
-                                )
+                        if expected_max_bytes and expected_max_bytes > 0:
+                            content_length = response.headers.get("Content-Length")
+                            if content_length:
+                                response_size = int(content_length)
+                                if response_size > expected_max_bytes:
+                                    raise ValueError(
+                                        f"response too large: {response_size} bytes > "
+                                        f"expected {expected_max_bytes}"
+                                    )
 
-                    async for part in response.aiter_bytes(chunk_size=FETCH_STREAM_CHUNK_SIZE):
-                        hasher.update(part)
-                        bytes_transferred += len(part)
-                        if (
-                            expected_max_bytes
-                            and expected_max_bytes > 0
-                            and bytes_transferred > expected_max_bytes
+                        async for part in response.aiter_bytes(
+                            chunk_size=FETCH_STREAM_CHUNK_SIZE
                         ):
-                            raise ValueError(
-                                f"response exceeded expected size while streaming: "
-                                f"{bytes_transferred} bytes > expected {expected_max_bytes}"
-                            )
-                        await queue.put(part)
-            except Exception as exc:
-                fetch_error = exc
-            finally:
-                await queue.put(None)
+                            hasher.update(part)
+                            buffer.extend(part)
+                            bytes_transferred += len(part)
+                            if (
+                                expected_max_bytes
+                                and expected_max_bytes > 0
+                                and bytes_transferred > expected_max_bytes
+                            ):
+                                raise ValueError(
+                                    f"response exceeded expected size while buffering: "
+                                    f"{bytes_transferred} bytes > expected {expected_max_bytes}"
+                                )
+                except Exception as exc:
+                    fetch_ready.signal_error(exception_detail(exc))
+                    raise
+
                 fetch_ms = (time.perf_counter() - fetch_started) * 1000
+                chunk_hash = hasher.hexdigest()
+                if expected_chunk_hash and chunk_hash.lower() != expected_chunk_hash.lower():
+                    mismatch = (
+                        f"chunk hash mismatch: expected {expected_chunk_hash}, got {chunk_hash}"
+                    )
+                    fetch_ready.signal_error(mismatch)
+                    raise ValueError(mismatch)
 
-        async def body_stream():
-            while True:
-                part = await queue.get()
-                if part is None:
-                    break
-                yield part
+                print(
+                    f"[Worker] Predefined ETag buffered download chunk={chunk_index} "
+                    f"bytes={bytes_transferred} fetch_ms={fetch_ms:.1f} "
+                    f"etag={PREDEFINED_ETAG!r} (hash ready, upload deferred)"
+                )
+                body = bytes(buffer)
+                fetch_ready.signal_ready(
+                    bytes_transferred,
+                    chunk_hash,
+                    fetch_ms,
+                    PREDEFINED_ETAG,
+                    buffer=body,
+                )
+                return (
+                    bytes_transferred,
+                    chunk_hash,
+                    PREDEFINED_ETAG,
+                    200,
+                    fetch_ms,
+                    0.0,
+                )
 
-        async def stream_to_destination(chunk_hash_header: Optional[str]) -> httpx.Response:
-            if is_object_storage:
-                send_headers = {"Content-Type": "application/octet-stream"}
+            async def fetch_producer() -> None:
+                nonlocal bytes_transferred, fetch_error, fetch_ms
+                try:
+                    async with client.stream(
+                        "GET", source_url, headers=fetch_headers, timeout=FETCH_TIMEOUT
+                    ) as response:
+                        if response.status_code not in (200, 206):
+                            response.raise_for_status()
+
+                        if expected_max_bytes and expected_max_bytes > 0:
+                            content_length = response.headers.get("Content-Length")
+                            if content_length:
+                                response_size = int(content_length)
+                                if response_size > expected_max_bytes:
+                                    raise ValueError(
+                                        f"response too large: {response_size} bytes > "
+                                        f"expected {expected_max_bytes}"
+                                    )
+
+                        async for part in response.aiter_bytes(
+                            chunk_size=FETCH_STREAM_CHUNK_SIZE
+                        ):
+                            hasher.update(part)
+                            bytes_transferred += len(part)
+                            if (
+                                expected_max_bytes
+                                and expected_max_bytes > 0
+                                and bytes_transferred > expected_max_bytes
+                            ):
+                                raise ValueError(
+                                    f"response exceeded expected size while streaming: "
+                                    f"{bytes_transferred} bytes > expected {expected_max_bytes}"
+                                )
+                            await queue.put(part)
+                except Exception as exc:
+                    fetch_error = exc
+                finally:
+                    await queue.put(None)
+                    fetch_ms = (time.perf_counter() - fetch_started) * 1000
+
+            async def body_stream():
+                while True:
+                    part = await queue.get()
+                    if part is None:
+                        break
+                    yield part
+
+            async def stream_to_destination(chunk_hash_header: Optional[str]) -> httpx.Response:
+                if is_object_storage:
+                    send_headers = {"Content-Type": "application/octet-stream"}
+                    if expected_max_bytes and expected_max_bytes > 0:
+                        send_headers["Content-Length"] = str(expected_max_bytes)
+                    if extra_dest_headers:
+                        send_headers.update(extra_dest_headers)
+                    return await client.put(
+                        destination_url,
+                        content=body_stream(),
+                        headers=send_headers,
+                        timeout=SEND_TIMEOUT,
+                    )
+
+                send_headers = {
+                    "Content-Type": "application/octet-stream",
+                    "X-Transfer-ID": transfer_id,
+                    "X-Chunk-ID": f"chunk_{chunk_index}",
+                    "X-Offset": str(upload_offset),
+                    "X-Length": str(expected_max_bytes or bytes_transferred or 0),
+                    "X-Total-Size": str(total_size or 0),
+                    "X-Chunk-SHA256": chunk_hash_header or "",
+                }
                 if expected_max_bytes and expected_max_bytes > 0:
                     send_headers["Content-Length"] = str(expected_max_bytes)
                 if extra_dest_headers:
                     send_headers.update(extra_dest_headers)
-                return await client.put(
+                if auth_token:
+                    send_headers["Authorization"] = f"Bearer {auth_token}"
+                return await client.post(
                     destination_url,
                     content=body_stream(),
                     headers=send_headers,
                     timeout=SEND_TIMEOUT,
                 )
 
-            send_headers = {
-                "Content-Type": "application/octet-stream",
-                "X-Transfer-ID": transfer_id,
-                "X-Chunk-ID": f"chunk_{chunk_index}",
-                "X-Offset": str(upload_offset),
-                "X-Length": str(expected_max_bytes or bytes_transferred or 0),
-                "X-Total-Size": str(total_size or 0),
-                "X-Chunk-SHA256": chunk_hash_header or "",
-            }
-            if expected_max_bytes and expected_max_bytes > 0:
-                send_headers["Content-Length"] = str(expected_max_bytes)
-            if extra_dest_headers:
-                send_headers.update(extra_dest_headers)
-            if auth_token:
-                send_headers["Authorization"] = f"Bearer {auth_token}"
-            return await client.post(
-                destination_url,
-                content=body_stream(),
-                headers=send_headers,
-                timeout=SEND_TIMEOUT,
-            )
+            producer_task = asyncio.create_task(fetch_producer())
 
-        producer_task = asyncio.create_task(fetch_producer())
-        signal_fetch_ready = (
-            fetch_ready is not None
-            and is_object_storage
-            and not is_canary
-            and uses_predefined_etag(expected_max_bytes or 0)
-        )
-
-        try:
             if is_canary:
                 async for _ in body_stream():
                     pass
@@ -1247,8 +1507,6 @@ async def fetch_and_send_chunk(
                 send_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await send_task
-                if signal_fetch_ready:
-                    fetch_ready.signal_error(exception_detail(fetch_error))
                 raise fetch_error
 
             chunk_hash = hasher.hexdigest()
@@ -1256,35 +1514,14 @@ async def fetch_and_send_chunk(
                 send_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await send_task
-                mismatch = (
+                raise ValueError(
                     f"chunk hash mismatch: expected {expected_chunk_hash}, got {chunk_hash}"
-                )
-                if signal_fetch_ready:
-                    fetch_ready.signal_error(mismatch)
-                raise ValueError(mismatch)
-
-            if signal_fetch_ready:
-                print(
-                    f"[Worker] Predefined ETag download complete chunk={chunk_index} "
-                    f"bytes={bytes_transferred} fetch_ms={fetch_ms:.1f} "
-                    f"etag={PREDEFINED_ETAG!r} (upload continuing)"
-                )
-                fetch_ready.signal_ready(
-                    bytes_transferred,
-                    chunk_hash,
-                    fetch_ms,
-                    PREDEFINED_ETAG,
                 )
 
             response = await send_task
 
             response.raise_for_status()
             send_ms = (time.perf_counter() - send_started) * 1000
-
-            if expected_chunk_hash and chunk_hash.lower() != expected_chunk_hash.lower():
-                raise ValueError(
-                    f"chunk hash mismatch: expected {expected_chunk_hash}, got {chunk_hash}"
-                )
 
             etag = response.headers.get("ETag") or response.headers.get("etag")
             if is_object_storage:
@@ -1295,14 +1532,14 @@ async def fetch_and_send_chunk(
             return (
                 bytes_transferred,
                 chunk_hash,
-                etag if not signal_fetch_ready else PREDEFINED_ETAG,
+                etag,
                 response.status_code,
                 fetch_ms,
                 send_ms,
             )
 
         except Exception as e:
-            if not producer_task.done():
+            if "producer_task" in locals() and not producer_task.done():
                 producer_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await producer_task
@@ -1936,41 +2173,6 @@ async def _handle_ws_task_sequential_accept(
     return await _finalize_ws_task(websocket, state, task_id, offer_id, result)
 
 
-async def _await_predefined_etag_upload(
-    exec_task: asyncio.Task,
-    task_id: str,
-    offer_id: str,
-) -> None:
-    """Finish staging upload after task_result was sent with the predefined ETag."""
-    try:
-        exec_result = await exec_task
-    except asyncio.CancelledError:
-        print(
-            f"[Worker] [WS] Upload cancelled after early task_result: "
-            f"task={task_label(task_id)} offer={task_label(offer_id)}"
-        )
-        return
-    except Exception as exc:
-        print(
-            f"[Worker] [WS] Upload error after early task_result: "
-            f"task={task_label(task_id)} offer={task_label(offer_id)} error={exc}"
-        )
-        return
-
-    if exec_result.success:
-        print(
-            f"[Worker] [WS] Upload completed after early task_result: "
-            f"task={task_label(task_id)} offer={task_label(offer_id)}"
-        )
-        return
-
-    print(
-        f"[Worker] [WS] Upload failed after early task_result: "
-        f"task={task_label(task_id)} offer={task_label(offer_id)} "
-        f"error={exec_result.error_msg or 'unknown'}"
-    )
-
-
 async def _handle_ws_task_predefined_etag_early_result(
     state: WorkerState,
     websocket,
@@ -1981,7 +2183,7 @@ async def _handle_ws_task_predefined_etag_early_result(
     transfer_context: dict,
     deadline_us: int,
 ) -> bool:
-    """Download during accept; send task_result after fetch, upload continues."""
+    """Offer → parallel download + task_accept; submit when ack+hash; upload background."""
     fetch_ready = FetchReadyState()
     accept_future: asyncio.Future = asyncio.get_event_loop().create_future()
     state.pending_task_accepts[task_key] = accept_future
@@ -1997,9 +2199,18 @@ async def _handle_ws_task_predefined_etag_early_result(
             fetch_ready=fetch_ready,
         )
     )
+    upload_task = asyncio.create_task(
+        run_predefined_etag_background_upload(
+            state.http_client,
+            fetch_ready,
+            transfer_context,
+            task_id=task_id,
+            offer_id=offer_id,
+        )
+    )
 
     print(
-        f"[Worker] [WS] Predefined ETag early transfer + task_accept: "
+        f"[Worker] [WS] Predefined ETag: download + task_accept in parallel: "
         f"task={task_label(task_id)} offer={task_label(offer_id)}"
     )
 
@@ -2008,73 +2219,57 @@ async def _handle_ws_task_predefined_etag_early_result(
             state.pending_task_accepts.pop(task_key, None)
             print("[Worker] [WS] Failed to send task_accept")
             await _cancel_exec_task(exec_task, task_id, offer_id)
+            upload_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await upload_task
             return False
 
         print(
-            f"[Worker] [WS] Sent task_accept, awaiting ack: "
+            f"[Worker] [WS] Sent task_accept, waiting for ack + buffered hash: "
             f"task={task_label(task_id)} offer={task_label(offer_id)}"
         )
 
-        try:
-            server_accepted = await asyncio.wait_for(
-                accept_future, timeout=WS_TASK_ACCEPT_ACK_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            state.pending_task_accepts.pop(task_key, None)
-            print(
-                f"[Worker] [WS] task_accept_ack timeout ({WS_TASK_ACCEPT_ACK_TIMEOUT}s): "
-                f"task={task_label(task_id)} offer={task_label(offer_id)}"
-            )
-            await _cancel_exec_task(exec_task, task_id, offer_id)
-            return False
-
-        if not server_accepted:
-            print(
-                f"[Worker] [WS] task_accept_ack rejected, aborting transfer: "
-                f"task={task_label(task_id)} offer={task_label(offer_id)}"
-            )
-            if exec_task.done():
-                print(
-                    f"[Worker] [WS] Transfer finished before reject — discarding result: "
-                    f"task={task_label(task_id)} offer={task_label(offer_id)}"
-                )
-            else:
-                await _cancel_exec_task(exec_task, task_id, offer_id)
-            return False
-
-        print(
-            f"[Worker] [WS] task_accept_ack OK: task={task_label(task_id)} "
-            f"offer={task_label(offer_id)}"
+        accepted, wait_error = await wait_accept_and_buffered_fetch(
+            accept_future,
+            fetch_ready,
+            accept_timeout=WS_TASK_ACCEPT_ACK_TIMEOUT,
+            fetch_timeout=FETCH_TIMEOUT + 5.0,
         )
+        state.pending_task_accepts.pop(task_key, None)
 
-        fetch_timeout = FETCH_TIMEOUT + 5.0
-        try:
-            await asyncio.wait_for(fetch_ready.event.wait(), timeout=fetch_timeout)
-        except asyncio.TimeoutError:
-            await _cancel_exec_task(exec_task, task_id, offer_id)
-            result = TaskExecutionResult(
-                success=False,
-                bytes_transferred=0,
-                duration_ms=0.0,
-                error_msg=f"download timeout ({fetch_timeout:.0f}s)",
+        if not accepted:
+            print(
+                f"[Worker] [WS] Stopping download: task={task_label(task_id)} "
+                f"offer={task_label(offer_id)} reason={wait_error}"
             )
-            return await _finalize_ws_task(websocket, state, task_id, offer_id, result)
+            await _cancel_exec_task(exec_task, task_id, offer_id)
+            upload_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await upload_task
+            return False
 
-        if fetch_ready.error or not fetch_ready.ready:
+        if wait_error:
             if not exec_task.done():
                 await _cancel_exec_task(exec_task, task_id, offer_id)
             else:
                 with contextlib.suppress(asyncio.CancelledError):
                     await exec_task
+            upload_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await upload_task
             result = TaskExecutionResult(
                 success=False,
                 bytes_transferred=fetch_ready.bytes_transferred,
                 duration_ms=round(fetch_ready.fetch_ms, 1),
                 chunk_hash=fetch_ready.chunk_hash,
-                error_msg=fetch_ready.error or "download failed",
+                error_msg=wait_error,
             )
             return await _finalize_ws_task(websocket, state, task_id, offer_id, result)
 
+        print(
+            f"[Worker] [WS] accept_ack + hash ready, submitting task_result: "
+            f"task={task_label(task_id)} offer={task_label(offer_id)}"
+        )
         result = TaskExecutionResult(
             success=True,
             bytes_transferred=fetch_ready.bytes_transferred,
@@ -2083,12 +2278,46 @@ async def _handle_ws_task_predefined_etag_early_result(
             etag=fetch_ready.etag or PREDEFINED_ETAG,
         )
         finalized = await _finalize_ws_task(websocket, state, task_id, offer_id, result)
-        asyncio.create_task(_await_predefined_etag_upload(exec_task, task_id, offer_id))
+        asyncio.create_task(_await_predefined_etag_upload_task(upload_task, task_id, offer_id))
         return finalized
     except asyncio.CancelledError:
         if not exec_task.done():
             exec_task.cancel()
+        upload_task.cancel()
         raise
+
+
+async def _await_predefined_etag_upload_task(
+    upload_task: asyncio.Task,
+    task_id: str,
+    offer_id: str,
+) -> None:
+    """Wait for background buffered upload after task_result was submitted."""
+    try:
+        ok = await upload_task
+    except asyncio.CancelledError:
+        print(
+            f"[Worker] [WS] Upload cancelled: task={task_label(task_id)} "
+            f"offer={task_label(offer_id)}"
+        )
+        return
+    except Exception as exc:
+        print(
+            f"[Worker] [WS] Upload error: task={task_label(task_id)} "
+            f"offer={task_label(offer_id)} error={exc}"
+        )
+        return
+
+    if ok:
+        print(
+            f"[Worker] [WS] Background upload finished after task_result: "
+            f"task={task_label(task_id)} offer={task_label(offer_id)}"
+        )
+    else:
+        print(
+            f"[Worker] [WS] Background upload failed after task_result: "
+            f"task={task_label(task_id)} offer={task_label(offer_id)}"
+        )
 
 
 async def _handle_ws_task_early_transfer(

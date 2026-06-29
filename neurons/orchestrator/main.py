@@ -108,6 +108,8 @@ async def lifespan(app: FastAPI):
     logger.info(f"API: http://{settings.api_host}:{settings.api_port}")
     if settings.worker_gateway_worker_secret:
         logger.info("Worker gateway: WORKER_GATEWAY_SECRET configured (workers must authenticate)")
+    elif (settings.worker_gateway_mode or "in_process").strip().lower() == "embedded":
+        logger.info("Worker gateway: embedded mode — workers run in-process (no external WS)")
     else:
         logger.warning(
             "Worker gateway: WORKER_GATEWAY_SECRET is not set — all worker WebSocket connections will be rejected"
@@ -203,7 +205,7 @@ Monitor the Orchestrator's health and view metrics.
 ### Orchestrators
 Registration and readiness endpoints for BeamCore communication.
     """,
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
@@ -229,11 +231,11 @@ app.include_router(health.router)
 app.include_router(orchestrators.router)
 _settings = get_settings()
 _gateway_mode = (_settings.worker_gateway_mode or "in_process").strip().lower()
-if _gateway_mode not in ("global", "coordinator"):
+if _gateway_mode not in ("global", "coordinator", "embedded"):
     app.include_router(workers.router)
 else:
     logger.info(
-        "WORKER_GATEWAY_MODE=%s — worker WS served by pool coordinator, not this process",
+        "WORKER_GATEWAY_MODE=%s — worker WS not served by this process",
         _gateway_mode,
     )
 
@@ -248,7 +250,7 @@ async def root():
     """Root endpoint with API info."""
     return {
         "service": "BEAM Orchestrator",
-        "version": "0.1.0",
+        "version": "0.2.0",
         "description": "Central coordinator for decentralized bandwidth mining",
         "docs": "/docs",
         "health": "/health",
