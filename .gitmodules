@@ -1,3 +1,6 @@
 [submodule "sn_origin"]
 	path = sn_origin
 	url = https://github.com/Beam-Network/beam.git
+[submodule "beam-core"]
+	path = beam-core
+	url = https://github.com/Beam-Network/beam-core-public.git
