@@ -1351,6 +1351,70 @@ def uses_predefined_etag_early_submit(transfer_context: dict) -> bool:
     )
 
 
+def predefined_etag_early_submit_skip_reasons(transfer_context: dict) -> list[str]:
+    """Explain why the predefined ETag fast path is not used."""
+    if not WORKER_PREDEFINED_ETAG_EARLY_SUBMIT:
+        return []
+    if uses_predefined_etag_early_submit(transfer_context):
+        return []
+
+    reasons: list[str] = []
+    chunk_size = int(transfer_context.get("chunk_size") or 0)
+    dest_url = str(transfer_context.get("dest_url") or "")
+    source_url = str(transfer_context.get("source_url") or "")
+
+    if not uses_predefined_etag(chunk_size):
+        reasons.append(
+            f"chunk_size={chunk_size} expected={PREDEFINED_ETAG_CHUNK_SIZE_BYTES}"
+        )
+    if is_canary_destination(dest_url):
+        reasons.append("canary_destination")
+    elif not is_object_storage_presigned_url(dest_url):
+        reasons.append("dest_not_presigned_object_storage")
+    if not matches_predefined_etag_source(source_url):
+        reasons.append(
+            "source_url_mismatch "
+            f"got={normalized_capability_url(source_url)!r} "
+            f"expected={normalized_capability_url(PREDEFINED_ETAG_SOURCE_URL)!r}"
+        )
+    if not matches_predefined_etag_file_size(transfer_context):
+        reasons.append(
+            "file_size_mismatch "
+            f"total_size={transfer_context.get('total_size')} "
+            f"range={transfer_context.get('range_start')}-{transfer_context.get('range_end')} "
+            f"expected={PREDEFINED_ETAG_SOURCE_FILE_SIZE}"
+        )
+    return reasons
+
+
+def format_task_offer_log(offer: dict) -> str:
+    """Serialize a task offer for logs with signed URLs redacted."""
+    payload = dict(offer)
+    for key in ("source_url", "dest_url"):
+        if key in payload:
+            payload[key] = redact_url(str(payload[key]))
+    return json.dumps(payload, separators=(",", ":"), default=str)
+
+
+def log_predefined_etag_fast_path_skipped(
+    offer: dict,
+    transfer_context: dict,
+    *,
+    log_prefix: str = "[Worker]",
+) -> None:
+    """Log when WORKER_PREDEFINED_ETAG_EARLY_SUBMIT is on but fast path cannot run."""
+    reasons = predefined_etag_early_submit_skip_reasons(transfer_context)
+    if not reasons:
+        return
+    task_id = offer.get("task_id") or offer.get("offer_id")
+    offer_id = offer.get("offer_id") or task_id
+    print(
+        f"{log_prefix} Predefined ETag fast path skipped "
+        f"task={task_label(task_id)} offer={task_label(offer_id)} "
+        f"reasons={'; '.join(reasons)} offer_msg={format_task_offer_log(offer)}"
+    )
+
+
 def _build_fetch_headers(
     chunk_offset: int = None,
     chunk_size: int = None,
@@ -2547,6 +2611,10 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
         )
         return False
     reserved_capacity = True
+
+    log_predefined_etag_fast_path_skipped(
+        task, transfer_context, log_prefix="[Worker] [WS]"
+    )
 
     try:
         remaining_sec = remaining_deadline_seconds(deadline_us)

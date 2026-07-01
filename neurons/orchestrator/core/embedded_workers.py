@@ -310,6 +310,10 @@ class EmbeddedWorkerPool:
                 await self._send_reject(worker, task_id, offer_id, capacity_error)
                 return
 
+            transfer.log_predefined_etag_fast_path_skipped(
+                offer, transfer_context, log_prefix="[Embedded]"
+            )
+
             if transfer.uses_predefined_etag_early_submit(transfer_context):
                 await self._handle_predefined_etag_offer(
                     worker,

@@ -115,6 +115,47 @@ def log_task_offer_batch(batch_id: Any, offers: list[dict]) -> None:
     if BATCH_DETAIL_LOG:
         for line in lines[1:]:
             _log.info(line)
+    _log_predefined_etag_batch_skips(batch_id, valid_offers)
+
+
+def _log_predefined_etag_batch_skips(batch_id: Any, offers: list[dict]) -> None:
+    """Log offer payload when predefined ETag fast path is enabled but skipped."""
+    try:
+        from core.transfer_loader import get_transfer_module
+
+        transfer = get_transfer_module()
+    except Exception as exc:
+        _log.debug("predefined_etag skip logging unavailable: %s", exc)
+        return
+
+    if not transfer.WORKER_PREDEFINED_ETAG_EARLY_SUBMIT:
+        return
+
+    for offer in offers:
+        transfer_context, validation_error = transfer.build_transfer_context(offer)
+        if validation_error or transfer_context is None:
+            _log.info(
+                "predefined_etag_skipped batch=%s task=%s offer=%s "
+                "reasons=invalid_offer:%s offer_msg=%s",
+                short_id(batch_id, 12),
+                short_id(offer.get("task_id")),
+                short_id(offer.get("offer_id")),
+                validation_error or "unknown",
+                transfer.format_task_offer_log(offer),
+            )
+            continue
+
+        reasons = transfer.predefined_etag_early_submit_skip_reasons(transfer_context)
+        if not reasons:
+            continue
+        _log.info(
+            "predefined_etag_skipped batch=%s task=%s offer=%s reasons=%s offer_msg=%s",
+            short_id(batch_id, 12),
+            short_id(offer.get("task_id")),
+            short_id(offer.get("offer_id")),
+            "; ".join(reasons),
+            transfer.format_task_offer_log(offer),
+        )
 
 
 def relay_summary(payload: dict) -> str:
