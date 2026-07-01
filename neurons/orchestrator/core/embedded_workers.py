@@ -298,11 +298,45 @@ class EmbeddedWorkerPool:
         failed = 0
         batch_used_ips: set[str] = set()
         batch_assigned_workers: set[str] = set()
+        transfer = get_transfer_module()
 
         for offer in offers:
             if not isinstance(offer, dict):
                 failed += 1
                 continue
+
+            task_id = str(offer.get("task_id") or offer.get("offer_id") or "")
+            offer_id = str(offer.get("offer_id") or task_id or "")
+            transfer_context, validation_error = transfer.build_transfer_context(offer)
+            if validation_error or transfer_context is None:
+                logger.warning(
+                    "Embedded batch offer invalid: batch=%s task=%s offer=%s error=%s",
+                    short_id(batch_id, 12),
+                    short_id(task_id),
+                    short_id(offer_id),
+                    validation_error or "unknown",
+                )
+                failed += 1
+                continue
+            elif transfer.uses_predefined_etag_early_submit(transfer_context):
+                logger.info(
+                    "Embedded batch offer fast-path: batch=%s task=%s offer=%s chunk_size=%s",
+                    short_id(batch_id, 12),
+                    short_id(task_id),
+                    short_id(offer_id),
+                    transfer_context.get("chunk_size"),
+                )
+            else:
+                skip_reasons = transfer.predefined_etag_early_submit_skip_reasons(
+                    transfer_context
+                )
+                logger.info(
+                    "Embedded batch offer standard-path: batch=%s task=%s offer=%s reasons=%s",
+                    short_id(batch_id, 12),
+                    short_id(task_id),
+                    short_id(offer_id),
+                    "; ".join(skip_reasons) if skip_reasons else "early_submit_disabled",
+                )
 
             worker = self._select_worker(batch_used_ips, batch_assigned_workers)
             if worker is None:
@@ -315,12 +349,10 @@ class EmbeddedWorkerPool:
                 continue
 
             offer_id = str(offer.get("offer_id") or offer.get("task_id") or "")
-            worker.active_offer_ids.add(offer_id)
             batch_assigned_workers.add(worker.worker_id)
             if worker.ip:
                 batch_used_ips.add(worker.ip)
 
-            task_id = str(offer.get("task_id") or offer_id)
             logger.info(
                 "Embedded offer assigned: batch=%s task=%s offer=%s worker_slot=%s worker_id=%s",
                 short_id(batch_id, 12),
@@ -329,7 +361,9 @@ class EmbeddedWorkerPool:
                 worker.slot,
                 short_id(worker.worker_id),
             )
-            task = asyncio.create_task(self._handle_offer(worker, offer))
+            task = asyncio.create_task(
+                self._handle_offer(worker, offer, transfer_context)
+            )
             self._task_handles.add(task)
             task.add_done_callback(
                 lambda t, tid=task_id, oid=offer_id: self._log_offer_task_done(
@@ -338,6 +372,8 @@ class EmbeddedWorkerPool:
             )
             task.add_done_callback(self._task_handles.discard)
             delivered += 1
+
+        await asyncio.sleep(0)
 
         logger.info(
             "Embedded batch queued: batch=%s offers=%s delivered=%s failed=%s",
@@ -348,31 +384,30 @@ class EmbeddedWorkerPool:
         )
         return delivered, failed
 
-    async def _handle_offer(self, worker: EmbeddedWorker, offer: dict) -> None:
+    async def _handle_offer(
+        self,
+        worker: EmbeddedWorker,
+        offer: dict,
+        transfer_context: dict,
+    ) -> None:
         transfer = get_transfer_module()
         task_id = offer.get("task_id") or offer.get("offer_id")
         offer_id = offer.get("offer_id") or task_id
-        deadline_us = int(offer.get("deadline_us") or 0)
+        worker.active_offer_ids.add(str(offer_id or ""))
+        logger.info(
+            "Embedded offer handler started: task=%s offer=%s worker_slot=%s",
+            short_id(task_id),
+            short_id(offer_id),
+            worker.slot,
+        )
+
+        try:
+            deadline_us = int(offer.get("deadline_us") or 0)
+        except (TypeError, ValueError):
+            deadline_us = 0
         estimated_bytes = transfer.estimate_task_bytes(offer)
 
         try:
-            transfer_context, validation_error = transfer.build_transfer_context(offer)
-            if validation_error or transfer_context is None:
-                reason = (
-                    validation_error
-                    if validation_error == "unsupported_worker_version"
-                    else f"invalid_offer:{validation_error or 'unknown'}"
-                )
-                logger.warning(
-                    "Embedded rejecting offer: task=%s offer=%s worker_slot=%s reason=%s",
-                    short_id(task_id),
-                    short_id(offer_id),
-                    worker.slot,
-                    reason,
-                )
-                await self._send_reject(worker, task_id, offer_id, reason)
-                return
-
             capacity_error = self._reserve_capacity(worker, estimated_bytes)
             if capacity_error:
                 logger.warning(
@@ -515,6 +550,32 @@ class EmbeddedWorkerPool:
         transfer = get_transfer_module()
         offer_started_at = time.perf_counter()
         fetch_ready = transfer.FetchReadyState()
+        dest_url = str(transfer_context.get("dest_url") or "")
+        chunk_size = int(transfer_context.get("chunk_size") or 0)
+        source_url = str(transfer_context.get("source_url") or "")
+
+        if not transfer.should_buffer_predefined_etag_fetch(
+            fetch_ready,
+            source_url=source_url,
+            chunk_size=chunk_size,
+            is_object_storage=transfer.is_object_storage_presigned_url(dest_url),
+            is_canary=transfer.is_canary_destination(dest_url),
+        ):
+            logger.warning(
+                "Embedded predefined handler buffer gate mismatch; using standard transfer: "
+                "task=%s offer=%s",
+                short_id(task_id),
+                short_id(offer_id),
+            )
+            await self._handle_standard_offer(
+                worker,
+                offer,
+                task_id,
+                offer_id,
+                transfer_context,
+                deadline_us,
+            )
+            return
 
         exec_task = asyncio.create_task(
             transfer.execute_task_with_metrics(
@@ -572,6 +633,13 @@ class EmbeddedWorkerPool:
             return
 
         if wait_error:
+            logger.warning(
+                "Embedded predefined transfer failed: task=%s offer=%s worker=%s reason=%s",
+                short_id(task_id),
+                short_id(offer_id),
+                short_id(worker.worker_id),
+                wait_error,
+            )
             exec_task.cancel()
             upload_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

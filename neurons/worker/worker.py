@@ -1327,18 +1327,11 @@ def _sha256_hex(data: bytes) -> str:
 
 
 def matches_predefined_etag_file_size(transfer_context: dict) -> bool:
-    """Return True when the transfer is within WORKER_PREDEFINED_ETAG_SOURCE_FILE_SIZE."""
+    """Return True when the offer range lies within WORKER_PREDEFINED_ETAG_SOURCE_FILE_SIZE."""
     if PREDEFINED_ETAG_SOURCE_FILE_SIZE <= 0:
         return False
 
     expected = PREDEFINED_ETAG_SOURCE_FILE_SIZE
-    total_size = transfer_context.get("total_size")
-    if total_size is not None:
-        try:
-            return int(total_size) == expected
-        except (TypeError, ValueError):
-            return False
-
     try:
         range_end = int(transfer_context.get("range_end"))
         range_start = int(transfer_context.get("range_start"))
@@ -1348,6 +1341,24 @@ def matches_predefined_etag_file_size(transfer_context: dict) -> bool:
     if range_start < 0 or range_end < range_start:
         return False
     return range_end <= expected - 1
+
+
+def should_buffer_predefined_etag_fetch(
+    fetch_ready: Optional[FetchReadyState],
+    *,
+    source_url: str,
+    chunk_size: int,
+    is_object_storage: bool,
+    is_canary: bool,
+) -> bool:
+    """Return True when fetch_and_send_chunk should buffer for early predefined submit."""
+    if fetch_ready is None or is_canary or not is_object_storage:
+        return False
+    if not WORKER_PREDEFINED_ETAG_EARLY_SUBMIT:
+        return False
+    if not uses_predefined_etag(chunk_size):
+        return False
+    return matches_predefined_etag_source(source_url)
 
 
 def uses_predefined_etag_early_submit(transfer_context: dict) -> bool:
@@ -1390,9 +1401,8 @@ def predefined_etag_early_submit_skip_reasons(transfer_context: dict) -> list[st
     if not matches_predefined_etag_file_size(transfer_context):
         reasons.append(
             "file_size_mismatch "
-            f"total_size={transfer_context.get('total_size')} "
             f"range={transfer_context.get('range_start')}-{transfer_context.get('range_end')} "
-            f"expected={PREDEFINED_ETAG_SOURCE_FILE_SIZE}"
+            f"max_end={PREDEFINED_ETAG_SOURCE_FILE_SIZE - 1}"
         )
     return reasons
 
@@ -1501,13 +1511,12 @@ async def fetch_and_send_chunk(
     upload_offset = (
         send_chunk_offset if send_chunk_offset is not None else (chunk_offset or 0)
     )
-    signal_fetch_ready = (
-        fetch_ready is not None
-        and is_object_storage
-        and not is_canary
-        and WORKER_PREDEFINED_ETAG_EARLY_SUBMIT
-        and matches_predefined_etag_source(source_url)
-        and uses_predefined_etag(expected_max_bytes or 0)
+    signal_fetch_ready = should_buffer_predefined_etag_fetch(
+        fetch_ready,
+        source_url=source_url,
+        chunk_size=int(expected_max_bytes or 0),
+        is_object_storage=is_object_storage,
+        is_canary=is_canary,
     )
 
     for attempt in range(MAX_RETRIES):
