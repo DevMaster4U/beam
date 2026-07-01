@@ -13,7 +13,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, List, Optional, Set
 
 import bittensor as bt
 import httpx
