@@ -1415,6 +1415,26 @@ def log_predefined_etag_fast_path_skipped(
     )
 
 
+def predefined_etag_bytes_error(bytes_count: int, expected: int) -> Optional[str]:
+    """Return an error message when transferred bytes do not match expected size."""
+    if expected <= 0:
+        return None
+    if bytes_count == expected:
+        return None
+    return f"bytes_mismatch: got {bytes_count} expected {expected}"
+
+
+def validate_fetch_ready_bytes(
+    fetch_ready: FetchReadyState,
+    transfer_context: dict,
+) -> Optional[str]:
+    """Return error when buffered bytes are not exactly 30 MiB (triggers standard fallback)."""
+    return predefined_etag_bytes_error(
+        fetch_ready.bytes_transferred,
+        PREDEFINED_ETAG_CHUNK_SIZE_BYTES,
+    )
+
+
 def _build_fetch_headers(
     chunk_offset: int = None,
     chunk_size: int = None,
@@ -2336,6 +2356,50 @@ async def _handle_ws_task_sequential_accept(
     return await _finalize_ws_task(websocket, state, task_id, offer_id, result)
 
 
+async def _cancel_predefined_etag_tasks(
+    exec_task: asyncio.Task,
+    upload_task: asyncio.Task,
+    *,
+    task_id: str,
+    offer_id: str,
+) -> None:
+    if not exec_task.done():
+        await _cancel_exec_task(exec_task, task_id, offer_id)
+    else:
+        with contextlib.suppress(asyncio.CancelledError):
+            await exec_task
+    upload_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await upload_task
+
+
+async def _finalize_ws_standard_transfer_after_accept(
+    state: WorkerState,
+    websocket,
+    task: dict,
+    task_id: str,
+    offer_id: str,
+    transfer_context: dict,
+    deadline_us: int,
+    *,
+    reason: str,
+) -> bool:
+    """Run stream download+upload and submit with the real staging etag."""
+    print(
+        f"[Worker] [WS] Falling back to standard transfer ({reason}): "
+        f"task={task_label(task_id)} offer={task_label(offer_id)}"
+    )
+    result = await execute_task_with_metrics(
+        state,
+        task_id,
+        task,
+        transfer_context,
+        deadline_us,
+        log_prefix="[Worker] [WS]",
+    )
+    return await _finalize_ws_task(websocket, state, task_id, offer_id, result)
+
+
 async def _handle_ws_task_predefined_etag_early_result(
     state: WorkerState,
     websocket,
@@ -2429,6 +2493,22 @@ async def _handle_ws_task_predefined_etag_early_result(
                 error_msg=wait_error,
             )
             return await _finalize_ws_task(websocket, state, task_id, offer_id, result)
+
+        bytes_error = validate_fetch_ready_bytes(fetch_ready, transfer_context)
+        if bytes_error:
+            await _cancel_predefined_etag_tasks(
+                exec_task, upload_task, task_id=task_id, offer_id=offer_id
+            )
+            return await _finalize_ws_standard_transfer_after_accept(
+                state,
+                websocket,
+                task,
+                task_id,
+                offer_id,
+                transfer_context,
+                deadline_us,
+                reason=bytes_error,
+            )
 
         waited_sec = await wait_predefined_etag_min_submit_delay(offer_started_at)
         if waited_sec > 0:

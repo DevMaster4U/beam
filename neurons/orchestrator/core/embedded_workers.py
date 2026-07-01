@@ -481,6 +481,38 @@ class EmbeddedWorkerPool:
             )
             return
 
+        bytes_error = transfer.validate_fetch_ready_bytes(fetch_ready, transfer_context)
+        if bytes_error:
+            logger.info(
+                "Embedded falling back to standard transfer (%s): task=%s offer=%s",
+                bytes_error,
+                short_id(task_id),
+                short_id(offer_id),
+            )
+            exec_task.cancel()
+            upload_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await exec_task
+                await upload_task
+            result = await transfer.execute_task_with_metrics(
+                worker.state,
+                str(task_id),
+                offer,
+                transfer_context,
+                deadline_us,
+                log_prefix="[Embedded]",
+            )
+            await self._send_result(
+                worker,
+                task_id,
+                offer_id,
+                success=result.success,
+                chunk_hash=result.chunk_hash,
+                etag=result.etag,
+                error=result.error_msg,
+            )
+            return
+
         waited_sec = await transfer.wait_predefined_etag_min_submit_delay(offer_started_at)
         if waited_sec > 0:
             logger.info(
