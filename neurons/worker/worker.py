@@ -1872,7 +1872,10 @@ async def execute_transfer(
         chunk_hashes[chunk_index] = task_message["chunk_hash"]
 
     client = state.http_client
-    await prewarm_for_transfer(state, source_url, destination_url)
+    # Buffered predefined-etag path skips prewarm: HEAD on origin root adds latency
+    # without helping the signed Range GET on the object path.
+    if fetch_ready is None:
+        await prewarm_for_transfer(state, source_url, destination_url)
 
     total_bytes = 0
     is_canary = is_canary_destination(destination_url)
