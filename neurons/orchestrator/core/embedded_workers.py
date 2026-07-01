@@ -206,6 +206,34 @@ class EmbeddedWorkerPool:
                 hotkey[:16],
             )
 
+        logger.info(
+            "Embedded predefined ETag config: early_submit=%s max_parallel=%s "
+            "source_prefix=%r file_size=%s",
+            transfer.WORKER_PREDEFINED_ETAG_EARLY_SUBMIT,
+            transfer.PREDEFINED_ETAG_MAX_PARALLEL,
+            transfer.normalized_capability_url(transfer.PREDEFINED_ETAG_SOURCE_URL),
+            transfer.PREDEFINED_ETAG_SOURCE_FILE_SIZE,
+        )
+
+    def _log_offer_task_done(
+        self,
+        task: asyncio.Task,
+        *,
+        task_id: str,
+        offer_id: str,
+    ) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(
+                "Embedded offer task failed: task=%s offer=%s error=%s",
+                short_id(task_id),
+                short_id(offer_id),
+                exc,
+                exc_info=exc,
+            )
+
     async def stop(self) -> None:
         for task in list(self._task_handles):
             task.cancel()
@@ -292,8 +320,22 @@ class EmbeddedWorkerPool:
             if worker.ip:
                 batch_used_ips.add(worker.ip)
 
+            task_id = str(offer.get("task_id") or offer_id)
+            logger.info(
+                "Embedded offer assigned: batch=%s task=%s offer=%s worker_slot=%s worker_id=%s",
+                short_id(batch_id, 12),
+                short_id(task_id),
+                short_id(offer_id),
+                worker.slot,
+                short_id(worker.worker_id),
+            )
             task = asyncio.create_task(self._handle_offer(worker, offer))
             self._task_handles.add(task)
+            task.add_done_callback(
+                lambda t, tid=task_id, oid=offer_id: self._log_offer_task_done(
+                    t, task_id=tid, offer_id=oid
+                )
+            )
             task.add_done_callback(self._task_handles.discard)
             delivered += 1
 
@@ -321,17 +363,37 @@ class EmbeddedWorkerPool:
                     if validation_error == "unsupported_worker_version"
                     else f"invalid_offer:{validation_error or 'unknown'}"
                 )
+                logger.warning(
+                    "Embedded rejecting offer: task=%s offer=%s worker_slot=%s reason=%s",
+                    short_id(task_id),
+                    short_id(offer_id),
+                    worker.slot,
+                    reason,
+                )
                 await self._send_reject(worker, task_id, offer_id, reason)
                 return
 
             capacity_error = self._reserve_capacity(worker, estimated_bytes)
             if capacity_error:
+                logger.warning(
+                    "Embedded rejecting offer: task=%s offer=%s worker_slot=%s reason=%s",
+                    short_id(task_id),
+                    short_id(offer_id),
+                    worker.slot,
+                    capacity_error,
+                )
                 await self._send_reject(worker, task_id, offer_id, capacity_error)
                 return
 
-            transfer.log_predefined_etag_fast_path_skipped(
-                offer, transfer_context, log_prefix="[Embedded]"
-            )
+            skip_reasons = transfer.predefined_etag_early_submit_skip_reasons(transfer_context)
+            if skip_reasons:
+                logger.info(
+                    "Embedded fast path skipped: task=%s offer=%s worker_slot=%s reasons=%s",
+                    short_id(task_id),
+                    short_id(offer_id),
+                    worker.slot,
+                    "; ".join(skip_reasons),
+                )
 
             if transfer.uses_predefined_etag_early_submit(transfer_context):
                 await self._handle_predefined_etag_offer(
@@ -343,6 +405,12 @@ class EmbeddedWorkerPool:
                     deadline_us,
                 )
             else:
+                logger.info(
+                    "Embedded standard transfer: task=%s offer=%s worker_slot=%s",
+                    short_id(task_id),
+                    short_id(offer_id),
+                    worker.slot,
+                )
                 await self._handle_standard_offer(
                     worker,
                     offer,
@@ -351,6 +419,14 @@ class EmbeddedWorkerPool:
                     transfer_context,
                     deadline_us,
                 )
+        except Exception:
+            logger.exception(
+                "Embedded offer handler error: task=%s offer=%s worker_slot=%s",
+                short_id(task_id),
+                short_id(offer_id),
+                worker.slot,
+            )
+            raise
         finally:
             worker.active_offer_ids.discard(str(offer_id or ""))
 
@@ -413,6 +489,17 @@ class EmbeddedWorkerPool:
                 short_id(task_id),
                 short_id(offer_id),
                 short_id(worker.worker_id),
+            )
+        else:
+            logger.warning(
+                "Embedded task result not completed: task=%s offer=%s worker=%s "
+                "received=%s completed=%s reason=%s",
+                short_id(task_id),
+                short_id(offer_id),
+                short_id(worker.worker_id),
+                ack.get("received"),
+                ack.get("completed"),
+                ack.get("reason") or ack.get("error") or ack.get("message"),
             )
         return ack
 
