@@ -44,6 +44,7 @@ class EmbeddedWorker:
     state: Any
     initial_order: int = 0
     max_concurrent_tasks: int = 4
+    http_client: Optional[httpx.AsyncClient] = None
     active_offer_ids: Set[str] = field(default_factory=set)
 
     @property
@@ -115,6 +116,17 @@ def parse_embedded_worker_configs(settings: OrchestratorSettings) -> List[Embedd
     return configs
 
 
+def _embedded_http_client() -> httpx.AsyncClient:
+    max_tasks = max(1, int(os.environ.get("WORKER_MAX_CONCURRENT_TASKS", "4")))
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(120.0, connect=30.0),
+        limits=httpx.Limits(
+            max_connections=max(max_tasks * 4, 16),
+            max_keepalive_connections=max(max_tasks * 2, 8),
+        ),
+    )
+
+
 class EmbeddedWorkerPool:
     """Runs worker transfer logic inside the orchestrator process."""
 
@@ -150,10 +162,11 @@ class EmbeddedWorkerPool:
                 path=self.settings.wallet_path,
             )
             hotkey = wallet.hotkey.ss58_address
+            worker_client = _embedded_http_client()
             state = transfer.WorkerState(
                 wallet=wallet,
                 api_url=self.settings.core_server_url,
-                http_client=self.http_client,
+                http_client=worker_client,
             )
             state.prewarm_origins = transfer.load_prewarm_origins_from_disk()
 
@@ -183,6 +196,7 @@ class EmbeddedWorkerPool:
                 state=state,
                 initial_order=cfg.initial_order,
                 max_concurrent_tasks=cfg.max_concurrent_tasks,
+                http_client=worker_client,
             )
             self.workers.append(worker)
             logger.info(
@@ -198,6 +212,11 @@ class EmbeddedWorkerPool:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         self._task_handles.clear()
+        for worker in self.workers:
+            if worker.http_client is not None:
+                await worker.http_client.aclose()
+                worker.http_client = None
+        self.workers.clear()
         if self.http_client is not None:
             await self.http_client.aclose()
             self.http_client = None

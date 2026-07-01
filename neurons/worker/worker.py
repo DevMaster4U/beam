@@ -328,6 +328,10 @@ WS_TASK_ACCEPT_ACK_TIMEOUT = float(os.environ.get("WORKER_TASK_ACCEPT_ACK_TIMEOU
 WS_TASK_RESULT_ACK_TIMEOUT = float(os.environ.get("WORKER_TASK_RESULT_ACK_TIMEOUT", "45.0"))
 WORKER_EARLY_TRANSFER = _env_bool("WORKER_EARLY_TRANSFER", True)
 WORKER_PREDEFINED_ETAG_EARLY_SUBMIT = _env_bool("WORKER_PREDEFINED_ETAG_EARLY_SUBMIT", True)
+PREDEFINED_ETAG_MAX_PARALLEL = max(
+    1, int(os.environ.get("WORKER_PREDEFINED_ETAG_MAX_PARALLEL", "1"))
+)
+predefined_etag_fast_path_semaphore = asyncio.Semaphore(PREDEFINED_ETAG_MAX_PARALLEL)
 PREWARM_ENABLED = _env_bool("WORKER_PREWARM_ENABLED", True)
 PREWARM_TIMEOUT = float(os.environ.get("WORKER_PREWARM_TIMEOUT", "5"))
 PREWARM_MAX_ORIGINS = max(1, int(os.environ.get("WORKER_PREWARM_MAX_ORIGINS", "32")))
@@ -1308,12 +1312,18 @@ def normalized_capability_url(url: str) -> str:
 
 
 def matches_predefined_etag_source(source_url: str) -> bool:
-    """Return True when source_url matches WORKER_PREDEFINED_ETAG_SOURCE_URL."""
+    """Return True when source_url path starts with WORKER_PREDEFINED_ETAG_SOURCE_URL."""
     if not PREDEFINED_ETAG_SOURCE_URL:
         return False
-    return normalized_capability_url(source_url) == normalized_capability_url(
-        PREDEFINED_ETAG_SOURCE_URL
-    )
+    got = normalized_capability_url(source_url)
+    prefix = normalized_capability_url(PREDEFINED_ETAG_SOURCE_URL)
+    if not got or not prefix:
+        return False
+    return got == prefix or got.startswith(f"{prefix}/")
+
+
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
 def matches_predefined_etag_file_size(transfer_context: dict) -> bool:
@@ -1373,9 +1383,9 @@ def predefined_etag_early_submit_skip_reasons(transfer_context: dict) -> list[st
         reasons.append("dest_not_presigned_object_storage")
     if not matches_predefined_etag_source(source_url):
         reasons.append(
-            "source_url_mismatch "
+            "source_url_prefix_mismatch "
             f"got={normalized_capability_url(source_url)!r} "
-            f"expected={normalized_capability_url(PREDEFINED_ETAG_SOURCE_URL)!r}"
+            f"expected_prefix={normalized_capability_url(PREDEFINED_ETAG_SOURCE_URL)!r}"
         )
     if not matches_predefined_etag_file_size(transfer_context):
         reasons.append(
@@ -1513,47 +1523,49 @@ async def fetch_and_send_chunk(
         try:
             if signal_fetch_ready:
                 buffer = bytearray()
-                hasher = hashlib.sha256()
                 bytes_transferred = 0
                 fetch_started = time.perf_counter()
                 try:
-                    async with client.stream(
-                        "GET", source_url, headers=fetch_headers, timeout=FETCH_TIMEOUT
-                    ) as response:
-                        if response.status_code not in (200, 206):
-                            response.raise_for_status()
+                    async with predefined_etag_fast_path_semaphore:
+                        async with client.stream(
+                            "GET", source_url, headers=fetch_headers, timeout=FETCH_TIMEOUT
+                        ) as response:
+                            if response.status_code not in (200, 206):
+                                response.raise_for_status()
 
-                        if expected_max_bytes and expected_max_bytes > 0:
-                            content_length = response.headers.get("Content-Length")
-                            if content_length:
-                                response_size = int(content_length)
-                                if response_size > expected_max_bytes:
-                                    raise ValueError(
-                                        f"response too large: {response_size} bytes > "
-                                        f"expected {expected_max_bytes}"
-                                    )
+                            if expected_max_bytes and expected_max_bytes > 0:
+                                content_length = response.headers.get("Content-Length")
+                                if content_length:
+                                    response_size = int(content_length)
+                                    if response_size > expected_max_bytes:
+                                        raise ValueError(
+                                            f"response too large: {response_size} bytes > "
+                                            f"expected {expected_max_bytes}"
+                                        )
 
-                        async for part in response.aiter_bytes(
-                            chunk_size=FETCH_STREAM_CHUNK_SIZE
-                        ):
-                            hasher.update(part)
-                            buffer.extend(part)
-                            bytes_transferred += len(part)
-                            if (
-                                expected_max_bytes
-                                and expected_max_bytes > 0
-                                and bytes_transferred > expected_max_bytes
+                            async for part in response.aiter_bytes(
+                                chunk_size=FETCH_STREAM_CHUNK_SIZE
                             ):
-                                raise ValueError(
-                                    f"response exceeded expected size while buffering: "
-                                    f"{bytes_transferred} bytes > expected {expected_max_bytes}"
-                                )
+                                buffer.extend(part)
+                                bytes_transferred += len(part)
+                                if (
+                                    expected_max_bytes
+                                    and expected_max_bytes > 0
+                                    and bytes_transferred > expected_max_bytes
+                                ):
+                                    raise ValueError(
+                                        f"response exceeded expected size while buffering: "
+                                        f"{bytes_transferred} bytes > expected {expected_max_bytes}"
+                                    )
                 except Exception as exc:
                     fetch_ready.signal_error(exception_detail(exc))
                     raise
 
                 fetch_ms = (time.perf_counter() - fetch_started) * 1000
-                chunk_hash = hasher.hexdigest()
+                body = bytes(buffer)
+                chunk_hash = await asyncio.get_running_loop().run_in_executor(
+                    None, _sha256_hex, body
+                )
                 if expected_chunk_hash and chunk_hash.lower() != expected_chunk_hash.lower():
                     mismatch = (
                         f"chunk hash mismatch: expected {expected_chunk_hash}, got {chunk_hash}"
@@ -1566,7 +1578,6 @@ async def fetch_and_send_chunk(
                     f"bytes={bytes_transferred} fetch_ms={fetch_ms:.1f} "
                     f"etag={PREDEFINED_ETAG!r} (hash ready, upload deferred)"
                 )
-                body = bytes(buffer)
                 fetch_ready.signal_ready(
                     bytes_transferred,
                     chunk_hash,
