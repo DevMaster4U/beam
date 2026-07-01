@@ -310,7 +310,7 @@ class EmbeddedWorkerPool:
                 await self._send_reject(worker, task_id, offer_id, capacity_error)
                 return
 
-            if transfer.uses_predefined_etag_transfer(transfer_context):
+            if transfer.uses_predefined_etag_early_submit(transfer_context):
                 await self._handle_predefined_etag_offer(
                     worker,
                     offer,
@@ -403,6 +403,7 @@ class EmbeddedWorkerPool:
         deadline_us: int,
     ) -> None:
         transfer = get_transfer_module()
+        offer_started_at = time.perf_counter()
         fetch_ready = transfer.FetchReadyState()
 
         exec_task = asyncio.create_task(
@@ -476,11 +477,22 @@ class EmbeddedWorkerPool:
             )
             return
 
-        logger.info(
-            "Embedded accept_ack + hash ready, submitting: task=%s offer=%s",
-            short_id(task_id),
-            short_id(offer_id),
-        )
+        waited_sec = await transfer.wait_predefined_etag_min_submit_delay(offer_started_at)
+        if waited_sec > 0:
+            logger.info(
+                "Embedded accept_ack + hash ready, waited %.3fs (min_submit=%.3fs) "
+                "before submit: task=%s offer=%s",
+                waited_sec,
+                transfer.PREDEFINED_ETAG_MIN_SUBMIT_SEC,
+                short_id(task_id),
+                short_id(offer_id),
+            )
+        else:
+            logger.info(
+                "Embedded accept_ack + hash ready, submitting: task=%s offer=%s",
+                short_id(task_id),
+                short_id(offer_id),
+            )
         await self._send_result(
             worker,
             task_id,

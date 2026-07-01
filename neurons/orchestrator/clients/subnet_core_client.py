@@ -26,6 +26,7 @@ from core.relay_log import (
     defer_relay_log,
     is_failure_summary,
     log_relay,
+    log_task_offer_batch,
     relay_summary,
     short_id as _short_id,
 )
@@ -809,10 +810,13 @@ class SubnetCoreClient:
             logger.warning("worker_task_offer_batch missing offers: batch=%s", batch_id)
             return
 
+        valid_offers = [o for o in offers if isinstance(o, dict)]
+        log_task_offer_batch(batch_id, valid_offers)
+
         if self._embedded_worker_pool is not None:
             delivered, failed = await self._embedded_worker_pool.deliver_task_offer_batch(
                 str(batch_id or "unknown"),
-                [o for o in offers if isinstance(o, dict)],
+                valid_offers,
             )
             logger.info(
                 "worker_task_offer_batch handled by embedded workers: batch=%s offers=%s delivered=%s failed=%s",
@@ -826,7 +830,7 @@ class SubnetCoreClient:
         if self._global_gateway_client:
             sent, failed = await self._global_gateway_client.send_task_offer_batch(
                 str(batch_id or "unknown"),
-                [o for o in offers if isinstance(o, dict)],
+                valid_offers,
             )
             logger.info(
                 "worker_task_offer_batch forwarded to global gateway: batch=%s offers=%s sent=%s failed=%s",
@@ -842,7 +846,7 @@ class SubnetCoreClient:
             return
 
         delivered, failed = await self._worker_gateway.deliver_task_offer_batch(
-            [o for o in offers if isinstance(o, dict)],
+            valid_offers,
         )
         logger.debug(
             "worker_task_offer_batch delivered locally: batch=%s offers=%s delivered=%s failed=%s",

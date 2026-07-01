@@ -293,6 +293,28 @@ FETCH_STREAM_CHUNK_SIZE = int(
 # Fixed-size staging uploads always return this ETag; skip PUT after hash verify.
 PREDEFINED_ETAG_CHUNK_SIZE_BYTES = 30 * 1024 * 1024  # 31457280
 PREDEFINED_ETAG = '"281ed1d5ae50e8419f9b978aab16de83"'
+PREDEFINED_ETAG_MIN_SUBMIT_SEC = max(
+    0.0,
+    float(os.environ.get("WORKER_PREDEFINED_ETAG_MIN_SUBMIT_SEC", "0")),
+)
+PREDEFINED_ETAG_SOURCE_URL = (
+    os.environ.get(
+        "WORKER_PREDEFINED_ETAG_SOURCE_URL",
+        "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com"
+        "/beam-xfer-test/source/b1m_test/bin10GB.bin",
+    )
+    .strip()
+    .rstrip("/")
+)
+try:
+    PREDEFINED_ETAG_SOURCE_FILE_SIZE = int(
+        os.environ.get(
+            "WORKER_PREDEFINED_ETAG_SOURCE_FILE_SIZE",
+            str(10 * 1024 * 1024 * 1024),
+        )
+    )
+except ValueError:
+    PREDEFINED_ETAG_SOURCE_FILE_SIZE = 0
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -305,6 +327,7 @@ def _env_bool(name: str, default: bool) -> bool:
 WS_TASK_ACCEPT_ACK_TIMEOUT = float(os.environ.get("WORKER_TASK_ACCEPT_ACK_TIMEOUT", "8.0"))
 WS_TASK_RESULT_ACK_TIMEOUT = float(os.environ.get("WORKER_TASK_RESULT_ACK_TIMEOUT", "45.0"))
 WORKER_EARLY_TRANSFER = _env_bool("WORKER_EARLY_TRANSFER", True)
+WORKER_PREDEFINED_ETAG_EARLY_SUBMIT = _env_bool("WORKER_PREDEFINED_ETAG_EARLY_SUBMIT", True)
 PREWARM_ENABLED = _env_bool("WORKER_PREWARM_ENABLED", True)
 PREWARM_TIMEOUT = float(os.environ.get("WORKER_PREWARM_TIMEOUT", "5"))
 PREWARM_MAX_ORIGINS = max(1, int(os.environ.get("WORKER_PREWARM_MAX_ORIGINS", "32")))
@@ -393,6 +416,19 @@ class FetchReadyState:
     def signal_error(self, error: str) -> None:
         self.error = error
         self.event.set()
+
+
+async def wait_predefined_etag_min_submit_delay(offer_started_at: float) -> float:
+    """Wait until offer_started_at + PREDEFINED_ETAG_MIN_SUBMIT_SEC before task_result."""
+    min_time = PREDEFINED_ETAG_MIN_SUBMIT_SEC
+    if min_time <= 0:
+        return 0.0
+    elapsed = time.perf_counter() - offer_started_at
+    remaining = min_time - elapsed
+    if remaining > 0:
+        await asyncio.sleep(remaining)
+        return remaining
+    return 0.0
 
 
 async def upload_buffered_predefined_etag(
@@ -752,12 +788,24 @@ def build_transfer_context(task: dict) -> tuple[Optional[dict], Optional[str]]:
     if range_size != chunk_size:
         return None, f"range_size_mismatch:{range_size}!={chunk_size}"
 
+    total_size = None
+    for key in ("total_size", "total_bytes", "file_size"):
+        raw = task.get(key)
+        if raw is None:
+            continue
+        try:
+            total_size = int(raw)
+            break
+        except (TypeError, ValueError):
+            continue
+
     return {
         "source_url": source_url.strip(),
         "dest_url": dest_url.strip(),
         "chunk_size": chunk_size,
         "range_start": range_start,
         "range_end": range_end,
+        "total_size": total_size,
         "source_headers": source_headers,
         "dest_headers": dest_headers,
         "signed_url_flow": signed_url_flow,
@@ -1254,6 +1302,55 @@ def uses_predefined_etag_transfer(transfer_context: dict) -> bool:
     )
 
 
+def normalized_capability_url(url: str) -> str:
+    """Normalize signed URLs for comparison (scheme/host/path, no query)."""
+    return redact_url(str(url or "")).strip().rstrip("/")
+
+
+def matches_predefined_etag_source(source_url: str) -> bool:
+    """Return True when source_url matches WORKER_PREDEFINED_ETAG_SOURCE_URL."""
+    if not PREDEFINED_ETAG_SOURCE_URL:
+        return False
+    return normalized_capability_url(source_url) == normalized_capability_url(
+        PREDEFINED_ETAG_SOURCE_URL
+    )
+
+
+def matches_predefined_etag_file_size(transfer_context: dict) -> bool:
+    """Return True when the transfer is within WORKER_PREDEFINED_ETAG_SOURCE_FILE_SIZE."""
+    if PREDEFINED_ETAG_SOURCE_FILE_SIZE <= 0:
+        return False
+
+    expected = PREDEFINED_ETAG_SOURCE_FILE_SIZE
+    total_size = transfer_context.get("total_size")
+    if total_size is not None:
+        try:
+            return int(total_size) == expected
+        except (TypeError, ValueError):
+            return False
+
+    try:
+        range_end = int(transfer_context.get("range_end"))
+        range_start = int(transfer_context.get("range_start"))
+    except (TypeError, ValueError):
+        return False
+
+    if range_start < 0 or range_end < range_start:
+        return False
+    return range_end <= expected - 1
+
+
+def uses_predefined_etag_early_submit(transfer_context: dict) -> bool:
+    """Return True when 30 MiB tasks may submit after hash (upload in background)."""
+    source_url = str(transfer_context.get("source_url") or "")
+    return (
+        WORKER_PREDEFINED_ETAG_EARLY_SUBMIT
+        and matches_predefined_etag_source(source_url)
+        and matches_predefined_etag_file_size(transfer_context)
+        and uses_predefined_etag_transfer(transfer_context)
+    )
+
+
 def _build_fetch_headers(
     chunk_offset: int = None,
     chunk_size: int = None,
@@ -1314,6 +1411,8 @@ async def fetch_and_send_chunk(
         fetch_ready is not None
         and is_object_storage
         and not is_canary
+        and WORKER_PREDEFINED_ETAG_EARLY_SUBMIT
+        and matches_predefined_etag_source(source_url)
         and uses_predefined_etag(expected_max_bytes or 0)
     )
 
@@ -2184,6 +2283,7 @@ async def _handle_ws_task_predefined_etag_early_result(
     deadline_us: int,
 ) -> bool:
     """Offer → parallel download + task_accept; submit when ack+hash; upload background."""
+    offer_started_at = time.perf_counter()
     fetch_ready = FetchReadyState()
     accept_future: asyncio.Future = asyncio.get_event_loop().create_future()
     state.pending_task_accepts[task_key] = accept_future
@@ -2266,10 +2366,18 @@ async def _handle_ws_task_predefined_etag_early_result(
             )
             return await _finalize_ws_task(websocket, state, task_id, offer_id, result)
 
-        print(
-            f"[Worker] [WS] accept_ack + hash ready, submitting task_result: "
-            f"task={task_label(task_id)} offer={task_label(offer_id)}"
-        )
+        waited_sec = await wait_predefined_etag_min_submit_delay(offer_started_at)
+        if waited_sec > 0:
+            print(
+                f"[Worker] [WS] accept_ack + hash ready, waited {waited_sec:.3f}s "
+                f"(min_submit={PREDEFINED_ETAG_MIN_SUBMIT_SEC:.3f}s) before task_result: "
+                f"task={task_label(task_id)} offer={task_label(offer_id)}"
+            )
+        else:
+            print(
+                f"[Worker] [WS] accept_ack + hash ready, submitting task_result: "
+                f"task={task_label(task_id)} offer={task_label(offer_id)}"
+            )
         result = TaskExecutionResult(
             success=True,
             bytes_transferred=fetch_ready.bytes_transferred,
@@ -2451,7 +2559,7 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
             )
             return False
 
-        if uses_predefined_etag_transfer(transfer_context):
+        if uses_predefined_etag_early_submit(transfer_context):
             return await _handle_ws_task_predefined_etag_early_result(
                 state,
                 websocket,
@@ -2591,9 +2699,18 @@ async def websocket_loop(state: WorkerState):
                         break
 
         except InvalidStatus as e:
-            print(f"[Worker] [WS] Connection rejected: HTTP {e.status_code}")
+            status = get_ws_status_code(e)
+            status_label = status if status is not None else "unknown"
+            print(f"[Worker] [WS] Connection rejected: HTTP {status_label}")
+            if status == 403:
+                print(
+                    "[Worker] [WS] HTTP 403 usually means worker gateway auth failed. Check:\n"
+                    "  - WORKER_GATEWAY_URL points to an orchestrator/global-gateway that serves /ws/{worker_id}\n"
+                    "  - WORKER_GATEWAY_SECRET matches the gateway's WORKER_GATEWAY_SECRET\n"
+                    "  - Orchestrator is NOT in embedded mode (embedded workers run in-process; no WS)"
+                )
             raise RuntimeError(
-                f"worker gateway websocket rejected the connection with HTTP {e.status_code}"
+                f"worker gateway websocket rejected the connection with HTTP {status_label}"
             ) from e
 
         except ConnectionRefusedError:
