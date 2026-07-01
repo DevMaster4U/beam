@@ -93,6 +93,11 @@ func NewPool(settings config.Settings, up upstream.Client, walletPath string, lo
 	}
 }
 
+// SetUpstream wires the BeamCore gateway client after construction.
+func (p *Pool) SetUpstream(up upstream.Client) {
+	p.Upstream = up
+}
+
 // WorkerCount returns the number of embedded workers.
 func (p *Pool) WorkerCount() int { return len(p.workers) }
 

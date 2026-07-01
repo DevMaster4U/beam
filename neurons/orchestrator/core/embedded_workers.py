@@ -13,7 +13,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Set
+from typing import Any, Awaitable, Callable, List, Optional, Set, TypeVar
 
 import bittensor as bt
 import httpx
@@ -117,6 +117,106 @@ def parse_embedded_worker_configs(settings: OrchestratorSettings) -> List[Embedd
     return configs
 
 
+T = TypeVar("T")
+
+
+@dataclass
+class _WorkHandle:
+    """Awaitable work item scheduled on a pre-created coroutine pool worker."""
+
+    future: asyncio.Future
+    cancelled: bool = False
+    _task: Optional[asyncio.Task] = None
+
+    def cancel(self) -> None:
+        self.cancelled = True
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+        elif not self.future.done():
+            self.future.cancel()
+
+
+class _CoroutinePool:
+    """Fixed pool of asyncio workers pulling callables from a queue."""
+
+    def __init__(self, name: str, concurrency: int) -> None:
+        self._name = name
+        self._concurrency = max(1, concurrency)
+        self._queue: asyncio.Queue = asyncio.Queue()
+        self._workers: List[asyncio.Task] = []
+
+    async def start(self) -> None:
+        for worker_id in range(self._concurrency):
+            self._workers.append(asyncio.create_task(self._worker_loop(worker_id)))
+
+    async def stop(self) -> None:
+        for _ in self._workers:
+            await self._queue.put(None)
+        for worker in self._workers:
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker
+        self._workers.clear()
+
+    async def _worker_loop(self, worker_id: int) -> None:
+        while True:
+            item = await self._queue.get()
+            try:
+                if item is None:
+                    break
+                handle, runner = item
+                if handle.cancelled:
+                    if not handle.future.done():
+                        handle.future.cancel()
+                    continue
+                handle._task = asyncio.current_task()
+                if handle.cancelled:
+                    if not handle.future.done():
+                        handle.future.cancel()
+                    continue
+                try:
+                    result = await runner()
+                    if not handle.future.done():
+                        handle.future.set_result(result)
+                except asyncio.CancelledError:
+                    if not handle.future.done():
+                        handle.future.cancel()
+                    raise
+                except Exception as exc:
+                    if not handle.future.done():
+                        handle.future.set_exception(exc)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("%s worker=%s failed", self._name, worker_id)
+            finally:
+                self._queue.task_done()
+
+    def submit(self, coro_factory: Callable[[], Awaitable[T]]) -> _WorkHandle:
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        handle = _WorkHandle(future=future)
+
+        async def runner() -> T:
+            return await coro_factory()
+
+        self._queue.put_nowait((handle, runner))
+        return handle
+
+    def submit_fire_and_forget(self, coro_factory: Callable[[], Awaitable[Any]]) -> None:
+        async def runner() -> None:
+            try:
+                await coro_factory()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("%s fire-and-forget failed", self._name)
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        handle = _WorkHandle(future=future)
+        self._queue.put_nowait((handle, runner))
+
+
 def _embedded_http_client() -> httpx.AsyncClient:
     max_tasks = max(1, int(os.environ.get("WORKER_MAX_CONCURRENT_TASKS", "4")))
     return httpx.AsyncClient(
@@ -137,7 +237,8 @@ class EmbeddedWorkerPool:
         self.workers: List[EmbeddedWorker] = []
         self.http_client: Optional[httpx.AsyncClient] = None
         self._cursor = 0
-        self._task_handles: Set[asyncio.Task] = set()
+        self._offer_pool: Optional[_CoroutinePool] = None
+        self._side_pool: Optional[_CoroutinePool] = None
 
     @property
     def worker_count(self) -> int:
@@ -596,6 +697,7 @@ class EmbeddedWorkerPool:
                 transfer_context,
                 task_id=str(task_id),
                 offer_id=str(offer_id),
+                log_prefix="[Embedded]",
             )
         )
 

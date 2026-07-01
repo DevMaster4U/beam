@@ -423,7 +423,7 @@ class FetchReadyState:
 
 
 async def wait_predefined_etag_min_submit_delay(offer_started_at: float) -> float:
-    """Wait until offer_started_at + PREDEFINED_ETAG_MIN_SUBMIT_SEC before task_result."""
+    """Wait until offer_started_at + add before task_result."""
     min_time = PREDEFINED_ETAG_MIN_SUBMIT_SEC
     if min_time <= 0:
         return 0.0
@@ -450,9 +450,28 @@ async def upload_buffered_predefined_etag(
     auth_token: str = None,
     task_id: str = None,
     offer_id: str = None,
+    source_url: str = "",
+    log_prefix: str = "[Worker]",
 ) -> float:
     """PUT/POST a buffered predefined-etag chunk; returns send_ms."""
     is_object_storage = is_object_storage_presigned_url(destination_url)
+    byte_to = (
+        upload_offset + expected_max_bytes - 1
+        if expected_max_bytes and expected_max_bytes > 0
+        else upload_offset + len(body) - 1
+    )
+    log_task_chunk(
+        "put_start",
+        fetch_url=source_url,
+        put_url=destination_url,
+        chunk_index=chunk_index,
+        byte_from=upload_offset,
+        byte_to=byte_to,
+        chunk_hash=chunk_hash,
+        task_id=task_id,
+        offer_id=offer_id,
+        log_prefix=log_prefix,
+    )
     send_started = time.perf_counter()
 
     if is_object_storage:
@@ -493,12 +512,19 @@ async def upload_buffered_predefined_etag(
     response.raise_for_status()
     send_ms = (time.perf_counter() - send_started) * 1000
     etag = response.headers.get("ETag") or response.headers.get("etag")
-    if is_object_storage:
-        print(
-            f"[Worker] Staging PUT ok chunk={chunk_index} "
-            f"bytes={len(body)} etag={etag!r} send_ms={send_ms:.1f} "
-            f"task={task_label(task_id)} offer={task_label(offer_id)}"
-        )
+    log_task_chunk(
+        "put_done",
+        fetch_url=source_url,
+        put_url=destination_url,
+        chunk_index=chunk_index,
+        byte_from=upload_offset,
+        byte_to=byte_to,
+        chunk_hash=chunk_hash,
+        task_id=task_id,
+        offer_id=offer_id,
+        log_prefix=log_prefix,
+        detail=f"etag={etag!r} send_ms={send_ms:.1f}",
+    )
     return send_ms
 
 
@@ -509,6 +535,7 @@ async def run_predefined_etag_background_upload(
     *,
     task_id: str = None,
     offer_id: str = None,
+    log_prefix: str = "[Worker]",
 ) -> bool:
     """Start upload as soon as the buffered download finishes (even before accept ack)."""
     await fetch_ready.event.wait()
@@ -518,12 +545,8 @@ async def run_predefined_etag_background_upload(
     chunk_size = int(transfer_context["chunk_size"])
     range_start = int(transfer_context["range_start"])
     dest_headers = transfer_context.get("dest_headers") or {}
+    source_url = str(transfer_context.get("source_url") or "")
 
-    print(
-        f"[Worker] Predefined ETag background upload starting "
-        f"bytes={len(fetch_ready.buffer)} task={task_label(task_id)} "
-        f"offer={task_label(offer_id)}"
-    )
     try:
         await upload_buffered_predefined_etag(
             client,
@@ -538,6 +561,8 @@ async def run_predefined_etag_background_upload(
             extra_dest_headers=dest_headers or None,
             task_id=task_id,
             offer_id=offer_id,
+            source_url=source_url,
+            log_prefix=log_prefix,
         )
         print(
             f"[Worker] Predefined ETag background upload complete "
@@ -718,6 +743,43 @@ def format_route_context(context: Dict[str, Any]) -> str:
     return " " + " ".join(parts) if parts else ""
 
 
+def log_task_chunk(
+    stage: str,
+    *,
+    fetch_url: str = "",
+    put_url: str = "",
+    chunk_index: int = 0,
+    byte_from: Optional[int] = None,
+    byte_to: Optional[int] = None,
+    chunk_hash: str = "",
+    task_id: Optional[str] = None,
+    offer_id: Optional[str] = None,
+    log_prefix: str = "[Worker]",
+    detail: str = "",
+) -> None:
+    """Grep-friendly per-chunk transfer log: fetch/put URL, chunk_id, byte range, hash."""
+    fields = [
+        f"{log_prefix} task_chunk stage={stage}",
+        f"task={task_label(task_id)}",
+        f"offer={task_label(offer_id)}",
+        f"chunk_id=chunk_{chunk_index}",
+    ]
+    if fetch_url:
+        fields.append(f"fetch={redact_url(fetch_url)}")
+    if put_url:
+        fields.append(f"put={redact_url(put_url)}")
+    if byte_from is not None:
+        if byte_to is not None:
+            fields.append(f"bytes={byte_from}-{byte_to}")
+        else:
+            fields.append(f"bytes={byte_from}")
+    if chunk_hash:
+        fields.append(f"hash={chunk_hash}")
+    if detail:
+        fields.append(detail)
+    print(" ".join(fields))
+
+
 def http_status_detail(error: Exception) -> str:
     """Return HTTP status context for httpx exceptions when available."""
     if isinstance(error, httpx.HTTPStatusError):
@@ -858,6 +920,7 @@ async def execute_task_with_metrics(
                     task,
                     deadline_us,
                     fetch_ready=fetch_ready,
+                    log_prefix=log_prefix,
                 )
     except Exception as e:
         error_msg = str(e)
@@ -1493,6 +1556,7 @@ async def fetch_and_send_chunk(
     extra_fetch_headers: Optional[Dict[str, str]] = None,
     extra_dest_headers: Optional[Dict[str, str]] = None,
     fetch_ready: Optional[FetchReadyState] = None,
+    log_prefix: str = "[Worker]",
 ) -> tuple[int, str, Optional[str], int, float, float]:
     """Fetch from source and upload to destination.
 
@@ -1510,6 +1574,26 @@ async def fetch_and_send_chunk(
     )
     upload_offset = (
         send_chunk_offset if send_chunk_offset is not None else (chunk_offset or 0)
+    )
+    byte_to = (
+        upload_offset + expected_max_bytes - 1
+        if expected_max_bytes and expected_max_bytes > 0
+        else (
+            upload_offset + chunk_size - 1
+            if chunk_size and chunk_size > 0
+            else None
+        )
+    )
+    log_task_chunk(
+        "start",
+        fetch_url=source_url,
+        put_url=destination_url,
+        chunk_index=chunk_index,
+        byte_from=upload_offset,
+        byte_to=byte_to,
+        task_id=task_id,
+        offer_id=offer_id,
+        log_prefix=log_prefix,
     )
     signal_fetch_ready = should_buffer_predefined_etag_fetch(
         fetch_ready,
@@ -1582,10 +1666,18 @@ async def fetch_and_send_chunk(
                     fetch_ready.signal_error(mismatch)
                     raise ValueError(mismatch)
 
-                print(
-                    f"[Worker] Predefined ETag buffered download chunk={chunk_index} "
-                    f"bytes={bytes_transferred} fetch_ms={fetch_ms:.1f} "
-                    f"etag={PREDEFINED_ETAG!r} (hash ready, upload deferred)"
+                log_task_chunk(
+                    "fetch_done",
+                    fetch_url=source_url,
+                    put_url=destination_url,
+                    chunk_index=chunk_index,
+                    byte_from=upload_offset,
+                    byte_to=byte_to,
+                    chunk_hash=chunk_hash,
+                    task_id=task_id,
+                    offer_id=offer_id,
+                    log_prefix=log_prefix,
+                    detail=f"fetch_ms={fetch_ms:.1f} etag={PREDEFINED_ETAG!r} upload_deferred",
                 )
                 fetch_ready.signal_ready(
                     bytes_transferred,
@@ -1694,9 +1786,23 @@ async def fetch_and_send_chunk(
                 await producer_task
                 if fetch_error:
                     raise fetch_error
+                canary_hash = hasher.hexdigest()
+                log_task_chunk(
+                    "fetch_done",
+                    fetch_url=source_url,
+                    put_url=destination_url,
+                    chunk_index=chunk_index,
+                    byte_from=upload_offset,
+                    byte_to=byte_to,
+                    chunk_hash=canary_hash,
+                    task_id=task_id,
+                    offer_id=offer_id,
+                    log_prefix=log_prefix,
+                    detail=f"fetch_ms={fetch_ms:.1f} canary_skip_put",
+                )
                 return (
                     bytes_transferred,
-                    hasher.hexdigest(),
+                    canary_hash,
                     None,
                     0,
                     fetch_ms,
@@ -1721,17 +1827,39 @@ async def fetch_and_send_chunk(
                     f"chunk hash mismatch: expected {expected_chunk_hash}, got {chunk_hash}"
                 )
 
+            log_task_chunk(
+                "fetch_done",
+                fetch_url=source_url,
+                put_url=destination_url,
+                chunk_index=chunk_index,
+                byte_from=upload_offset,
+                byte_to=byte_to,
+                chunk_hash=chunk_hash,
+                task_id=task_id,
+                offer_id=offer_id,
+                log_prefix=log_prefix,
+                detail=f"fetch_ms={fetch_ms:.1f}",
+            )
+
             response = await send_task
 
             response.raise_for_status()
             send_ms = (time.perf_counter() - send_started) * 1000
 
             etag = response.headers.get("ETag") or response.headers.get("etag")
-            if is_object_storage:
-                print(
-                    f"[Worker] Staging PUT ok chunk={chunk_index} "
-                    f"bytes={bytes_transferred} etag={etag!r}"
-                )
+            log_task_chunk(
+                "put_done",
+                fetch_url=source_url,
+                put_url=destination_url,
+                chunk_index=chunk_index,
+                byte_from=upload_offset,
+                byte_to=byte_to,
+                chunk_hash=chunk_hash,
+                task_id=task_id,
+                offer_id=offer_id,
+                log_prefix=log_prefix,
+                detail=f"etag={etag!r} send_ms={send_ms:.1f} response={response.status_code}",
+            )
             return (
                 bytes_transferred,
                 chunk_hash,
@@ -1848,6 +1976,7 @@ async def execute_transfer(
     task_message: dict,
     deadline_us: int,
     fetch_ready: Optional[FetchReadyState] = None,
+    log_prefix: str = "[Worker]",
 ) -> tuple:
     """Execute real data transfer: fetch from source, send to destination.
 
@@ -1882,12 +2011,6 @@ async def execute_transfer(
     computed_chunk_hash = ""
     last_etag: Optional[str] = None
     offer_id = task_message.get("offer_id") or task_id
-    hotkey = getattr(getattr(state.wallet, "hotkey", None), "ss58_address", "unknown")
-
-    print(
-        f"[Worker] Transferring signed range bytes={range_start}-{range_end} "
-        f"task={task_label(task_id)} offer={task_label(offer_id)} hotkey={hotkey[:16]}"
-    )
 
     try:
         # Check deadline
@@ -1927,6 +2050,7 @@ async def execute_transfer(
             is_canary=is_canary,
             send_chunk_offset=range_start,
             fetch_ready=fetch_ready,
+            log_prefix=log_prefix,
         )
 
         if bytes_fetched != chunk_size:
@@ -1939,8 +2063,21 @@ async def execute_transfer(
             )
 
         if is_canary:
-            print(f"[Worker] Chunk {chunk_index}: CANARY mode, skipping upload")
             total_bytes += bytes_fetched
+            total_ms = (time.perf_counter() - chunk_started) * 1000
+            log_task_chunk(
+                "complete",
+                fetch_url=source_url,
+                put_url=destination_url,
+                chunk_index=chunk_index,
+                byte_from=range_start,
+                byte_to=range_end,
+                chunk_hash=computed_chunk_hash,
+                task_id=task_id,
+                offer_id=offer_id,
+                log_prefix=log_prefix,
+                detail=f"canary_skip_put total_ms={total_ms:.1f}",
+            )
         else:
             if etag:
                 last_etag = etag
@@ -1948,11 +2085,21 @@ async def execute_transfer(
             total_bytes += bytes_fetched
             total_ms = (time.perf_counter() - chunk_started) * 1000
             mbps = (bytes_fetched * 8 / 1_000_000) / (total_ms / 1000) if total_ms > 0 else 0
-            print(
-                f"[Worker] Chunk {chunk_index}: {bytes_fetched} bytes transferred "
-                f"task={task_label(task_id)} offer={task_label(offer_id)} "
-                f"fetch_ms={fetch_ms:.1f} send_ms={send_ms:.1f} "
-                f"total_ms={total_ms:.1f} mbps={mbps:.1f} response={response_code}"
+            log_task_chunk(
+                "complete",
+                fetch_url=source_url,
+                put_url=destination_url,
+                chunk_index=chunk_index,
+                byte_from=range_start,
+                byte_to=range_end,
+                chunk_hash=computed_chunk_hash,
+                task_id=task_id,
+                offer_id=offer_id,
+                log_prefix=log_prefix,
+                detail=(
+                    f"fetch_ms={fetch_ms:.1f} send_ms={send_ms:.1f} "
+                    f"total_ms={total_ms:.1f} mbps={mbps:.1f} response={response_code}"
+                ),
             )
 
     except asyncio.TimeoutError as e:
