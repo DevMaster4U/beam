@@ -709,24 +709,17 @@ class EmbeddedWorkerPool:
         deadline_us: int,
     ) -> None:
         transfer = get_transfer_module()
-        offer_started_at = time.perf_counter()
-        fetch_ready = transfer.FetchReadyState()
-        dest_url = str(transfer_context.get("dest_url") or "")
-        chunk_size = int(transfer_context.get("chunk_size") or 0)
-        source_url = str(transfer_context.get("source_url") or "")
 
-        if not transfer.should_buffer_predefined_etag_fetch(
-            fetch_ready,
-            source_url=source_url,
-            chunk_size=chunk_size,
-            is_object_storage=transfer.is_object_storage_presigned_url(dest_url),
-            is_canary=transfer.is_canary_destination(dest_url),
-        ):
+        if not transfer.uses_predefined_etag_early_submit(transfer_context):
             logger.warning(
-                "Embedded predefined handler buffer gate mismatch; using standard transfer: "
-                "task=%s offer=%s",
+                "Embedded predefined handler fast path unavailable; using standard transfer: "
+                "task=%s offer=%s reasons=%s",
                 short_id(task_id),
                 short_id(offer_id),
+                "; ".join(
+                    transfer.predefined_etag_early_submit_skip_reasons(transfer_context)
+                )
+                or "early_submit_disabled",
             )
             await self._handle_standard_offer(
                 worker,
@@ -738,162 +731,150 @@ class EmbeddedWorkerPool:
             )
             return
 
-        exec_task = asyncio.create_task(
-            transfer.execute_task_with_metrics(
-                worker.state,
-                str(task_id),
-                offer,
-                transfer_context,
-                deadline_us,
-                log_prefix="[Embedded]",
-                fetch_ready=fetch_ready,
-            )
-        )
-        upload_task = asyncio.create_task(
-            transfer.run_predefined_etag_background_upload(
-                worker.state.http_client,
-                fetch_ready,
-                transfer_context,
-                task_id=str(task_id),
-                offer_id=str(offer_id),
-                log_prefix="[Embedded]",
-            )
-        )
-
+        cached = transfer.get_predefined_etag_cache(transfer_context)
+        env_configured = bool(transfer.PREDEFINED_ETAG_ENV_CHUNK_HASH)
         logger.info(
-            "Embedded predefined ETag: download + task_accept in parallel: task=%s offer=%s",
+            "Embedded predefined ETag: %s task=%s offer=%s",
+            (
+                "env hash/etag, accept then submit"
+                if env_configured
+                else "cache hit, accept then submit"
+                if cached
+                else "cache miss, fetch+upload then submit"
+            ),
             short_id(task_id),
             short_id(offer_id),
         )
 
-        async def _accept_ok() -> bool:
+        async def _accept_task() -> bool:
             resp = await self._send_accept(worker, task_id, offer_id)
             return bool(resp.get("accepted"))
 
-        accepted, wait_error = await transfer.wait_accept_and_buffered_fetch(
-            _accept_ok(),
-            fetch_ready,
+        outcome = await transfer.predefined_etag_submit_flow(
+            worker.state,
+            str(task_id),
+            str(offer_id),
+            offer,
+            transfer_context,
+            deadline_us,
+            log_prefix="[Embedded]",
             accept_timeout=float(
                 os.environ.get("WORKER_TASK_ACCEPT_ACK_TIMEOUT", "8.0")
             ),
-            fetch_timeout=transfer.FETCH_TIMEOUT + 5.0,
+            accept_task=_accept_task,
         )
 
-        if not accepted:
+        if not outcome.success:
             logger.warning(
-                "Embedded stopping download: task=%s offer=%s worker=%s reason=%s",
+                "Embedded predefined submit failed: task=%s offer=%s worker=%s reason=%s",
                 short_id(task_id),
                 short_id(offer_id),
                 short_id(worker.worker_id),
-                wait_error,
+                outcome.error,
             )
             self._log_task_failed(
                 transfer,
                 transfer_context,
                 task_id=str(task_id),
                 offer_id=str(offer_id),
-                reason=str(wait_error or "task_accept_rejected"),
-                chunk_hash=fetch_ready.chunk_hash,
+                reason=str(outcome.error or "predefined_submit_failed"),
+                chunk_hash=outcome.chunk_hash,
             )
-            exec_task.cancel()
-            upload_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await exec_task
-                await upload_task
+            if outcome.error:
+                await self._send_result(
+                    worker,
+                    task_id,
+                    offer_id,
+                    success=False,
+                    chunk_hash=outcome.chunk_hash,
+                    error=outcome.error,
+                )
             return
 
-        if wait_error:
-            logger.warning(
-                "Embedded predefined transfer failed: task=%s offer=%s worker=%s reason=%s",
-                short_id(task_id),
-                short_id(offer_id),
-                short_id(worker.worker_id),
-                wait_error,
-            )
-            self._log_task_failed(
-                transfer,
-                transfer_context,
-                task_id=str(task_id),
-                offer_id=str(offer_id),
-                reason=str(wait_error),
-                chunk_hash=fetch_ready.chunk_hash,
-            )
-            exec_task.cancel()
-            upload_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await exec_task
-                await upload_task
-            await self._send_result(
-                worker,
-                task_id,
-                offer_id,
-                success=False,
-                chunk_hash=fetch_ready.chunk_hash,
-                error=wait_error,
-            )
-            return
-
-        bytes_error = transfer.validate_fetch_ready_bytes(fetch_ready, transfer_context)
-        if bytes_error:
-            logger.info(
-                "Embedded falling back to standard transfer (%s): task=%s offer=%s",
-                bytes_error,
-                short_id(task_id),
-                short_id(offer_id),
-            )
-            exec_task.cancel()
-            upload_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await exec_task
-                await upload_task
-            result = await transfer.execute_task_with_metrics(
-                worker.state,
-                str(task_id),
-                offer,
-                transfer_context,
-                deadline_us,
-                log_prefix="[Embedded]",
-            )
-            await self._send_result(
-                worker,
-                task_id,
-                offer_id,
-                success=result.success,
-                chunk_hash=result.chunk_hash,
-                etag=result.etag,
-                error=result.error_msg,
-            )
-            return
-
-        waited_sec = await transfer.wait_predefined_etag_min_submit_delay(offer_started_at)
-        if waited_sec > 0:
-            logger.info(
-                "Embedded accept_ack + hash ready, waited %.3fs (min_submit=%.3fs) "
-                "before submit: task=%s offer=%s",
-                waited_sec,
-                transfer.PREDEFINED_ETAG_MIN_SUBMIT_SEC,
-                short_id(task_id),
-                short_id(offer_id),
-            )
-        else:
-            logger.info(
-                "Embedded accept_ack + hash ready, submitting: task=%s offer=%s",
-                short_id(task_id),
-                short_id(offer_id),
-            )
         await self._send_result(
             worker,
             task_id,
             offer_id,
             success=True,
-            chunk_hash=fetch_ready.chunk_hash,
-            etag=fetch_ready.etag or transfer.PREDEFINED_ETAG,
+            chunk_hash=outcome.chunk_hash,
+            etag=outcome.etag,
         )
-        asyncio.create_task(
-            self._await_background_upload_task(
-                upload_task, task_id, offer_id, transfer_context
+
+        if outcome.used_cache:
+            asyncio.create_task(
+                self._await_background_transfer_task(
+                    worker,
+                    offer,
+                    task_id,
+                    offer_id,
+                    transfer_context,
+                    deadline_us,
+                )
             )
-        )
+
+    async def _await_background_transfer_task(
+        self,
+        worker: EmbeddedWorker,
+        offer: dict,
+        task_id: str,
+        offer_id: str,
+        transfer_context: dict,
+        deadline_us: int,
+    ) -> None:
+        transfer = get_transfer_module()
+        try:
+            result = await transfer.run_predefined_etag_background_transfer(
+                worker.state,
+                str(task_id),
+                str(offer_id),
+                offer,
+                transfer_context,
+                deadline_us,
+                log_prefix="[Embedded]",
+            )
+        except asyncio.CancelledError:
+            logger.warning(
+                "Embedded background transfer cancelled: task=%s offer=%s",
+                short_id(task_id),
+                short_id(offer_id),
+            )
+            return
+        except Exception as exc:
+            logger.warning(
+                "Embedded background transfer error: task=%s offer=%s err=%s",
+                short_id(task_id),
+                short_id(offer_id),
+                exc,
+            )
+            self._log_task_failed(
+                transfer,
+                transfer_context,
+                task_id=str(task_id),
+                offer_id=str(offer_id),
+                reason=str(exc),
+            )
+            return
+
+        if result.success:
+            logger.info(
+                "Embedded background transfer finished after task_result: task=%s offer=%s",
+                short_id(task_id),
+                short_id(offer_id),
+            )
+        else:
+            logger.warning(
+                "Embedded background transfer failed after task_result: task=%s offer=%s",
+                short_id(task_id),
+                short_id(offer_id),
+            )
+            self._log_task_failed(
+                transfer,
+                transfer_context,
+                task_id=str(task_id),
+                offer_id=str(offer_id),
+                reason=result.error_msg or "background_transfer_failed",
+                chunk_hash=result.chunk_hash,
+            )
 
     async def _handle_standard_offer(
         self,
@@ -941,49 +922,3 @@ class EmbeddedWorkerPool:
             etag=result.etag,
             error=result.error_msg,
         )
-
-    async def _await_background_upload_task(
-        self,
-        upload_task: asyncio.Task,
-        task_id: str,
-        offer_id: str,
-        transfer_context: dict,
-    ) -> None:
-        transfer = get_transfer_module()
-        try:
-            ok = await upload_task
-        except asyncio.CancelledError:
-            logger.warning(
-                "Embedded upload cancelled: task=%s offer=%s",
-                short_id(task_id),
-                short_id(offer_id),
-            )
-            return
-        except Exception as exc:
-            logger.warning(
-                "Embedded upload error: task=%s offer=%s err=%s",
-                short_id(task_id),
-                short_id(offer_id),
-                exc,
-            )
-            return
-
-        if ok:
-            logger.info(
-                "Embedded background upload finished after task_result: task=%s offer=%s",
-                short_id(task_id),
-                short_id(offer_id),
-            )
-        else:
-            logger.warning(
-                "Embedded background upload failed after task_result: task=%s offer=%s",
-                short_id(task_id),
-                short_id(offer_id),
-            )
-            self._log_task_failed(
-                transfer,
-                transfer_context,
-                task_id=str(task_id),
-                offer_id=str(offer_id),
-                reason="background_upload_failed",
-            )

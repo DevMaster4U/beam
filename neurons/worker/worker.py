@@ -47,7 +47,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 import httpx
@@ -293,6 +293,14 @@ FETCH_STREAM_CHUNK_SIZE = int(
 # Fixed-size staging uploads always return this ETag; skip PUT after hash verify.
 PREDEFINED_ETAG_CHUNK_SIZE_BYTES = 30 * 1024 * 1024  # 31457280
 PREDEFINED_ETAG = '"281ed1d5ae50e8419f9b978aab16de83"'
+PREDEFINED_ETAG_ENV_CHUNK_HASH = os.environ.get(
+    "WORKER_PREDEFINED_ETAG_CHUNK_HASH",
+    os.environ.get("CHUNK_HASH", ""),
+).strip()
+PREDEFINED_ETAG_ENV_ETAG = (
+    os.environ.get("WORKER_PREDEFINED_ETAG_ETAG", os.environ.get("ETAG", "")).strip()
+    or (PREDEFINED_ETAG if PREDEFINED_ETAG_ENV_CHUNK_HASH else "")
+)
 PREDEFINED_ETAG_MIN_SUBMIT_SEC = max(
     0.0,
     float(os.environ.get("WORKER_PREDEFINED_ETAG_MIN_SUBMIT_SEC", "0")),
@@ -315,6 +323,17 @@ try:
     )
 except ValueError:
     PREDEFINED_ETAG_SOURCE_FILE_SIZE = 0
+
+PREDEFINED_ETAG_CACHE_FILENAME = "predefined_etag_chunks.json"
+
+
+@dataclass(frozen=True)
+class PredefinedETagChunkCacheEntry:
+    chunk_hash: str
+    etag: str
+
+
+_PREDEFINED_ETAG_CHUNK_CACHE: dict[str, PredefinedETagChunkCacheEntry] = {}
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -1438,6 +1457,106 @@ def normalized_capability_url(url: str) -> str:
     return redact_url(str(url or "")).strip().rstrip("/")
 
 
+def _predefined_etag_cache_path() -> Path:
+    log_root = Path(os.environ.get("LOG_DIR", _workspace_root() / "logs"))
+    return log_root / "workers" / PREDEFINED_ETAG_CACHE_FILENAME
+
+
+def predefined_etag_cache_key(transfer_context: dict) -> str:
+    """Cache key: normalized source URL + byte range (same hash/etag per source chunk)."""
+    source = normalized_capability_url(str(transfer_context.get("source_url") or ""))
+    range_start = int(transfer_context["range_start"])
+    range_end = int(transfer_context["range_end"])
+    return f"{source}|{range_start}|{range_end}"
+
+
+def load_predefined_etag_chunk_cache() -> None:
+    """Load persisted predefined-etag hash/etag entries."""
+    path = _predefined_etag_cache_path()
+    if not path.is_file():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        entries = data.get("entries") or {}
+        for key, item in entries.items():
+            if not isinstance(item, dict):
+                continue
+            chunk_hash = str(item.get("chunk_hash") or "").strip()
+            etag = str(item.get("etag") or PREDEFINED_ETAG).strip()
+            if chunk_hash:
+                _PREDEFINED_ETAG_CHUNK_CACHE[key] = PredefinedETagChunkCacheEntry(
+                    chunk_hash=chunk_hash,
+                    etag=etag,
+                )
+    except Exception as exc:
+        print(f"[Worker] Predefined ETag cache load failed: {exc}")
+
+
+def save_predefined_etag_chunk_cache() -> None:
+    path = _predefined_etag_cache_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "entries": {
+            key: {"chunk_hash": entry.chunk_hash, "etag": entry.etag}
+            for key, entry in _PREDEFINED_ETAG_CHUNK_CACHE.items()
+        },
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def get_predefined_etag_env_entry(
+    transfer_context: dict,
+) -> Optional[PredefinedETagChunkCacheEntry]:
+    """Return hash/etag from env when configured for this predefined-etag transfer."""
+    if not PREDEFINED_ETAG_ENV_CHUNK_HASH:
+        return None
+    if not uses_predefined_etag_early_submit(transfer_context):
+        return None
+    return PredefinedETagChunkCacheEntry(
+        chunk_hash=PREDEFINED_ETAG_ENV_CHUNK_HASH,
+        etag=PREDEFINED_ETAG_ENV_ETAG or PREDEFINED_ETAG,
+    )
+
+
+def get_predefined_etag_cache(
+    transfer_context: dict,
+) -> Optional[PredefinedETagChunkCacheEntry]:
+    env_entry = get_predefined_etag_env_entry(transfer_context)
+    if env_entry is not None:
+        return env_entry
+    return _PREDEFINED_ETAG_CHUNK_CACHE.get(predefined_etag_cache_key(transfer_context))
+
+
+def predefined_etag_known_source(transfer_context: dict) -> Optional[str]:
+    """Return how hash/etag were resolved: env, cache, or None."""
+    if get_predefined_etag_env_entry(transfer_context) is not None:
+        return "env"
+    if predefined_etag_cache_key(transfer_context) in _PREDEFINED_ETAG_CHUNK_CACHE:
+        return "cache"
+    return None
+
+
+def store_predefined_etag_cache(
+    transfer_context: dict,
+    chunk_hash: str,
+    etag: Optional[str] = None,
+) -> None:
+    if PREDEFINED_ETAG_ENV_CHUNK_HASH:
+        return
+    if not chunk_hash:
+        return
+    key = predefined_etag_cache_key(transfer_context)
+    _PREDEFINED_ETAG_CHUNK_CACHE[key] = PredefinedETagChunkCacheEntry(
+        chunk_hash=chunk_hash,
+        etag=etag or PREDEFINED_ETAG,
+    )
+    save_predefined_etag_chunk_cache()
+
+
+load_predefined_etag_chunk_cache()
+
+
 def matches_predefined_etag_source(source_url: str) -> bool:
     """Return True when source_url path starts with WORKER_PREDEFINED_ETAG_SOURCE_URL."""
     if not PREDEFINED_ETAG_SOURCE_URL:
@@ -1580,6 +1699,184 @@ def validate_fetch_ready_bytes(
         fetch_ready.bytes_transferred,
         PREDEFINED_ETAG_CHUNK_SIZE_BYTES,
     )
+
+
+@dataclass
+class PredefinedETagSubmitOutcome:
+    success: bool
+    chunk_hash: str = ""
+    etag: Optional[str] = None
+    error: Optional[str] = None
+    used_cache: bool = False
+    hash_source: str = "computed"
+
+
+def _log_predefined_etag_submit_ready(
+    log_prefix: str,
+    task_id: str,
+    offer_id: str,
+    transfer_context: dict,
+    waited_sec: float,
+    *,
+    hash_source: str,
+) -> None:
+    kind = {
+        "env": "env hash/etag",
+        "cache": "cached hash/etag",
+        "computed": "computed hash/etag",
+    }.get(hash_source, "hash/etag")
+    if waited_sec > 0:
+        detail = (
+            f"accept_ack + {kind}, waited {waited_sec:.3f}s "
+            f"(min_submit={PREDEFINED_ETAG_MIN_SUBMIT_SEC:.3f}s) before task_result"
+        )
+    else:
+        detail = f"accept_ack + {kind}, submitting task_result"
+    log_task_chunk_from_context(
+        "submit_ready",
+        transfer_context,
+        task_id=task_id,
+        offer_id=offer_id,
+        log_prefix=log_prefix,
+        detail=detail,
+    )
+
+
+async def predefined_etag_submit_flow(
+    state: WorkerState,
+    task_id: str,
+    offer_id: str,
+    offer: dict,
+    transfer_context: dict,
+    deadline_us: int,
+    *,
+    log_prefix: str,
+    accept_timeout: float,
+    accept_task: Callable[[], Awaitable[bool]],
+) -> PredefinedETagSubmitOutcome:
+    """Predefined ETag submit: env/cache hit → accept + min_delay + result; miss → fetch+upload first."""
+    offer_started_at = time.perf_counter()
+    hash_source = predefined_etag_known_source(transfer_context)
+    known = get_predefined_etag_cache(transfer_context)
+    stage = hash_source or "cache_miss"
+    log_task_chunk_from_context(
+        stage,
+        transfer_context,
+        task_id=task_id,
+        offer_id=offer_id,
+        chunk_hash=known.chunk_hash if known else "",
+        log_prefix=log_prefix,
+        detail=f"etag={known.etag!r}" if known else "",
+    )
+
+    try:
+        accepted = await asyncio.wait_for(accept_task(), timeout=accept_timeout)
+    except asyncio.TimeoutError:
+        return PredefinedETagSubmitOutcome(
+            success=False,
+            error=f"task_accept_ack timeout ({accept_timeout:.0f}s)",
+        )
+    except Exception as exc:
+        return PredefinedETagSubmitOutcome(success=False, error=str(exc))
+
+    if not accepted:
+        return PredefinedETagSubmitOutcome(success=False, error="task_accept rejected")
+
+    if known:
+        waited_sec = await wait_predefined_etag_min_submit_delay(offer_started_at)
+        _log_predefined_etag_submit_ready(
+            log_prefix,
+            task_id,
+            offer_id,
+            transfer_context,
+            waited_sec,
+            hash_source=hash_source or "cache",
+        )
+        return PredefinedETagSubmitOutcome(
+            success=True,
+            chunk_hash=known.chunk_hash,
+            etag=known.etag,
+            used_cache=True,
+            hash_source=hash_source or "cache",
+        )
+
+    result = await execute_task_with_metrics(
+        state,
+        task_id,
+        offer,
+        transfer_context,
+        deadline_us,
+        log_prefix=log_prefix,
+    )
+    if not result.success:
+        return PredefinedETagSubmitOutcome(
+            success=False,
+            chunk_hash=result.chunk_hash,
+            error=result.error_msg,
+        )
+
+    etag = result.etag or PREDEFINED_ETAG
+    store_predefined_etag_cache(transfer_context, result.chunk_hash, etag)
+    waited_sec = await wait_predefined_etag_min_submit_delay(offer_started_at)
+    _log_predefined_etag_submit_ready(
+        log_prefix,
+        task_id,
+        offer_id,
+        transfer_context,
+        waited_sec,
+        hash_source="computed",
+    )
+    return PredefinedETagSubmitOutcome(
+        success=True,
+        chunk_hash=result.chunk_hash,
+        etag=etag,
+        used_cache=False,
+        hash_source="computed",
+    )
+
+
+async def run_predefined_etag_background_transfer(
+    state: WorkerState,
+    task_id: str,
+    offer_id: str,
+    offer: dict,
+    transfer_context: dict,
+    deadline_us: int,
+    *,
+    log_prefix: str,
+) -> TaskExecutionResult:
+    """Run real fetch+upload after a cached early task_result."""
+    log_task_chunk_from_context(
+        "background_start",
+        transfer_context,
+        task_id=task_id,
+        offer_id=offer_id,
+        log_prefix=log_prefix,
+    )
+    result = await execute_task_with_metrics(
+        state,
+        task_id,
+        offer,
+        transfer_context,
+        deadline_us,
+        log_prefix=log_prefix,
+    )
+    if result.success and result.chunk_hash:
+        store_predefined_etag_cache(
+            transfer_context,
+            result.chunk_hash,
+            result.etag or PREDEFINED_ETAG,
+        )
+    log_task_chunk_from_context(
+        "background_done" if result.success else "background_failed",
+        transfer_context,
+        task_id=task_id,
+        offer_id=offer_id,
+        chunk_hash=result.chunk_hash,
+        log_prefix=log_prefix,
+        detail=result.error_msg or "",
+    )
+    return result
 
 
 def _build_fetch_headers(
@@ -2687,133 +2984,122 @@ async def _handle_ws_task_predefined_etag_early_result(
     transfer_context: dict,
     deadline_us: int,
 ) -> bool:
-    """Offer → parallel download + task_accept; submit when ack+hash; upload background."""
-    offer_started_at = time.perf_counter()
-    fetch_ready = FetchReadyState()
+    """Predefined ETag: cache hit submits after accept; miss fetch+upload; background if cached."""
     accept_future: asyncio.Future = asyncio.get_event_loop().create_future()
     state.pending_task_accepts[task_key] = accept_future
 
-    exec_task = asyncio.create_task(
-        execute_task_with_metrics(
+    cached = get_predefined_etag_cache(transfer_context)
+    print(
+        f"[Worker] [WS] Predefined ETag: "
+        f"{'cache hit, accept then submit' if cached else 'cache miss, fetch+upload then submit'}: "
+        f"task={task_label(task_id)} offer={task_label(offer_id)}"
+    )
+
+    async def _accept_task() -> bool:
+        if not await ws_send_task_accept(websocket, state, task_id, offer_id=offer_id):
+            return False
+        try:
+            return await asyncio.wait_for(accept_future, timeout=WS_TASK_ACCEPT_ACK_TIMEOUT)
+        except asyncio.TimeoutError:
+            return False
+
+    try:
+        outcome = await predefined_etag_submit_flow(
             state,
             task_id,
+            offer_id,
             task,
             transfer_context,
             deadline_us,
             log_prefix="[Worker] [WS]",
-            fetch_ready=fetch_ready,
-        )
-    )
-    upload_task = asyncio.create_task(
-        run_predefined_etag_background_upload(
-            state.http_client,
-            fetch_ready,
-            transfer_context,
-            task_id=task_id,
-            offer_id=offer_id,
-        )
-    )
-
-    print(
-        f"[Worker] [WS] Predefined ETag: download + task_accept in parallel: "
-        f"task={task_label(task_id)} offer={task_label(offer_id)}"
-    )
-
-    try:
-        if not await ws_send_task_accept(websocket, state, task_id, offer_id=offer_id):
-            state.pending_task_accepts.pop(task_key, None)
-            print("[Worker] [WS] Failed to send task_accept")
-            await _cancel_exec_task(exec_task, task_id, offer_id)
-            upload_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await upload_task
-            return False
-
-        print(
-            f"[Worker] [WS] Sent task_accept, waiting for ack + buffered hash: "
-            f"task={task_label(task_id)} offer={task_label(offer_id)}"
-        )
-
-        accepted, wait_error = await wait_accept_and_buffered_fetch(
-            accept_future,
-            fetch_ready,
             accept_timeout=WS_TASK_ACCEPT_ACK_TIMEOUT,
-            fetch_timeout=FETCH_TIMEOUT + 5.0,
+            accept_task=_accept_task,
         )
+    finally:
         state.pending_task_accepts.pop(task_key, None)
 
-        if not accepted:
-            print(
-                f"[Worker] [WS] Stopping download: task={task_label(task_id)} "
-                f"offer={task_label(offer_id)} reason={wait_error}"
-            )
-            await _cancel_exec_task(exec_task, task_id, offer_id)
-            upload_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await upload_task
-            return False
-
-        if wait_error:
-            if not exec_task.done():
-                await _cancel_exec_task(exec_task, task_id, offer_id)
-            else:
-                with contextlib.suppress(asyncio.CancelledError):
-                    await exec_task
-            upload_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await upload_task
+    if not outcome.success:
+        print(
+            f"[Worker] [WS] Predefined submit failed: task={task_label(task_id)} "
+            f"offer={task_label(offer_id)} reason={outcome.error}"
+        )
+        if outcome.error:
             result = TaskExecutionResult(
                 success=False,
-                bytes_transferred=fetch_ready.bytes_transferred,
-                duration_ms=round(fetch_ready.fetch_ms, 1),
-                chunk_hash=fetch_ready.chunk_hash,
-                error_msg=wait_error,
+                bytes_transferred=0,
+                duration_ms=0.0,
+                chunk_hash=outcome.chunk_hash,
+                error_msg=outcome.error,
             )
             return await _finalize_ws_task(websocket, state, task_id, offer_id, result)
+        return False
 
-        bytes_error = validate_fetch_ready_bytes(fetch_ready, transfer_context)
-        if bytes_error:
-            await _cancel_predefined_etag_tasks(
-                exec_task, upload_task, task_id=task_id, offer_id=offer_id
-            )
-            return await _finalize_ws_standard_transfer_after_accept(
+    result = TaskExecutionResult(
+        success=True,
+        bytes_transferred=int(transfer_context.get("chunk_size") or 0),
+        duration_ms=0.0,
+        chunk_hash=outcome.chunk_hash,
+        etag=outcome.etag,
+    )
+    finalized = await _finalize_ws_task(websocket, state, task_id, offer_id, result)
+
+    if outcome.used_cache:
+        asyncio.create_task(
+            _await_predefined_etag_background_transfer_task(
                 state,
-                websocket,
                 task,
                 task_id,
                 offer_id,
                 transfer_context,
                 deadline_us,
-                reason=bytes_error,
             )
-
-        waited_sec = await wait_predefined_etag_min_submit_delay(offer_started_at)
-        if waited_sec > 0:
-            print(
-                f"[Worker] [WS] accept_ack + hash ready, waited {waited_sec:.3f}s "
-                f"(min_submit={PREDEFINED_ETAG_MIN_SUBMIT_SEC:.3f}s) before task_result: "
-                f"task={task_label(task_id)} offer={task_label(offer_id)}"
-            )
-        else:
-            print(
-                f"[Worker] [WS] accept_ack + hash ready, submitting task_result: "
-                f"task={task_label(task_id)} offer={task_label(offer_id)}"
-            )
-        result = TaskExecutionResult(
-            success=True,
-            bytes_transferred=fetch_ready.bytes_transferred,
-            duration_ms=round(fetch_ready.fetch_ms, 1),
-            chunk_hash=fetch_ready.chunk_hash,
-            etag=fetch_ready.etag or PREDEFINED_ETAG,
         )
-        finalized = await _finalize_ws_task(websocket, state, task_id, offer_id, result)
-        asyncio.create_task(_await_predefined_etag_upload_task(upload_task, task_id, offer_id))
-        return finalized
+    return finalized
+
+
+async def _await_predefined_etag_background_transfer_task(
+    state: WorkerState,
+    task: dict,
+    task_id: str,
+    offer_id: str,
+    transfer_context: dict,
+    deadline_us: int,
+) -> None:
+    """Wait for background fetch+upload after cached early task_result."""
+    try:
+        result = await run_predefined_etag_background_transfer(
+            state,
+            task_id,
+            offer_id,
+            task,
+            transfer_context,
+            deadline_us,
+            log_prefix="[Worker] [WS]",
+        )
     except asyncio.CancelledError:
-        if not exec_task.done():
-            exec_task.cancel()
-        upload_task.cancel()
-        raise
+        print(
+            f"[Worker] [WS] Background transfer cancelled: task={task_label(task_id)} "
+            f"offer={task_label(offer_id)}"
+        )
+        return
+    except Exception as exc:
+        print(
+            f"[Worker] [WS] Background transfer error: task={task_label(task_id)} "
+            f"offer={task_label(offer_id)} error={exc}"
+        )
+        return
+
+    if result.success:
+        print(
+            f"[Worker] [WS] Background transfer finished after task_result: "
+            f"task={task_label(task_id)} offer={task_label(offer_id)}"
+        )
+    else:
+        print(
+            f"[Worker] [WS] Background transfer failed after task_result: "
+            f"task={task_label(task_id)} offer={task_label(offer_id)} "
+            f"error={result.error_msg}"
+        )
 
 
 async def _await_predefined_etag_upload_task(
