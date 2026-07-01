@@ -743,6 +743,14 @@ def format_route_context(context: Dict[str, Any]) -> str:
     return " " + " ".join(parts) if parts else ""
 
 
+def _emit_transfer_log(message: str, *, log_prefix: str = "[Worker]") -> None:
+    """Write transfer logs to the active worker log sink."""
+    if log_prefix == "[Embedded]":
+        logging.getLogger("core.embedded_workers").info(message)
+        return
+    print(message)
+
+
 def log_task_chunk(
     stage: str,
     *,
@@ -777,7 +785,63 @@ def log_task_chunk(
         fields.append(f"hash={chunk_hash}")
     if detail:
         fields.append(detail)
-    print(" ".join(fields))
+    _emit_transfer_log(" ".join(fields), log_prefix=log_prefix)
+
+
+def log_task_chunk_from_context(
+    stage: str,
+    transfer_context: dict,
+    *,
+    task_id: Optional[str] = None,
+    offer_id: Optional[str] = None,
+    chunk_hash: str = "",
+    log_prefix: str = "[Worker]",
+    detail: str = "",
+    chunk_index: int = 0,
+) -> None:
+    """Log a transfer stage using fields from build_transfer_context output."""
+    byte_from: Optional[int] = None
+    byte_to: Optional[int] = None
+    try:
+        byte_from = int(transfer_context.get("range_start"))
+        byte_to = int(transfer_context.get("range_end"))
+    except (TypeError, ValueError):
+        pass
+    log_task_chunk(
+        stage,
+        fetch_url=str(transfer_context.get("source_url") or ""),
+        put_url=str(transfer_context.get("dest_url") or ""),
+        chunk_index=chunk_index,
+        byte_from=byte_from,
+        byte_to=byte_to,
+        chunk_hash=chunk_hash,
+        task_id=task_id,
+        offer_id=offer_id,
+        log_prefix=log_prefix,
+        detail=detail,
+    )
+
+
+def _log_transfer_failure(
+    transfer_context: dict,
+    *,
+    task_id: str,
+    offer_id: str,
+    chunk_index: int,
+    log_prefix: str,
+    reason: str,
+    chunk_hash: str = "",
+) -> None:
+    log_task_chunk_from_context(
+        "failed",
+        transfer_context,
+        task_id=task_id,
+        offer_id=offer_id,
+        chunk_hash=chunk_hash,
+        log_prefix=log_prefix,
+        detail=f"reason={reason}",
+        chunk_index=chunk_index,
+    )
 
 
 def http_status_detail(error: Exception) -> str:
@@ -2018,10 +2082,19 @@ async def execute_transfer(
             now_us = time.time() * 1_000_000
             remaining_us = deadline_us - now_us
             if remaining_us <= 0:
+                reason = f"Deadline exceeded before chunk {chunk_index}"
+                _log_transfer_failure(
+                    transfer_context,
+                    task_id=task_id,
+                    offer_id=str(offer_id),
+                    chunk_index=chunk_index,
+                    log_prefix=log_prefix,
+                    reason=reason,
+                )
                 return (
                     total_bytes,
                     False,
-                    f"Deadline exceeded before chunk {chunk_index}",
+                    reason,
                     "",
                     last_etag,
                 )
@@ -2054,10 +2127,20 @@ async def execute_transfer(
         )
 
         if bytes_fetched != chunk_size:
+            reason = f"source range returned {bytes_fetched} bytes, expected {chunk_size}"
+            _log_transfer_failure(
+                transfer_context,
+                task_id=task_id,
+                offer_id=str(offer_id),
+                chunk_index=chunk_index,
+                log_prefix=log_prefix,
+                reason=reason,
+                chunk_hash=computed_chunk_hash or "",
+            )
             return (
                 total_bytes,
                 False,
-                f"source range returned {bytes_fetched} bytes, expected {chunk_size}",
+                reason,
                 computed_chunk_hash or "",
                 last_etag,
             )
@@ -2104,44 +2187,68 @@ async def execute_transfer(
 
     except asyncio.TimeoutError as e:
         detail = exception_detail(e)
-        print(
-            f"[Worker] Chunk {chunk_index} timeout "
-            f"task={task_label(task_id)} offer={task_label(offer_id)} error={detail}"
+        reason = f"Deadline exceeded at chunk {chunk_index}: {detail}"
+        _log_transfer_failure(
+            transfer_context,
+            task_id=task_id,
+            offer_id=str(offer_id),
+            chunk_index=chunk_index,
+            log_prefix=log_prefix,
+            reason=reason,
         )
         return (
             total_bytes,
             False,
-            f"Deadline exceeded at chunk {chunk_index}: {detail}",
+            reason,
             "",
             last_etag,
         )
     except httpx.HTTPStatusError as e:
         detail = exception_detail(e)
-        print(
-            f"[Worker] Chunk {chunk_index} HTTP failure "
-            f"task={task_label(task_id)} offer={task_label(offer_id)} "
-            f"status={e.response.status_code} error={detail}"
+        reason = f"HTTP {e.response.status_code} at chunk {chunk_index}: {detail}"
+        _log_transfer_failure(
+            transfer_context,
+            task_id=task_id,
+            offer_id=str(offer_id),
+            chunk_index=chunk_index,
+            log_prefix=log_prefix,
+            reason=reason,
         )
         return (
             total_bytes,
             False,
-            f"HTTP {e.response.status_code} at chunk {chunk_index}: {detail}",
+            reason,
             "",
             last_etag,
         )
     except Exception as e:
         detail = exception_detail(e)
-        print(
-            f"[Worker] Chunk {chunk_index} failure "
-            f"task={task_label(task_id)} offer={task_label(offer_id)} error={detail}{http_status_detail(e)}"
+        reason = f"Error at chunk {chunk_index}: {detail}"
+        _log_transfer_failure(
+            transfer_context,
+            task_id=task_id,
+            offer_id=str(offer_id),
+            chunk_index=chunk_index,
+            log_prefix=log_prefix,
+            reason=reason,
         )
-        return (total_bytes, False, f"Error at chunk {chunk_index}: {detail}", "", last_etag)
+        return (total_bytes, False, reason, "", last_etag)
 
     if transfer_context.get("etag_required") and not last_etag:
+        reason = "missing ETag from storage PUT response"
+        _log_transfer_failure(
+            transfer_context,
+            task_id=task_id,
+            offer_id=str(offer_id),
+            chunk_index=chunk_index,
+            log_prefix=log_prefix,
+            reason=reason,
+            chunk_hash=computed_chunk_hash or "",
+        )
         return (
             total_bytes,
             False,
-            "missing ETag from storage PUT response",
+            reason,
             computed_chunk_hash or "",
             last_etag,
         )

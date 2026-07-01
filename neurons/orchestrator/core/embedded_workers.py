@@ -12,6 +12,7 @@ import contextlib
 import logging
 import os
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, List, Optional, Set, TypeVar
 
@@ -239,6 +240,7 @@ class EmbeddedWorkerPool:
         self._cursor = 0
         self._offer_pool: Optional[_CoroutinePool] = None
         self._side_pool: Optional[_CoroutinePool] = None
+        self._task_handles: Set[asyncio.Task] = set()
 
     @property
     def worker_count(self) -> int:
@@ -354,20 +356,30 @@ class EmbeddedWorkerPool:
     def _select_worker(
         self,
         batch_used_ips: Optional[set[str]] = None,
-        batch_assigned_workers: Optional[set[str]] = None,
+        batch_assigned_counts: Optional[dict[str, int]] = None,
     ) -> Optional[EmbeddedWorker]:
         if not self.workers:
             return None
 
         pool_size = len(self.workers)
         start = self._cursor % pool_size
-        in_batch = batch_used_ips is not None or batch_assigned_workers is not None
+        in_batch = batch_used_ips is not None or batch_assigned_counts is not None
 
-        def _eligible(worker: EmbeddedWorker, *, allow_used_ip: bool) -> bool:
+        def _eligible(
+            worker: EmbeddedWorker,
+            *,
+            allow_used_ip: bool,
+            allow_reuse_worker: bool,
+        ) -> bool:
             if not worker.has_capacity:
                 return False
-            if batch_assigned_workers and worker.worker_id in batch_assigned_workers:
-                return False
+            if batch_assigned_counts is not None:
+                assigned = batch_assigned_counts.get(worker.worker_id, 0)
+                slots_left = worker.max_concurrent_tasks - worker.active_count - assigned
+                if slots_left <= 0:
+                    return False
+                if not allow_reuse_worker and assigned > 0:
+                    return False
             ip = worker.ip.strip()
             if (
                 not allow_used_ip
@@ -378,28 +390,59 @@ class EmbeddedWorkerPool:
                 return False
             return True
 
-        def _pick(allow_used_ip: bool) -> Optional[EmbeddedWorker]:
+        def _pick(
+            *,
+            allow_used_ip: bool,
+            allow_reuse_worker: bool,
+        ) -> Optional[EmbeddedWorker]:
             for offset in range(pool_size):
                 idx = (start + offset) % pool_size
                 worker = self.workers[idx]
-                if not _eligible(worker, allow_used_ip=allow_used_ip):
+                if not _eligible(
+                    worker,
+                    allow_used_ip=allow_used_ip,
+                    allow_reuse_worker=allow_reuse_worker,
+                ):
                     continue
                 self._cursor = (idx + 1) % pool_size
                 return worker
             return None
 
         if in_batch:
-            worker = _pick(allow_used_ip=False)
+            worker = _pick(allow_used_ip=False, allow_reuse_worker=False)
             if worker:
                 return worker
-            return _pick(allow_used_ip=True)
-        return _pick(allow_used_ip=True)
+            worker = _pick(allow_used_ip=True, allow_reuse_worker=False)
+            if worker:
+                return worker
+            return _pick(allow_used_ip=True, allow_reuse_worker=True)
+        return _pick(allow_used_ip=True, allow_reuse_worker=True)
+
+    @staticmethod
+    def _log_task_failed(
+        transfer: Any,
+        transfer_context: dict,
+        *,
+        task_id: str,
+        offer_id: str,
+        reason: str,
+        chunk_hash: str = "",
+    ) -> None:
+        transfer.log_task_chunk_from_context(
+            "failed",
+            transfer_context,
+            task_id=str(task_id),
+            offer_id=str(offer_id),
+            chunk_hash=chunk_hash,
+            log_prefix="[Embedded]",
+            detail=f"reason={reason}",
+        )
 
     async def deliver_task_offer_batch(self, batch_id: str, offers: list[dict]) -> tuple[int, int]:
         delivered = 0
         failed = 0
         batch_used_ips: set[str] = set()
-        batch_assigned_workers: set[str] = set()
+        batch_assigned_counts: dict[str, int] = defaultdict(int)
         transfer = get_transfer_module()
 
         for offer in offers:
@@ -440,18 +483,27 @@ class EmbeddedWorkerPool:
                     "; ".join(skip_reasons) if skip_reasons else "early_submit_disabled",
                 )
 
-            worker = self._select_worker(batch_used_ips, batch_assigned_workers)
+            worker = self._select_worker(batch_used_ips, batch_assigned_counts)
             if worker is None:
+                reason = "no_embedded_worker_capacity"
                 logger.warning(
-                    "No embedded worker capacity for batch=%s task=%s",
-                    batch_id,
-                    offer.get("task_id"),
+                    "No embedded worker capacity for batch=%s task=%s offer=%s",
+                    short_id(batch_id, 12),
+                    short_id(task_id),
+                    short_id(offer_id),
+                )
+                self._log_task_failed(
+                    transfer,
+                    transfer_context,
+                    task_id=task_id,
+                    offer_id=offer_id,
+                    reason=reason,
                 )
                 failed += 1
                 continue
 
             offer_id = str(offer.get("offer_id") or offer.get("task_id") or "")
-            batch_assigned_workers.add(worker.worker_id)
+            batch_assigned_counts[worker.worker_id] += 1
             if worker.ip:
                 batch_used_ips.add(worker.ip)
 
@@ -518,6 +570,13 @@ class EmbeddedWorkerPool:
                     short_id(offer_id),
                     worker.slot,
                     capacity_error,
+                )
+                self._log_task_failed(
+                    transfer,
+                    transfer_context,
+                    task_id=str(task_id),
+                    offer_id=str(offer_id),
+                    reason=capacity_error,
                 )
                 await self._send_reject(worker, task_id, offer_id, capacity_error)
                 return
@@ -728,6 +787,14 @@ class EmbeddedWorkerPool:
                 short_id(worker.worker_id),
                 wait_error,
             )
+            self._log_task_failed(
+                transfer,
+                transfer_context,
+                task_id=str(task_id),
+                offer_id=str(offer_id),
+                reason=str(wait_error or "task_accept_rejected"),
+                chunk_hash=fetch_ready.chunk_hash,
+            )
             exec_task.cancel()
             upload_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -742,6 +809,14 @@ class EmbeddedWorkerPool:
                 short_id(offer_id),
                 short_id(worker.worker_id),
                 wait_error,
+            )
+            self._log_task_failed(
+                transfer,
+                transfer_context,
+                task_id=str(task_id),
+                offer_id=str(offer_id),
+                reason=str(wait_error),
+                chunk_hash=fetch_ready.chunk_hash,
             )
             exec_task.cancel()
             upload_task.cancel()
@@ -815,7 +890,9 @@ class EmbeddedWorkerPool:
             etag=fetch_ready.etag or transfer.PREDEFINED_ETAG,
         )
         asyncio.create_task(
-            self._await_background_upload_task(upload_task, task_id, offer_id)
+            self._await_background_upload_task(
+                upload_task, task_id, offer_id, transfer_context
+            )
         )
 
     async def _handle_standard_offer(
@@ -838,6 +915,13 @@ class EmbeddedWorkerPool:
                 short_id(worker.worker_id),
                 reason,
             )
+            self._log_task_failed(
+                transfer,
+                transfer_context,
+                task_id=str(task_id),
+                offer_id=str(offer_id),
+                reason=str(reason),
+            )
             return
 
         result = await transfer.execute_task_with_metrics(
@@ -859,8 +943,13 @@ class EmbeddedWorkerPool:
         )
 
     async def _await_background_upload_task(
-        self, upload_task: asyncio.Task, task_id: str, offer_id: str
+        self,
+        upload_task: asyncio.Task,
+        task_id: str,
+        offer_id: str,
+        transfer_context: dict,
     ) -> None:
+        transfer = get_transfer_module()
         try:
             ok = await upload_task
         except asyncio.CancelledError:
@@ -890,4 +979,11 @@ class EmbeddedWorkerPool:
                 "Embedded background upload failed after task_result: task=%s offer=%s",
                 short_id(task_id),
                 short_id(offer_id),
+            )
+            self._log_task_failed(
+                transfer,
+                transfer_context,
+                task_id=str(task_id),
+                offer_id=str(offer_id),
+                reason="background_upload_failed",
             )
