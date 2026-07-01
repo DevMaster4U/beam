@@ -305,6 +305,18 @@ PREDEFINED_ETAG_MIN_SUBMIT_SEC = max(
     0.0,
     float(os.environ.get("WORKER_PREDEFINED_ETAG_MIN_SUBMIT_SEC", "0")),
 )
+try:
+    PREDEFINED_ETAG_MAX_SPEED_MBPS = max(
+        0.0,
+        float(
+            os.environ.get(
+                "WORKER_PREDEFINED_ETAG_MAX_SPEED_MBPS",
+                os.environ.get("MAX_SPEED_MBPS", "0"),
+            )
+        ),
+    )
+except ValueError:
+    PREDEFINED_ETAG_MAX_SPEED_MBPS = 0.0
 PREDEFINED_ETAG_SOURCE_URL = (
     os.environ.get(
         "WORKER_PREDEFINED_ETAG_SOURCE_URL",
@@ -441,9 +453,12 @@ class FetchReadyState:
         self.event.set()
 
 
-async def wait_predefined_etag_min_submit_delay(offer_started_at: float) -> float:
-    """Wait until offer_started_at + add before task_result."""
-    min_time = PREDEFINED_ETAG_MIN_SUBMIT_SEC
+async def wait_predefined_etag_min_submit_delay(
+    offer_started_at: float,
+    transfer_context: Optional[dict] = None,
+) -> float:
+    """Wait until offer_started_at + min submit delay before task_result."""
+    min_time = resolve_predefined_etag_min_submit_sec(transfer_context or {})
     if min_time <= 0:
         return 0.0
     elapsed = time.perf_counter() - offer_started_at
@@ -452,6 +467,42 @@ async def wait_predefined_etag_min_submit_delay(offer_started_at: float) -> floa
         await asyncio.sleep(remaining)
         return remaining
     return 0.0
+
+
+def predefined_etag_min_submit_sec_for_bytes(byte_count: int) -> float:
+    """Minimum submit delay implied by max speed (Mbps) and chunk bytes."""
+    if PREDEFINED_ETAG_MAX_SPEED_MBPS <= 0 or byte_count <= 0:
+        return 0.0
+    return (byte_count * 8) / (PREDEFINED_ETAG_MAX_SPEED_MBPS * 1_000_000)
+
+
+def resolve_predefined_etag_min_submit_sec(transfer_context: dict) -> float:
+    """Return min delay before task_result: max(fixed floor, bytes/max_speed)."""
+    try:
+        byte_count = int(transfer_context.get("chunk_size") or 0)
+    except (TypeError, ValueError):
+        byte_count = 0
+    speed_delay = predefined_etag_min_submit_sec_for_bytes(byte_count)
+    return max(PREDEFINED_ETAG_MIN_SUBMIT_SEC, speed_delay)
+
+
+def format_predefined_etag_min_submit_detail(transfer_context: dict) -> str:
+    """Human-readable min-submit breakdown for logs."""
+    try:
+        byte_count = int(transfer_context.get("chunk_size") or 0)
+    except (TypeError, ValueError):
+        byte_count = 0
+    speed_delay = predefined_etag_min_submit_sec_for_bytes(byte_count)
+    resolved = max(PREDEFINED_ETAG_MIN_SUBMIT_SEC, speed_delay)
+    parts = [f"min_submit={resolved:.3f}s"]
+    if PREDEFINED_ETAG_MIN_SUBMIT_SEC > 0:
+        parts.append(f"floor={PREDEFINED_ETAG_MIN_SUBMIT_SEC:.3f}s")
+    if PREDEFINED_ETAG_MAX_SPEED_MBPS > 0 and byte_count > 0:
+        parts.append(
+            f"speed={PREDEFINED_ETAG_MAX_SPEED_MBPS:.1f}mbps "
+            f"bytes={byte_count} delay={speed_delay:.3f}s"
+        )
+    return " ".join(parts)
 
 
 async def upload_buffered_predefined_etag(
@@ -1728,7 +1779,7 @@ def _log_predefined_etag_submit_ready(
     if waited_sec > 0:
         detail = (
             f"accept_ack + {kind}, waited {waited_sec:.3f}s "
-            f"(min_submit={PREDEFINED_ETAG_MIN_SUBMIT_SEC:.3f}s) before task_result"
+            f"({format_predefined_etag_min_submit_detail(transfer_context)}) before task_result"
         )
     else:
         detail = f"accept_ack + {kind}, submitting task_result"
@@ -1783,7 +1834,9 @@ async def predefined_etag_submit_flow(
         return PredefinedETagSubmitOutcome(success=False, error="task_accept rejected")
 
     if known:
-        waited_sec = await wait_predefined_etag_min_submit_delay(offer_started_at)
+        waited_sec = await wait_predefined_etag_min_submit_delay(
+            offer_started_at, transfer_context
+        )
         _log_predefined_etag_submit_ready(
             log_prefix,
             task_id,
@@ -1817,7 +1870,9 @@ async def predefined_etag_submit_flow(
 
     etag = result.etag or PREDEFINED_ETAG
     store_predefined_etag_cache(transfer_context, result.chunk_hash, etag)
-    waited_sec = await wait_predefined_etag_min_submit_delay(offer_started_at)
+    waited_sec = await wait_predefined_etag_min_submit_delay(
+        offer_started_at, transfer_context
+    )
     _log_predefined_etag_submit_ready(
         log_prefix,
         task_id,
