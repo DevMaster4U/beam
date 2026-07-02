@@ -224,8 +224,6 @@ def _load_workspace_env() -> None:
 if os.environ.get("BEAM_SKIP_WORKER_BOOTSTRAP") != "1":
     _load_workspace_env()
     configure_worker_logging()
-elif not LOADED_ENV_FILES:
-    _load_workspace_env()
 
 # =============================================================================
 # Configuration

@@ -34,7 +34,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from core.config import configure_orchestrator_logging, get_settings
+from core.config import configure_orchestrator_logging, get_settings, _orchestrator_instance_name
 from core.orchestrator import Orchestrator, get_orchestrator
 from middleware.metrics import MetricsMiddleware, get_metrics_collector, get_metrics_response
 from middleware.rate_limiting import RateLimitMiddleware, get_rate_limiter
@@ -69,6 +69,11 @@ async def lifespan(app: FastAPI):
 
     settings = get_settings()
 
+    # Log to file before heavy imports (worker transfer module, control-server WS).
+    log_path = configure_orchestrator_logging(force=True)
+    logger.info("Orchestrator log file: %s", log_path)
+    logging.getLogger().setLevel(settings.log_level)
+
     try:
         from neurons.common.wallet_sync import ensure_wallets_from_control_server
 
@@ -77,19 +82,28 @@ async def lifespan(app: FastAPI):
         logger.error("Failed to sync wallet from control-server: %s", exc)
         raise
 
+    from neurons.common.control_client import get_control_server_config
     from core.transfer_loader import get_transfer_module
     from neurons.common.control_ws_client import start_control_ws_client, stop_control_ws_client
 
+    cs_cfg = get_control_server_config()
+    if cs_cfg.cache_ws_enabled:
+        logger.info(
+            "Control-server cache WS enabled miner_id=%s url=%s",
+            cs_cfg.miner_id or _orchestrator_instance_name(),
+            cs_cfg.ws_url,
+        )
+    else:
+        logger.warning(
+            "Control-server cache WS disabled — set CONTROL_SERVER_WS_URL=ws://host:port/ws/miners "
+            "and CONTROL_SERVER_SECRET in config/orchestrators/%s.env",
+            _orchestrator_instance_name(),
+        )
+
+    logger.info("Loading embedded transfer module...")
     transfer = get_transfer_module()
     transfer.setup_control_server_cache_sync()
     await start_control_ws_client()
-
-    # Re-apply file logging after imports (bittensor/uvicorn can touch logging config).
-    log_path = configure_orchestrator_logging(force=True)
-    logger.info("Orchestrator log file: %s", log_path)
-
-    # Configure logging level
-    logging.getLogger().setLevel(settings.log_level)
 
     # Initialize rate limiter
     rate_limiter = get_rate_limiter()
