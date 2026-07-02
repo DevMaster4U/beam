@@ -92,11 +92,11 @@ print_control_info() {
     echo "  journal: journalctl -u ${SERVICE} -n 50 --no-pager"
   fi
   if [[ "$host" == "0.0.0.0" || "$host" == "::" ]]; then
-    echo "  url: http://127.0.0.1:${port}"
-    echo "  ws: ws://127.0.0.1:${port}/ws/miners"
+    echo "  http: http://127.0.0.1:${port}  (wallet/env bootstrap only)"
+    echo "  ws:   ws://127.0.0.1:${port}/ws/miners  (cache broadcast — miners use this)"
   else
-    echo "  url: http://${host}:${port}"
-    echo "  ws: ws://${host}:${port}/ws/miners"
+    echo "  http: http://${host}:${port}  (wallet/env bootstrap only)"
+    echo "  ws:   ws://${host}:${port}/ws/miners  (cache broadcast — miners use this)"
   fi
 }
 

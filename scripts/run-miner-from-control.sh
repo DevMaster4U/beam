@@ -20,8 +20,10 @@ usage() {
 Usage: $0 <miner_id> [orchestrator|worker] [--foreground] [extra args...]
 
 Environment:
-  CONTROL_SERVER_URL      Base URL, e.g. http://10.0.0.1:8010
-  CONTROL_SERVER_SECRET   Shared secret (X-Control-Server-Secret)
+  CONTROL_SERVER_WS_URL   WebSocket for cache broadcast, e.g. ws://10.0.0.1:8010/ws/miners
+  CONTROL_SERVER_SECRET   Shared secret (X-Control-Server-Secret / hello message)
+  CONTROL_SERVER_MINER_ID Unique id per miner server
+  CONTROL_SERVER_URL      Optional HTTP base for env/wallet bootstrap (derived from WS if omitted)
 EOF
 }
 
@@ -49,11 +51,26 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-: "${CONTROL_SERVER_URL:?CONTROL_SERVER_URL is required}"
+: "${CONTROL_SERVER_WS_URL:?CONTROL_SERVER_WS_URL is required (e.g. ws://host:8010/ws/miners)}"
 : "${CONTROL_SERVER_SECRET:?CONTROL_SERVER_SECRET is required}"
 
 export CONTROL_SERVER_MINER_ID="$MINER_ID"
 export PYTHONPATH="${ROOT}:${PYTHONPATH:-}"
+
+# Derive HTTP base for env/wallet REST if not set
+if [[ -z "${CONTROL_SERVER_URL:-}" ]]; then
+  CONTROL_SERVER_URL="$(
+    python3 - <<'PY'
+import os
+from neurons.common.control_client import resolve_control_server_urls
+http_url, _ = resolve_control_server_urls()
+if not http_url:
+    raise SystemExit("Failed to derive CONTROL_SERVER_URL from CONTROL_SERVER_WS_URL")
+print(http_url)
+PY
+  )"
+  export CONTROL_SERVER_URL
+fi
 
 ENV_DIR="${ROOT}/config/miners"
 mkdir -p "$ENV_DIR"

@@ -8,19 +8,8 @@ import json
 import logging
 import os
 from typing import Any, Callable, Optional
-from urllib.parse import urlparse, urlunparse
-
-from neurons.common.control_client import get_control_server_config
 
 logger = logging.getLogger(__name__)
-
-try:
-    import websockets
-    from websockets.exceptions import ConnectionClosed
-
-    WEBSOCKETS_AVAILABLE = True
-except ImportError:
-    WEBSOCKETS_AVAILABLE = False
 
 MergeHandler = Callable[[str, str, str], None]
 SnapshotHandler = Callable[[dict[str, dict[str, str]]], None]
@@ -42,10 +31,13 @@ def register_cache_snapshot_handler(handler: SnapshotHandler) -> None:
     _snapshot_handler = handler
 
 
-def _http_to_ws_url(http_url: str) -> str:
-    parsed = urlparse(http_url.strip())
-    scheme = "wss" if parsed.scheme == "https" else "ws"
-    return urlunparse((scheme, parsed.netloc, "/ws/miners", "", "", ""))
+try:
+    import websockets
+    from websockets.exceptions import ConnectionClosed
+
+    WEBSOCKETS_AVAILABLE = True
+except ImportError:
+    WEBSOCKETS_AVAILABLE = False
 
 
 def schedule_cache_update(key: str, chunk_hash: str, etag: str) -> None:
@@ -107,13 +99,14 @@ async def _client_loop() -> None:
     assert _update_queue is not None
 
     cfg = get_control_server_config()
-    ws_url = _http_to_ws_url(cfg.url)
+    ws_url = cfg.ws_url
     reconnect_delay = float(os.environ.get("CONTROL_SERVER_WS_RECONNECT_SEC", "3.0"))
 
     while not _stop_event.is_set():
-        if not cfg.enabled:
+        cfg = get_control_server_config()
+        ws_url = cfg.ws_url
+        if not cfg.cache_ws_enabled:
             await asyncio.sleep(reconnect_delay)
-            cfg = get_control_server_config()
             continue
         if not WEBSOCKETS_AVAILABLE:
             logger.error("websockets package required for control-server cache sync")
@@ -180,7 +173,10 @@ async def _client_loop() -> None:
 async def start_control_ws_client() -> None:
     global _update_queue, _client_task, _stop_event
     cfg = get_control_server_config()
-    if not cfg.enabled:
+    if not cfg.cache_ws_enabled:
+        logger.info(
+            "Control-server WS cache sync disabled (set CONTROL_SERVER_WS_URL=ws://host:port/ws/miners)"
+        )
         return
     if _client_task is not None and not _client_task.done():
         return
