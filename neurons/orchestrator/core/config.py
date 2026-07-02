@@ -15,6 +15,8 @@ from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings
 
 _WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
+if str(_WORKSPACE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_WORKSPACE_ROOT))
 _ENV_LOADED = False
 
 

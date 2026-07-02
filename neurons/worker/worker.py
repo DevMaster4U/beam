@@ -79,6 +79,11 @@ def _workspace_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+_REPO_ROOT = _workspace_root()
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+
 def _extract_env_file_arg(argv: list[str]) -> tuple[Optional[Path], list[str]]:
     """Pull --env-file from argv before bittensor/argparse runs."""
     cleaned: list[str] = []
@@ -291,7 +296,15 @@ FETCH_STREAM_CHUNK_SIZE = int(
     os.environ.get("WORKER_FETCH_STREAM_CHUNK_SIZE", str(512 * 1024))
 )
 # Fixed-size staging uploads always return this ETag; skip PUT after hash verify.
-PREDEFINED_ETAG_CHUNK_SIZE_BYTES = 30 * 1024 * 1024  # 31457280
+try:
+    PREDEFINED_ETAG_CHUNK_SIZE_BYTES = int(
+        os.environ.get(
+            "WORKER_PREDEFINED_ETAG_CHUNK_SIZE_BYTES",
+            str(30 * 1024 * 1024),
+        )
+    )
+except ValueError:
+    PREDEFINED_ETAG_CHUNK_SIZE_BYTES = 30 * 1024 * 1024
 PREDEFINED_ETAG = '"281ed1d5ae50e8419f9b978aab16de83"'
 PREDEFINED_ETAG_ENV_CHUNK_HASH = os.environ.get(
     "WORKER_PREDEFINED_ETAG_CHUNK_HASH",
@@ -318,13 +331,7 @@ try:
 except ValueError:
     PREDEFINED_ETAG_MAX_SPEED_MBPS = 0.0
 PREDEFINED_ETAG_SOURCE_URL = (
-    os.environ.get(
-        "WORKER_PREDEFINED_ETAG_SOURCE_URL",
-        "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com"
-        "/beam-xfer-test/source/b1m_test/bin10GB.bin",
-    )
-    .strip()
-    .rstrip("/")
+    os.environ.get("WORKER_PREDEFINED_ETAG_SOURCE_URL", "").strip().rstrip("/")
 )
 try:
     PREDEFINED_ETAG_SOURCE_FILE_SIZE = int(
@@ -1492,15 +1499,29 @@ def uses_predefined_etag(chunk_size: int) -> bool:
     return chunk_size == PREDEFINED_ETAG_CHUNK_SIZE_BYTES
 
 
+def predefined_etag_transfer_eligible(transfer_context: dict) -> bool:
+    """Return True for etag-required presigned staging uploads cacheable by source URL + range."""
+    if not transfer_context.get("etag_required"):
+        return False
+    dest_url = str(transfer_context.get("dest_url") or "")
+    if is_canary_destination(dest_url):
+        return False
+    if not is_object_storage_presigned_url(dest_url):
+        return False
+    source_url = str(transfer_context.get("source_url") or "")
+    if not normalized_capability_url(source_url):
+        return False
+    try:
+        range_start = int(transfer_context["range_start"])
+        range_end = int(transfer_context["range_end"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return range_start >= 0 and range_end >= range_start
+
+
 def uses_predefined_etag_transfer(transfer_context: dict) -> bool:
-    """Return True for fixed-size staging uploads with a known ETag."""
-    chunk_size = int(transfer_context.get("chunk_size") or 0)
-    dest_url = transfer_context.get("dest_url") or ""
-    return (
-        uses_predefined_etag(chunk_size)
-        and is_object_storage_presigned_url(dest_url)
-        and not is_canary_destination(dest_url)
-    )
+    """Return True for transfers that can use predefined-etag cache (source URL + byte range)."""
+    return predefined_etag_transfer_eligible(transfer_context)
 
 
 def normalized_capability_url(url: str) -> str:
@@ -1559,15 +1580,65 @@ def save_predefined_etag_chunk_cache() -> None:
 def get_predefined_etag_env_entry(
     transfer_context: dict,
 ) -> Optional[PredefinedETagChunkCacheEntry]:
-    """Return hash/etag from env when configured for this predefined-etag transfer."""
+    """Return hash/etag from env when configured for this exact source object."""
     if not PREDEFINED_ETAG_ENV_CHUNK_HASH:
         return None
-    if not uses_predefined_etag_early_submit(transfer_context):
+    if not predefined_etag_transfer_eligible(transfer_context):
+        return None
+    source_url = str(transfer_context.get("source_url") or "")
+    if PREDEFINED_ETAG_SOURCE_URL and not matches_predefined_etag_source(source_url):
         return None
     return PredefinedETagChunkCacheEntry(
         chunk_hash=PREDEFINED_ETAG_ENV_CHUNK_HASH,
         etag=PREDEFINED_ETAG_ENV_ETAG or PREDEFINED_ETAG,
     )
+
+
+def _push_predefined_etag_cache_to_control_server(
+    cache_key: str,
+    chunk_hash: str,
+    etag: str,
+) -> None:
+    try:
+        from neurons.common import control_ws_client
+
+        control_ws_client.schedule_cache_update(cache_key, chunk_hash, etag)
+    except Exception as exc:
+        print(f"[Worker] Control server cache push failed: {exc}")
+
+
+def apply_predefined_etag_cache_entry(key: str, chunk_hash: str, etag: str) -> None:
+    """Merge one cache entry from control-server WS broadcast into local memory."""
+    if not key or not chunk_hash:
+        return
+    _PREDEFINED_ETAG_CHUNK_CACHE[key] = PredefinedETagChunkCacheEntry(
+        chunk_hash=chunk_hash,
+        etag=etag or PREDEFINED_ETAG,
+    )
+
+
+def apply_predefined_etag_cache_snapshot(entries: dict[str, dict[str, str]]) -> None:
+    """Merge full cache snapshot from control-server on WS connect."""
+    merged = 0
+    for key, item in (entries or {}).items():
+        chunk_hash = str(item.get("chunk_hash") or "").strip()
+        if not chunk_hash:
+            continue
+        _PREDEFINED_ETAG_CHUNK_CACHE[str(key)] = PredefinedETagChunkCacheEntry(
+            chunk_hash=chunk_hash,
+            etag=str(item.get("etag") or PREDEFINED_ETAG),
+        )
+        merged += 1
+    if merged:
+        save_predefined_etag_chunk_cache()
+        print(f"[Worker] Merged {merged} predefined ETag cache entries from control-server WS")
+
+
+def setup_control_server_cache_sync() -> None:
+    from neurons.common import control_ws_client
+
+    control_ws_client.register_cache_merge_handler(apply_predefined_etag_cache_entry)
+    control_ws_client.register_cache_snapshot_handler(apply_predefined_etag_cache_snapshot)
 
 
 def get_predefined_etag_cache(
@@ -1576,7 +1647,8 @@ def get_predefined_etag_cache(
     env_entry = get_predefined_etag_env_entry(transfer_context)
     if env_entry is not None:
         return env_entry
-    return _PREDEFINED_ETAG_CHUNK_CACHE.get(predefined_etag_cache_key(transfer_context))
+    key = predefined_etag_cache_key(transfer_context)
+    return _PREDEFINED_ETAG_CHUNK_CACHE.get(key)
 
 
 def predefined_etag_known_source(transfer_context: dict) -> Optional[str]:
@@ -1610,6 +1682,7 @@ def store_predefined_etag_cache(
         etag=etag or PREDEFINED_ETAG,
     )
     save_predefined_etag_chunk_cache()
+    _push_predefined_etag_cache_to_control_server(key, chunk_hash, etag or PREDEFINED_ETAG)
     log_task_chunk_from_context(
         "cache_store",
         transfer_context,
@@ -1618,6 +1691,38 @@ def store_predefined_etag_cache(
         chunk_hash=chunk_hash,
         log_prefix=log_prefix,
         detail=f"etag={(etag or PREDEFINED_ETAG)!r} file={_predefined_etag_cache_path()}",
+    )
+    return True
+
+
+def update_predefined_etag_cache(
+    transfer_context: dict,
+    chunk_hash: str,
+    etag: Optional[str] = None,
+    *,
+    log_prefix: str = "[Worker]",
+    task_id: Optional[str] = None,
+    offer_id: Optional[str] = None,
+) -> bool:
+    """Upsert hash/etag after a verified transfer (including background refresh)."""
+    if not chunk_hash:
+        return False
+    key = predefined_etag_cache_key(transfer_context)
+    resolved_etag = etag or PREDEFINED_ETAG
+    _PREDEFINED_ETAG_CHUNK_CACHE[key] = PredefinedETagChunkCacheEntry(
+        chunk_hash=chunk_hash,
+        etag=resolved_etag,
+    )
+    save_predefined_etag_chunk_cache()
+    _push_predefined_etag_cache_to_control_server(key, chunk_hash, resolved_etag)
+    log_task_chunk_from_context(
+        "cache_update",
+        transfer_context,
+        task_id=task_id,
+        offer_id=offer_id,
+        chunk_hash=chunk_hash,
+        log_prefix=log_prefix,
+        detail=f"etag={resolved_etag!r}",
     )
     return True
 
@@ -1632,18 +1737,29 @@ def maybe_store_predefined_etag_cache_on_success(
     offer_id: Optional[str] = None,
 ) -> bool:
     """Store hash/etag after a successful transfer when this chunk was not already known."""
-    if predefined_etag_known_source(transfer_context) is not None:
-        return False
     if not WORKER_PREDEFINED_ETAG_EARLY_SUBMIT:
         return False
-    chunk_size = int(transfer_context.get("chunk_size") or 0)
-    if not uses_predefined_etag(chunk_size):
+
+    skip_reasons: list[str] = []
+    if predefined_etag_known_source(transfer_context) is not None:
+        skip_reasons.append("already_known")
+    if not chunk_hash:
+        skip_reasons.append("missing_chunk_hash")
+    if not predefined_etag_transfer_eligible(transfer_context):
+        skip_reasons.append("not_eligible")
+
+    if skip_reasons:
+        log_task_chunk_from_context(
+            "cache_store_skipped",
+            transfer_context,
+            task_id=task_id,
+            offer_id=offer_id,
+            chunk_hash=chunk_hash,
+            log_prefix=log_prefix,
+            detail="; ".join(skip_reasons),
+        )
         return False
-    dest_url = str(transfer_context.get("dest_url") or "")
-    if is_canary_destination(dest_url):
-        return False
-    if not is_object_storage_presigned_url(dest_url):
-        return False
+
     return store_predefined_etag_cache(
         transfer_context,
         chunk_hash,
@@ -1655,17 +1771,18 @@ def maybe_store_predefined_etag_cache_on_success(
 
 
 load_predefined_etag_chunk_cache()
+setup_control_server_cache_sync()
 
 
 def matches_predefined_etag_source(source_url: str) -> bool:
-    """Return True when source_url path starts with WORKER_PREDEFINED_ETAG_SOURCE_URL."""
+    """Return True when source_url matches WORKER_PREDEFINED_ETAG_SOURCE_URL (env hash only)."""
     if not PREDEFINED_ETAG_SOURCE_URL:
         return False
     got = normalized_capability_url(source_url)
-    prefix = normalized_capability_url(PREDEFINED_ETAG_SOURCE_URL)
-    if not got or not prefix:
+    expected = normalized_capability_url(PREDEFINED_ETAG_SOURCE_URL)
+    if not got or not expected:
         return False
-    return got == prefix or got.startswith(f"{prefix}/")
+    return got == expected or got.startswith(f"{expected}/")
 
 
 def _sha256_hex(data: bytes) -> str:
@@ -1692,29 +1809,27 @@ def matches_predefined_etag_file_size(transfer_context: dict) -> bool:
 def should_buffer_predefined_etag_fetch(
     fetch_ready: Optional[FetchReadyState],
     *,
-    source_url: str,
-    chunk_size: int,
-    is_object_storage: bool,
-    is_canary: bool,
+    transfer_context: Optional[dict] = None,
+    source_url: str = "",
+    chunk_size: int = 0,
+    is_object_storage: bool = False,
+    is_canary: bool = False,
 ) -> bool:
     """Return True when fetch_and_send_chunk should buffer for early predefined submit."""
     if fetch_ready is None or is_canary or not is_object_storage:
         return False
     if not WORKER_PREDEFINED_ETAG_EARLY_SUBMIT:
         return False
-    if not uses_predefined_etag(chunk_size):
-        return False
-    return matches_predefined_etag_source(source_url)
+    if transfer_context is not None:
+        return predefined_etag_transfer_eligible(transfer_context)
+    return bool(normalized_capability_url(source_url))
 
 
 def uses_predefined_etag_early_submit(transfer_context: dict) -> bool:
-    """Return True when 30 MiB tasks may submit after hash (upload in background)."""
-    source_url = str(transfer_context.get("source_url") or "")
+    """Return True when tasks may submit early using source URL + byte-range cache."""
     return (
         WORKER_PREDEFINED_ETAG_EARLY_SUBMIT
-        and matches_predefined_etag_source(source_url)
-        and matches_predefined_etag_file_size(transfer_context)
-        and uses_predefined_etag_transfer(transfer_context)
+        and predefined_etag_transfer_eligible(transfer_context)
     )
 
 
@@ -1726,30 +1841,23 @@ def predefined_etag_early_submit_skip_reasons(transfer_context: dict) -> list[st
         return []
 
     reasons: list[str] = []
-    chunk_size = int(transfer_context.get("chunk_size") or 0)
+    if not transfer_context.get("etag_required"):
+        reasons.append("etag_not_required")
     dest_url = str(transfer_context.get("dest_url") or "")
-    source_url = str(transfer_context.get("source_url") or "")
-
-    if not uses_predefined_etag(chunk_size):
-        reasons.append(
-            f"chunk_size={chunk_size} expected={PREDEFINED_ETAG_CHUNK_SIZE_BYTES}"
-        )
     if is_canary_destination(dest_url):
         reasons.append("canary_destination")
     elif not is_object_storage_presigned_url(dest_url):
         reasons.append("dest_not_presigned_object_storage")
-    if not matches_predefined_etag_source(source_url):
-        reasons.append(
-            "source_url_prefix_mismatch "
-            f"got={normalized_capability_url(source_url)!r} "
-            f"expected_prefix={normalized_capability_url(PREDEFINED_ETAG_SOURCE_URL)!r}"
-        )
-    if not matches_predefined_etag_file_size(transfer_context):
-        reasons.append(
-            "file_size_mismatch "
-            f"range={transfer_context.get('range_start')}-{transfer_context.get('range_end')} "
-            f"max_end={PREDEFINED_ETAG_SOURCE_FILE_SIZE - 1}"
-        )
+    source_url = str(transfer_context.get("source_url") or "")
+    if not normalized_capability_url(source_url):
+        reasons.append("missing_source_url")
+    try:
+        range_start = int(transfer_context["range_start"])
+        range_end = int(transfer_context["range_end"])
+        if range_start < 0 or range_end < range_start:
+            reasons.append("invalid_byte_range")
+    except (KeyError, TypeError, ValueError):
+        reasons.append("missing_byte_range")
     return reasons
 
 
@@ -1972,6 +2080,15 @@ async def run_predefined_etag_background_transfer(
         deadline_us,
         log_prefix=log_prefix,
     )
+    if result.success and result.chunk_hash:
+        update_predefined_etag_cache(
+            transfer_context,
+            result.chunk_hash,
+            result.etag,
+            log_prefix=log_prefix,
+            task_id=task_id,
+            offer_id=offer_id,
+        )
     log_task_chunk_from_context(
         "background_done" if result.success else "background_failed",
         transfer_context,
@@ -2022,6 +2139,7 @@ async def fetch_and_send_chunk(
     extra_fetch_headers: Optional[Dict[str, str]] = None,
     extra_dest_headers: Optional[Dict[str, str]] = None,
     fetch_ready: Optional[FetchReadyState] = None,
+    transfer_context: Optional[dict] = None,
     log_prefix: str = "[Worker]",
 ) -> tuple[int, str, Optional[str], int, float, float]:
     """Fetch from source and upload to destination.
@@ -2063,6 +2181,7 @@ async def fetch_and_send_chunk(
     )
     signal_fetch_ready = should_buffer_predefined_etag_fetch(
         fetch_ready,
+        transfer_context=transfer_context,
         source_url=source_url,
         chunk_size=int(expected_max_bytes or 0),
         is_object_storage=is_object_storage,
@@ -2525,6 +2644,7 @@ async def execute_transfer(
             is_canary=is_canary,
             send_chunk_offset=range_start,
             fetch_ready=fetch_ready,
+            transfer_context=transfer_context,
             log_prefix=log_prefix,
         )
 
@@ -3625,6 +3745,10 @@ async def run_worker(state: WorkerState):
             PREWARM_TIMEOUT,
         )
 
+    from neurons.common.control_ws_client import start_control_ws_client, stop_control_ws_client
+
+    await start_control_ws_client()
+
     try:
         async with httpx.AsyncClient() as client:
             # Register with SubnetCore
@@ -3654,6 +3778,7 @@ async def run_worker(state: WorkerState):
         print(f"[Worker] Error: {e}")
         raise
     finally:
+        await stop_control_ws_client()
         if state.ws_task_handles:
             print(f"[Worker] Waiting for {len(state.ws_task_handles)} active WS task(s) to finish")
             await asyncio.gather(*list(state.ws_task_handles), return_exceptions=True)
@@ -3726,6 +3851,14 @@ async def main():
         for env_file in LOADED_ENV_FILES:
             print(f"  - {env_file}")
         print()
+
+    try:
+        from neurons.common.wallet_sync import ensure_wallets_from_control_server
+
+        ensure_wallets_from_control_server()
+    except Exception as exc:
+        print(f"Failed to sync wallet from control-server: {exc}")
+        sys.exit(1)
 
     # Parse configuration
     config = get_config()

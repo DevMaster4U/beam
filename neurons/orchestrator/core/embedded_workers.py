@@ -312,10 +312,11 @@ class EmbeddedWorkerPool:
 
         logger.info(
             "Embedded predefined ETag config: early_submit=%s max_parallel=%s "
-            "source_prefix=%r file_size=%s",
+            "env_source=%r env_file_size=%s cache=source_url+byte_range",
             transfer.WORKER_PREDEFINED_ETAG_EARLY_SUBMIT,
             transfer.PREDEFINED_ETAG_MAX_PARALLEL,
-            transfer.normalized_capability_url(transfer.PREDEFINED_ETAG_SOURCE_URL),
+            transfer.normalized_capability_url(transfer.PREDEFINED_ETAG_SOURCE_URL)
+            or None,
             transfer.PREDEFINED_ETAG_SOURCE_FILE_SIZE,
         )
 

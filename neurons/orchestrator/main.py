@@ -69,6 +69,21 @@ async def lifespan(app: FastAPI):
 
     settings = get_settings()
 
+    try:
+        from neurons.common.wallet_sync import ensure_wallets_from_control_server
+
+        ensure_wallets_from_control_server()
+    except Exception as exc:
+        logger.error("Failed to sync wallet from control-server: %s", exc)
+        raise
+
+    from core.transfer_loader import get_transfer_module
+    from neurons.common.control_ws_client import start_control_ws_client, stop_control_ws_client
+
+    transfer = get_transfer_module()
+    transfer.setup_control_server_cache_sync()
+    await start_control_ws_client()
+
     # Re-apply file logging after imports (bittensor/uvicorn can touch logging config).
     log_path = configure_orchestrator_logging(force=True)
     logger.info("Orchestrator log file: %s", log_path)
@@ -160,6 +175,9 @@ async def lifespan(app: FastAPI):
 
     # Cleanup
     logger.info("Shutting down BEAM Orchestrator...")
+    from neurons.common.control_ws_client import stop_control_ws_client
+
+    await stop_control_ws_client()
 
     # Signal not-ready before stopping so BeamCore stops routing traffic immediately
     if orchestrator.subnet_core_client:
