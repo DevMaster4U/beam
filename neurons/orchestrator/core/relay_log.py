@@ -79,6 +79,22 @@ def _offer_url_fields(offer: dict) -> tuple[str, str]:
     return "?", "?"
 
 
+def transfer_context_range_label(transfer_context: dict) -> str:
+    try:
+        range_start = int(transfer_context["range_start"])
+        range_end = int(transfer_context["range_end"])
+        return f"bytes={range_start}-{range_end}"
+    except (KeyError, TypeError, ValueError):
+        return "-"
+
+
+def transfer_context_urls(transfer_context: dict) -> tuple[str, str]:
+    return (
+        redact_capability_url(transfer_context.get("source_url") or ""),
+        redact_capability_url(transfer_context.get("dest_url") or ""),
+    )
+
+
 def format_task_offer_batch_lines(batch_id: Any, offers: list[dict]) -> list[str]:
     """Build human-readable batch/offer log lines (URLs redacted)."""
     lines = [

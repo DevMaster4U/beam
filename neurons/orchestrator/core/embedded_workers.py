@@ -20,10 +20,122 @@ import bittensor as bt
 import httpx
 
 from core.config import OrchestratorSettings
-from core.relay_log import short_id
+from core.relay_log import short_id, transfer_context_range_label, transfer_context_urls
 from core.transfer_loader import get_transfer_module
 
 logger = logging.getLogger(__name__)
+
+_WORKERS_LOG = "_workers |"
+
+
+def _log_embedded_task_offer(
+    *,
+    batch_id: str,
+    task_id: str,
+    offer_id: str,
+    worker_slot: int,
+    worker_id: str,
+    transfer_context: dict,
+    path: str,
+) -> None:
+    src, dest = transfer_context_urls(transfer_context)
+    logger.info(
+        "%s task_offer batch=%s task=%s offer=%s worker_slot=%s worker_id=%s "
+        "path=%s src=%s range=%s dest=%s chunk_size=%s",
+        _WORKERS_LOG,
+        short_id(batch_id, 12),
+        short_id(task_id),
+        short_id(offer_id),
+        worker_slot,
+        short_id(worker_id),
+        path,
+        src,
+        transfer_context_range_label(transfer_context),
+        dest,
+        transfer_context.get("chunk_size", "?"),
+    )
+
+
+def _log_embedded_transfer(
+    *,
+    task_id: str,
+    offer_id: str,
+    transfer_context: dict,
+    chunk_hash: str = "",
+    etag: str = "",
+    cached: Optional[bool] = None,
+    stage: str = "transfer",
+) -> None:
+    src, dest = transfer_context_urls(transfer_context)
+    cached_label = "?" if cached is None else str(cached).lower()
+    logger.info(
+        "%s %s task=%s offer=%s src=%s range=%s hash=%s etag=%s cached=%s dest=%s",
+        _WORKERS_LOG,
+        stage,
+        short_id(task_id),
+        short_id(offer_id),
+        src,
+        transfer_context_range_label(transfer_context),
+        chunk_hash or "-",
+        etag or "-",
+        cached_label,
+        dest,
+    )
+
+
+def _log_embedded_task_failed(
+    *,
+    task_id: str,
+    offer_id: str,
+    transfer_context: dict,
+    reason: str,
+    chunk_hash: str = "",
+    etag: str = "",
+    cached: Optional[bool] = None,
+) -> None:
+    src, dest = transfer_context_urls(transfer_context)
+    cached_label = "?" if cached is None else str(cached).lower()
+    logger.warning(
+        "%s failed task=%s offer=%s reason=%s src=%s range=%s hash=%s etag=%s cached=%s dest=%s",
+        _WORKERS_LOG,
+        short_id(task_id),
+        short_id(offer_id),
+        reason,
+        src,
+        transfer_context_range_label(transfer_context),
+        chunk_hash or "-",
+        etag or "-",
+        cached_label,
+        dest,
+    )
+
+
+def _log_embedded_task_completed(
+    *,
+    task_id: str,
+    offer_id: str,
+    worker_id: str,
+    transfer_context: dict,
+    chunk_hash: str = "",
+    etag: str = "",
+    cached: Optional[bool] = None,
+) -> None:
+    src, dest = transfer_context_urls(transfer_context)
+    cached_label = "?" if cached is None else str(cached).lower()
+    logger.info(
+        "%s Embedded task completed on BeamCore task=%s offer=%s worker=%s "
+        "src=%s range=%s hash=%s etag=%s cached=%s dest=%s",
+        _WORKERS_LOG,
+        short_id(task_id),
+        short_id(offer_id),
+        short_id(worker_id),
+        src,
+        transfer_context_range_label(transfer_context),
+        chunk_hash or "-",
+        etag or "-",
+        cached_label,
+        dest,
+    )
 
 
 @dataclass
@@ -428,7 +540,18 @@ class EmbeddedWorkerPool:
         offer_id: str,
         reason: str,
         chunk_hash: str = "",
+        etag: str = "",
+        cached: Optional[bool] = None,
     ) -> None:
+        _log_embedded_task_failed(
+            task_id=str(task_id),
+            offer_id=str(offer_id),
+            transfer_context=transfer_context,
+            reason=reason,
+            chunk_hash=chunk_hash,
+            etag=etag,
+            cached=cached,
+        )
         transfer.log_task_chunk_from_context(
             "failed",
             transfer_context,
@@ -465,24 +588,9 @@ class EmbeddedWorkerPool:
                 failed += 1
                 continue
             elif transfer.uses_predefined_etag_early_submit(transfer_context):
-                logger.info(
-                    "Embedded batch offer fast-path: batch=%s task=%s offer=%s chunk_size=%s",
-                    short_id(batch_id, 12),
-                    short_id(task_id),
-                    short_id(offer_id),
-                    transfer_context.get("chunk_size"),
-                )
+                path = "predefined_etag"
             else:
-                skip_reasons = transfer.predefined_etag_early_submit_skip_reasons(
-                    transfer_context
-                )
-                logger.info(
-                    "Embedded batch offer standard-path: batch=%s task=%s offer=%s reasons=%s",
-                    short_id(batch_id, 12),
-                    short_id(task_id),
-                    short_id(offer_id),
-                    "; ".join(skip_reasons) if skip_reasons else "early_submit_disabled",
-                )
+                path = "standard"
 
             worker = self._select_worker(batch_used_ips, batch_assigned_counts)
             if worker is None:
@@ -508,13 +616,14 @@ class EmbeddedWorkerPool:
             if worker.ip:
                 batch_used_ips.add(worker.ip)
 
-            logger.info(
-                "Embedded offer assigned: batch=%s task=%s offer=%s worker_slot=%s worker_id=%s",
-                short_id(batch_id, 12),
-                short_id(task_id),
-                short_id(offer_id),
-                worker.slot,
-                short_id(worker.worker_id),
+            _log_embedded_task_offer(
+                batch_id=str(batch_id),
+                task_id=str(task_id),
+                offer_id=str(offer_id),
+                worker_slot=worker.slot,
+                worker_id=worker.worker_id,
+                transfer_context=transfer_context,
+                path=path,
             )
             task = asyncio.create_task(
                 self._handle_offer(worker, offer, transfer_context)
@@ -549,12 +658,6 @@ class EmbeddedWorkerPool:
         task_id = offer.get("task_id") or offer.get("offer_id")
         offer_id = offer.get("offer_id") or task_id
         worker.active_offer_ids.add(str(offer_id or ""))
-        logger.info(
-            "Embedded offer handler started: task=%s offer=%s worker_slot=%s",
-            short_id(task_id),
-            short_id(offer_id),
-            worker.slot,
-        )
 
         try:
             deadline_us = int(offer.get("deadline_us") or 0)
@@ -584,7 +687,7 @@ class EmbeddedWorkerPool:
 
             skip_reasons = transfer.predefined_etag_early_submit_skip_reasons(transfer_context)
             if skip_reasons:
-                logger.info(
+                logger.debug(
                     "Embedded fast path skipped: task=%s offer=%s worker_slot=%s reasons=%s",
                     short_id(task_id),
                     short_id(offer_id),
@@ -602,12 +705,6 @@ class EmbeddedWorkerPool:
                     deadline_us,
                 )
             else:
-                logger.info(
-                    "Embedded standard transfer: task=%s offer=%s worker_slot=%s",
-                    short_id(task_id),
-                    short_id(offer_id),
-                    worker.slot,
-                )
                 await self._handle_standard_offer(
                     worker,
                     offer,
@@ -666,6 +763,8 @@ class EmbeddedWorkerPool:
         chunk_hash: str = "",
         etag: Optional[str] = None,
         error: Optional[str] = None,
+        transfer_context: Optional[dict] = None,
+        cached: Optional[bool] = None,
     ) -> dict:
         payload = {
             "task_id": str(task_id),
@@ -681,12 +780,24 @@ class EmbeddedWorkerPool:
             payload["error"] = error
         ack = await self.upstream.send_task_result(payload)
         if ack.get("completed"):
-            logger.info(
-                "Embedded task completed on BeamCore: task=%s offer=%s worker=%s",
-                short_id(task_id),
-                short_id(offer_id),
-                short_id(worker.worker_id),
-            )
+            if transfer_context is not None:
+                _log_embedded_task_completed(
+                    task_id=str(task_id),
+                    offer_id=str(offer_id),
+                    worker_id=worker.worker_id,
+                    transfer_context=transfer_context,
+                    chunk_hash=chunk_hash,
+                    etag=etag or "",
+                    cached=cached,
+                )
+            else:
+                logger.info(
+                    "%s Embedded task completed on BeamCore task=%s offer=%s worker=%s",
+                    _WORKERS_LOG,
+                    short_id(task_id),
+                    short_id(offer_id),
+                    short_id(worker.worker_id),
+                )
         else:
             logger.warning(
                 "Embedded task result not completed: task=%s offer=%s worker=%s "
@@ -733,19 +844,16 @@ class EmbeddedWorkerPool:
             return
 
         cached = transfer.get_predefined_etag_cache(transfer_context)
-        env_configured = bool(transfer.PREDEFINED_ETAG_ENV_CHUNK_HASH)
-        logger.info(
-            "Embedded predefined ETag: %s task=%s offer=%s",
-            (
-                "env hash/etag, accept then submit"
-                if env_configured
-                else "cache hit, accept then submit"
-                if cached
-                else "cache miss, fetch+upload then submit"
-            ),
-            short_id(task_id),
-            short_id(offer_id),
-        )
+        cached_hit = cached is not None
+        if cached_hit:
+            _log_embedded_transfer(
+                task_id=str(task_id),
+                offer_id=str(offer_id),
+                transfer_context=transfer_context,
+                chunk_hash=cached.chunk_hash if cached else "",
+                etag=cached.etag if cached else "",
+                cached=True,
+            )
 
         async def _accept_task() -> bool:
             resp = await self._send_accept(worker, task_id, offer_id)
@@ -789,8 +897,20 @@ class EmbeddedWorkerPool:
                     success=False,
                     chunk_hash=outcome.chunk_hash,
                     error=outcome.error,
+                    transfer_context=transfer_context,
+                    cached=outcome.used_cache,
                 )
             return
+
+        if not outcome.used_cache:
+            _log_embedded_transfer(
+                task_id=str(task_id),
+                offer_id=str(offer_id),
+                transfer_context=transfer_context,
+                chunk_hash=outcome.chunk_hash,
+                etag=outcome.etag or "",
+                cached=False,
+            )
 
         await self._send_result(
             worker,
@@ -799,6 +919,8 @@ class EmbeddedWorkerPool:
             success=True,
             chunk_hash=outcome.chunk_hash,
             etag=outcome.etag,
+            transfer_context=transfer_context,
+            cached=outcome.used_cache,
         )
 
         if outcome.used_cache:
@@ -923,6 +1045,15 @@ class EmbeddedWorkerPool:
                 task_id=str(task_id),
                 offer_id=str(offer_id),
             )
+        if result.success:
+            _log_embedded_transfer(
+                task_id=str(task_id),
+                offer_id=str(offer_id),
+                transfer_context=transfer_context,
+                chunk_hash=result.chunk_hash,
+                etag=result.etag or "",
+                cached=False,
+            )
         await self._send_result(
             worker,
             task_id,
@@ -931,4 +1062,6 @@ class EmbeddedWorkerPool:
             chunk_hash=result.chunk_hash,
             etag=result.etag,
             error=result.error_msg,
+            transfer_context=transfer_context,
+            cached=False,
         )

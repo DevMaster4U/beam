@@ -37,7 +37,6 @@ class MinerConnectionHub:
         return sorted(self._connections.keys())
 
     async def connect(self, miner_id: str, websocket: WebSocket) -> None:
-        await websocket.accept()
         old = self._connections.pop(miner_id, None)
         if old is not None:
             with contextlib.suppress(Exception):

@@ -19,6 +19,7 @@ router = APIRouter(tags=["miners-ws"])
 async def miner_websocket(websocket: WebSocket) -> None:
     settings = get_settings()
     miner_id = ""
+    await websocket.accept()
     try:
         hello = await websocket.receive_json()
         if str(hello.get("type") or "") != "hello":
