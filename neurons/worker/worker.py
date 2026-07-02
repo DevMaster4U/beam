@@ -1592,17 +1592,34 @@ def store_predefined_etag_cache(
     transfer_context: dict,
     chunk_hash: str,
     etag: Optional[str] = None,
-) -> None:
+    *,
+    log_prefix: str = "[Worker]",
+    task_id: Optional[str] = None,
+    offer_id: Optional[str] = None,
+) -> bool:
+    """Persist hash/etag to JSON when a chunk was not cached and transfer succeeded."""
     if PREDEFINED_ETAG_ENV_CHUNK_HASH:
-        return
+        return False
     if not chunk_hash:
-        return
+        return False
     key = predefined_etag_cache_key(transfer_context)
+    if key in _PREDEFINED_ETAG_CHUNK_CACHE:
+        return False
     _PREDEFINED_ETAG_CHUNK_CACHE[key] = PredefinedETagChunkCacheEntry(
         chunk_hash=chunk_hash,
         etag=etag or PREDEFINED_ETAG,
     )
     save_predefined_etag_chunk_cache()
+    log_task_chunk_from_context(
+        "cache_store",
+        transfer_context,
+        task_id=task_id,
+        offer_id=offer_id,
+        chunk_hash=chunk_hash,
+        log_prefix=log_prefix,
+        detail=f"etag={(etag or PREDEFINED_ETAG)!r} file={_predefined_etag_cache_path()}",
+    )
+    return True
 
 
 load_predefined_etag_chunk_cache()
@@ -1869,7 +1886,14 @@ async def predefined_etag_submit_flow(
         )
 
     etag = result.etag or PREDEFINED_ETAG
-    store_predefined_etag_cache(transfer_context, result.chunk_hash, etag)
+    store_predefined_etag_cache(
+        transfer_context,
+        result.chunk_hash,
+        etag,
+        log_prefix=log_prefix,
+        task_id=task_id,
+        offer_id=offer_id,
+    )
     waited_sec = await wait_predefined_etag_min_submit_delay(
         offer_started_at, transfer_context
     )
@@ -1916,12 +1940,6 @@ async def run_predefined_etag_background_transfer(
         deadline_us,
         log_prefix=log_prefix,
     )
-    if result.success and result.chunk_hash:
-        store_predefined_etag_cache(
-            transfer_context,
-            result.chunk_hash,
-            result.etag or PREDEFINED_ETAG,
-        )
     log_task_chunk_from_context(
         "background_done" if result.success else "background_failed",
         transfer_context,
