@@ -90,6 +90,8 @@ class MinerConnectionHub:
         }
         if "chunk_index" in entry:
             broadcast["chunk_index"] = entry["chunk_index"]
+        if entry.get("has_chunk_data"):
+            broadcast["has_chunk_data"] = True
         await self.broadcast(broadcast, exclude_miner=miner_id)
         await self._send(miner_id, {"type": "cache_update_ack", "key": key})
         logger.info(

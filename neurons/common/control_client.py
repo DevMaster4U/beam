@@ -13,6 +13,7 @@ import httpx
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = float(os.environ.get("CONTROL_SERVER_TIMEOUT", "10.0"))
+CHUNK_DATA_TIMEOUT = float(os.environ.get("CONTROL_SERVER_CHUNK_DATA_TIMEOUT", "180.0"))
 WS_PATH = "/ws/miners"
 
 
@@ -133,6 +134,71 @@ def fetch_wallet_bundle(
         logger.warning(
             "Control server wallet bundle fetch failed wallet=%s err=%s",
             wallet_name,
+            exc,
+        )
+        return None
+
+
+def upload_predefined_etag_chunk_data(
+    cache_key: str,
+    data: bytes,
+    chunk_hash: str,
+    etag: str = "",
+    config: Optional[ControlServerConfig] = None,
+) -> bool:
+    """Upload raw chunk bytes; control-server stores file and broadcasts metadata."""
+    cfg = config or get_control_server_config()
+    if not cfg.http_url or not cfg.secret or not cache_key or not data or not chunk_hash:
+        return False
+    url = (
+        f"{cfg.http_url}/cache/predefined-etag/entries/"
+        f"{quote(cache_key, safe='')}/data"
+    )
+    headers = {
+        **_headers(cfg.secret),
+        "X-Chunk-Hash": chunk_hash,
+        "X-ETag": etag or "",
+        "Content-Type": "application/octet-stream",
+    }
+    if cfg.miner_id:
+        headers["X-Miner-Id"] = cfg.miner_id
+    try:
+        with httpx.Client(timeout=CHUNK_DATA_TIMEOUT) as client:
+            resp = client.put(url, content=data, headers=headers)
+            resp.raise_for_status()
+        return True
+    except Exception as exc:
+        logger.warning(
+            "Control server chunk data upload failed key=%s err=%s",
+            cache_key[:96],
+            exc,
+        )
+        return False
+
+
+def fetch_predefined_etag_chunk_data(
+    cache_key: str,
+    config: Optional[ControlServerConfig] = None,
+) -> Optional[bytes]:
+    """Download raw chunk bytes from control-server."""
+    cfg = config or get_control_server_config()
+    if not cfg.http_url or not cfg.secret or not cache_key:
+        return None
+    url = (
+        f"{cfg.http_url}/cache/predefined-etag/entries/"
+        f"{quote(cache_key, safe='')}/data"
+    )
+    try:
+        with httpx.Client(timeout=CHUNK_DATA_TIMEOUT) as client:
+            resp = client.get(url, headers=_headers(cfg.secret))
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            return resp.content
+    except Exception as exc:
+        logger.warning(
+            "Control server chunk data fetch failed key=%s err=%s",
+            cache_key[:96],
             exc,
         )
         return None

@@ -67,6 +67,19 @@ def _apply_broadcast(key: str, chunk_hash: str, etag: str) -> None:
         logger.warning("Cache merge handler failed key=%s err=%s", key[:96], exc)
 
 
+def _schedule_chunk_data_download(key: str, chunk_hash: str) -> None:
+    try:
+        from neurons.worker import worker as transfer_module
+
+        transfer_module.schedule_predefined_etag_chunk_data_download(key, chunk_hash)
+    except Exception as exc:
+        logger.warning(
+            "Chunk data download schedule failed key=%s err=%s",
+            key[:96],
+            exc,
+        )
+
+
 def _apply_snapshot(entries: dict[str, Any]) -> None:
     normalized: dict[str, dict[str, str]] = {}
     for key, item in (entries or {}).items():
@@ -158,6 +171,8 @@ async def _client_loop() -> None:
                         etag = str(message.get("etag") or "")
                         if key and chunk_hash:
                             _apply_broadcast(key, chunk_hash, etag)
+                            if message.get("has_chunk_data"):
+                                _schedule_chunk_data_download(key, chunk_hash)
                             source_miner = str(message.get("source_miner") or "?")
                             chunk_index = message.get("chunk_index")
                             idx_label = (

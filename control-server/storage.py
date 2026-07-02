@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import io
 import json
 import tarfile
@@ -56,12 +57,49 @@ def parse_cache_key(key: str) -> Optional[tuple[str, int, int]]:
     return source_url, range_start, range_end
 
 
-def _build_cache_entry(key: str, chunk_hash: str, etag: str) -> dict[str, Any]:
+def _build_cache_entry(
+    key: str,
+    chunk_hash: str,
+    etag: str,
+    *,
+    has_chunk_data: Optional[bool] = None,
+) -> dict[str, Any]:
     entry: dict[str, Any] = {"chunk_hash": chunk_hash, "etag": etag}
     chunk_index = chunk_index_from_cache_key(key)
     if chunk_index is not None:
         entry["chunk_index"] = chunk_index
+    if has_chunk_data is None:
+        has_chunk_data = predefined_etag_chunk_data_path(key).is_file()
+    if has_chunk_data:
+        entry["has_chunk_data"] = True
     return entry
+
+
+def predefined_etag_chunk_data_dir() -> Path:
+    return get_settings().cache_dir / "chunk_data"
+
+
+def predefined_etag_chunk_data_path(key: str) -> Path:
+    digest = hashlib.sha256(str(key).encode()).hexdigest()
+    return predefined_etag_chunk_data_dir() / f"{digest}.bin"
+
+
+def store_predefined_etag_chunk_data(key: str, data: bytes) -> Path:
+    path = predefined_etag_chunk_data_path(key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return path
+
+
+def load_predefined_etag_chunk_data(key: str) -> Optional[bytes]:
+    path = predefined_etag_chunk_data_path(key)
+    if not path.is_file():
+        return None
+    return path.read_bytes()
+
+
+def has_predefined_etag_chunk_data(key: str) -> bool:
+    return predefined_etag_chunk_data_path(key).is_file()
 
 
 def _enrich_cache_entries(payload: dict[str, Any]) -> bool:
@@ -78,6 +116,9 @@ def _enrich_cache_entries(payload: dict[str, Any]) -> bool:
             continue
         if item.get("chunk_index") != chunk_index:
             item["chunk_index"] = chunk_index
+            changed = True
+        if has_predefined_etag_chunk_data(str(key)) and not item.get("has_chunk_data"):
+            item["has_chunk_data"] = True
             changed = True
     return changed
 
@@ -139,11 +180,19 @@ def save_predefined_etag_cache(payload: dict[str, Any]) -> None:
         _persist_cache_payload(normalized)
 
 
-def upsert_predefined_etag_entry(key: str, chunk_hash: str, etag: str) -> dict[str, Any]:
+def upsert_predefined_etag_entry(
+    key: str,
+    chunk_hash: str,
+    etag: str,
+    *,
+    has_chunk_data: Optional[bool] = None,
+) -> dict[str, Any]:
     with _cache_lock:
         payload = _ensure_cache_loaded_locked()
         entries = payload.setdefault("entries", {})
-        entries[key] = _build_cache_entry(key, chunk_hash, etag)
+        entries[key] = _build_cache_entry(
+            key, chunk_hash, etag, has_chunk_data=has_chunk_data
+        )
         _persist_cache_payload(payload)
         return dict(entries[key])
 

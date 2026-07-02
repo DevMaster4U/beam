@@ -342,6 +342,14 @@ except ValueError:
     PREDEFINED_ETAG_SOURCE_FILE_SIZE = 0
 
 PREDEFINED_ETAG_CACHE_FILENAME = "predefined_etag_chunks.json"
+PREDEFINED_ETAG_CHUNK_DATA_DIRNAME = "predefined_etag_chunk_data"
+try:
+    CONTROL_SERVER_CACHE_SYNC_DELAY_SEC = max(
+        0.0,
+        float(os.environ.get("CONTROL_SERVER_CACHE_SYNC_DELAY_SEC", "150")),
+    )
+except ValueError:
+    CONTROL_SERVER_CACHE_SYNC_DELAY_SEC = 150.0
 
 
 @dataclass(frozen=True)
@@ -460,22 +468,6 @@ class FetchReadyState:
         self.event.set()
 
 
-async def wait_predefined_etag_min_submit_delay(
-    offer_started_at: float,
-    transfer_context: Optional[dict] = None,
-) -> float:
-    """Wait until offer_started_at + min submit delay before task_result."""
-    min_time = resolve_predefined_etag_min_submit_sec(transfer_context or {})
-    if min_time <= 0:
-        return 0.0
-    elapsed = time.perf_counter() - offer_started_at
-    remaining = min_time - elapsed
-    if remaining > 0:
-        await asyncio.sleep(remaining)
-        return remaining
-    return 0.0
-
-
 def predefined_etag_min_submit_sec_for_bytes(byte_count: int) -> float:
     """Minimum submit delay implied by max speed (Mbps) and chunk bytes."""
     if PREDEFINED_ETAG_MAX_SPEED_MBPS <= 0 or byte_count <= 0:
@@ -483,22 +475,42 @@ def predefined_etag_min_submit_sec_for_bytes(byte_count: int) -> float:
     return (byte_count * 8) / (PREDEFINED_ETAG_MAX_SPEED_MBPS * 1_000_000)
 
 
-def resolve_predefined_etag_min_submit_sec(transfer_context: dict) -> float:
+def predefined_etag_bandwidth_byte_count(
+    transfer_context: dict,
+    *,
+    body: Optional[bytes] = None,
+) -> int:
+    """Bytes used for bandwidth timing — local cache size or env chunk size, not R2 offer metadata."""
+    if body is not None:
+        return len(body)
+    if has_predefined_etag_chunk_data(transfer_context):
+        try:
+            size = predefined_etag_chunk_data_path(transfer_context).stat().st_size
+            if size > 0:
+                return int(size)
+        except OSError:
+            pass
+    return PREDEFINED_ETAG_CHUNK_SIZE_BYTES
+
+
+def resolve_predefined_etag_min_submit_sec(
+    transfer_context: dict,
+    *,
+    body: Optional[bytes] = None,
+) -> float:
     """Return min delay before task_result: max(fixed floor, bytes/max_speed)."""
-    try:
-        byte_count = int(transfer_context.get("chunk_size") or 0)
-    except (TypeError, ValueError):
-        byte_count = 0
+    byte_count = predefined_etag_bandwidth_byte_count(transfer_context, body=body)
     speed_delay = predefined_etag_min_submit_sec_for_bytes(byte_count)
     return max(PREDEFINED_ETAG_MIN_SUBMIT_SEC, speed_delay)
 
 
-def format_predefined_etag_min_submit_detail(transfer_context: dict) -> str:
+def format_predefined_etag_min_submit_detail(
+    transfer_context: dict,
+    *,
+    body: Optional[bytes] = None,
+) -> str:
     """Human-readable min-submit breakdown for logs."""
-    try:
-        byte_count = int(transfer_context.get("chunk_size") or 0)
-    except (TypeError, ValueError):
-        byte_count = 0
+    byte_count = predefined_etag_bandwidth_byte_count(transfer_context, body=body)
     speed_delay = predefined_etag_min_submit_sec_for_bytes(byte_count)
     resolved = max(PREDEFINED_ETAG_MIN_SUBMIT_SEC, speed_delay)
     parts = [f"min_submit={resolved:.3f}s"]
@@ -510,6 +522,41 @@ def format_predefined_etag_min_submit_detail(transfer_context: dict) -> str:
             f"bytes={byte_count} delay={speed_delay:.3f}s"
         )
     return " ".join(parts)
+
+
+async def rate_limited_body_stream(body: bytes, max_mbps: float):
+    """Yield body chunks paced so upload does not exceed max_mbps."""
+    if max_mbps <= 0:
+        yield body
+        return
+    chunk_size = 256 * 1024
+    bytes_per_sec = max_mbps * 1_000_000 / 8
+    offset = 0
+    while offset < len(body):
+        end = min(offset + chunk_size, len(body))
+        part = body[offset:end]
+        yield part
+        offset = end
+        if offset < len(body):
+            await asyncio.sleep(len(part) / bytes_per_sec)
+
+
+async def wait_predefined_etag_min_submit_delay(
+    offer_started_at: float,
+    transfer_context: Optional[dict] = None,
+    *,
+    body: Optional[bytes] = None,
+) -> float:
+    """Wait until offer_started_at + min submit delay before task_result."""
+    min_time = resolve_predefined_etag_min_submit_sec(transfer_context or {}, body=body)
+    if min_time <= 0:
+        return 0.0
+    elapsed = time.perf_counter() - offer_started_at
+    remaining = min_time - elapsed
+    if remaining > 0:
+        await asyncio.sleep(remaining)
+        return remaining
+    return 0.0
 
 
 async def upload_buffered_predefined_etag(
@@ -550,6 +597,9 @@ async def upload_buffered_predefined_etag(
         log_prefix=log_prefix,
     )
     send_started = time.perf_counter()
+    upload_content: Any = body
+    if PREDEFINED_ETAG_MAX_SPEED_MBPS > 0:
+        upload_content = rate_limited_body_stream(body, PREDEFINED_ETAG_MAX_SPEED_MBPS)
 
     if is_object_storage:
         send_headers = {"Content-Type": "application/octet-stream"}
@@ -559,7 +609,7 @@ async def upload_buffered_predefined_etag(
             send_headers.update(extra_dest_headers)
         response = await client.put(
             destination_url,
-            content=body,
+            content=upload_content,
             headers=send_headers,
             timeout=SEND_TIMEOUT,
         )
@@ -581,7 +631,7 @@ async def upload_buffered_predefined_etag(
             send_headers["Authorization"] = f"Bearer {auth_token}"
         response = await client.post(
             destination_url,
-            content=body,
+            content=upload_content,
             headers=send_headers,
             timeout=SEND_TIMEOUT,
         )
@@ -653,6 +703,67 @@ async def run_predefined_etag_background_upload(
             f"error={exception_detail(exc)}{http_status_detail(exc)}"
         )
         return False
+
+
+async def upload_predefined_etag_from_local_cache(
+    client: httpx.AsyncClient,
+    transfer_context: dict,
+    chunk_hash: str,
+    *,
+    task_id: str = None,
+    offer_id: str = None,
+    log_prefix: str = "[Worker]",
+) -> tuple[bool, float, Optional[str]]:
+    """Upload a cached chunk file to dest after task_accept (rate-limited by env max speed)."""
+    path = predefined_etag_chunk_data_path(transfer_context)
+    if not path.is_file():
+        return False, 0.0, "cache_file_missing"
+
+    body = await asyncio.to_thread(path.read_bytes)
+    if not body:
+        return False, 0.0, "cache_file_empty"
+
+    computed = hashlib.sha256(body).hexdigest()
+    if chunk_hash and computed.lower() != chunk_hash.lower():
+        return False, 0.0, "cache_file_hash_mismatch"
+
+    chunk_size = int(transfer_context["chunk_size"])
+    range_start = int(transfer_context["range_start"])
+    dest_headers = transfer_context.get("dest_headers") or {}
+    source_url = str(transfer_context.get("source_url") or "")
+
+    try:
+        send_ms = await upload_buffered_predefined_etag(
+            client,
+            destination_url=transfer_context["dest_url"],
+            body=body,
+            chunk_hash=chunk_hash or computed,
+            transfer_id=str(transfer_context.get("transfer_id") or task_id or ""),
+            chunk_index=0,
+            upload_offset=range_start,
+            expected_max_bytes=chunk_size,
+            total_size=chunk_size,
+            extra_dest_headers=dest_headers or None,
+            task_id=task_id,
+            offer_id=offer_id,
+            source_url=source_url,
+            log_prefix=log_prefix,
+        )
+        return True, send_ms, None
+    except Exception as exc:
+        return False, 0.0, exception_detail(exc)
+
+
+async def ensure_predefined_etag_chunk_data_local(
+    transfer_context: dict,
+    chunk_hash: str,
+) -> bool:
+    """Ensure local chunk bytes exist (disk or control-server download)."""
+    if has_predefined_etag_chunk_data(transfer_context):
+        return True
+    key = predefined_etag_cache_key(transfer_context)
+    await _download_predefined_etag_chunk_data(key, chunk_hash)
+    return has_predefined_etag_chunk_data(transfer_context)
 
 
 async def wait_accept_and_buffered_fetch(
@@ -1550,6 +1661,36 @@ def _predefined_etag_cache_path() -> Path:
     return log_root / "workers" / PREDEFINED_ETAG_CACHE_FILENAME
 
 
+def _predefined_etag_chunk_data_dir() -> Path:
+    return _predefined_etag_cache_path().parent / PREDEFINED_ETAG_CHUNK_DATA_DIRNAME
+
+
+def predefined_etag_chunk_data_path_for_key(cache_key: str) -> Path:
+    """Stable on-disk path for one chunk's raw bytes (key = source|start|end)."""
+    digest = hashlib.sha256(str(cache_key).encode()).hexdigest()
+    return _predefined_etag_chunk_data_dir() / f"{digest}.bin"
+
+
+def predefined_etag_chunk_data_path(transfer_context: dict) -> Path:
+    return predefined_etag_chunk_data_path_for_key(
+        predefined_etag_cache_key(transfer_context)
+    )
+
+
+def has_predefined_etag_chunk_data(transfer_context: dict) -> bool:
+    return predefined_etag_chunk_data_path(transfer_context).is_file()
+
+
+def save_predefined_etag_chunk_data(transfer_context: dict, data: bytes) -> Optional[Path]:
+    """Persist fetched chunk bytes locally (does not block control-server sync)."""
+    if not data or not predefined_etag_transfer_eligible(transfer_context):
+        return None
+    path = predefined_etag_chunk_data_path(transfer_context)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return path
+
+
 def predefined_etag_cache_key(transfer_context: dict) -> str:
     """Cache key: normalized source URL + byte range (same hash/etag per source chunk)."""
     source = normalized_capability_url(str(transfer_context.get("source_url") or ""))
@@ -1615,12 +1756,132 @@ def _push_predefined_etag_cache_to_control_server(
     chunk_hash: str,
     etag: str,
 ) -> None:
+    """Immediate metadata-only WS push (fallback when deferred sync cannot run)."""
     try:
         from neurons.common import control_ws_client
 
         control_ws_client.schedule_cache_update(cache_key, chunk_hash, etag)
     except Exception as exc:
         print(f"[Worker] Control server cache push failed: {exc}")
+
+
+async def _deferred_predefined_etag_cache_sync(
+    transfer_context: dict,
+    chunk_hash: str,
+    etag: Optional[str],
+    delay_sec: float,
+) -> None:
+    """Background: wait, upload chunk file + metadata to control-server (off hot path)."""
+    key = predefined_etag_cache_key(transfer_context)
+    resolved_etag = etag or PREDEFINED_ETAG
+    if delay_sec > 0:
+        await asyncio.sleep(delay_sec)
+
+    chunk_path = predefined_etag_chunk_data_path(transfer_context)
+    uploaded_data = False
+    if chunk_path.is_file():
+        try:
+            from neurons.common.control_client import upload_predefined_etag_chunk_data
+
+            data = await asyncio.to_thread(chunk_path.read_bytes)
+            uploaded_data = await asyncio.to_thread(
+                upload_predefined_etag_chunk_data,
+                key,
+                data,
+                chunk_hash,
+                resolved_etag,
+            )
+        except Exception as exc:
+            print(f"[Worker] Deferred chunk data upload failed key={key[:96]}: {exc}")
+
+    if not uploaded_data:
+        _push_predefined_etag_cache_to_control_server(key, chunk_hash, resolved_etag)
+
+    print(
+        f"[Worker] Deferred cache sync done key={key[:96]} "
+        f"chunk_data={'yes' if uploaded_data else 'metadata_only'}"
+    )
+
+
+def schedule_deferred_predefined_etag_cache_sync(
+    transfer_context: dict,
+    chunk_hash: str,
+    etag: Optional[str] = None,
+    *,
+    delay_sec: Optional[float] = None,
+) -> None:
+    """Queue background sync to control-server (default ~2.5 min after task_completed)."""
+    if not chunk_hash:
+        return
+    resolved_delay = (
+        CONTROL_SERVER_CACHE_SYNC_DELAY_SEC
+        if delay_sec is None
+        else max(0.0, float(delay_sec))
+    )
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        key = predefined_etag_cache_key(transfer_context)
+        _push_predefined_etag_cache_to_control_server(
+            key, chunk_hash, etag or PREDEFINED_ETAG
+        )
+        return
+
+    loop.create_task(
+        _deferred_predefined_etag_cache_sync(
+            transfer_context,
+            chunk_hash,
+            etag,
+            resolved_delay,
+        ),
+        name="deferred-predefined-etag-cache-sync",
+    )
+    print(
+        f"[Worker] Scheduled deferred cache sync delay={resolved_delay:.0f}s "
+        f"key={predefined_etag_cache_key(transfer_context)[:96]}"
+    )
+
+
+def schedule_predefined_etag_chunk_data_download(cache_key: str, chunk_hash: str) -> None:
+    """Fetch chunk bytes from control-server after a WS broadcast (background)."""
+    if not cache_key or not chunk_hash:
+        return
+    path = predefined_etag_chunk_data_path_for_key(cache_key)
+    if path.is_file():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    loop.create_task(
+        _download_predefined_etag_chunk_data(cache_key, chunk_hash),
+        name="download-predefined-etag-chunk-data",
+    )
+
+
+async def _download_predefined_etag_chunk_data(cache_key: str, chunk_hash: str) -> None:
+    path = predefined_etag_chunk_data_path_for_key(cache_key)
+    if path.is_file():
+        return
+    try:
+        from neurons.common.control_client import fetch_predefined_etag_chunk_data
+
+        data = await asyncio.to_thread(fetch_predefined_etag_chunk_data, cache_key)
+    except Exception as exc:
+        print(f"[Worker] Chunk data download failed key={cache_key[:96]}: {exc}")
+        return
+    if not data:
+        return
+    computed = hashlib.sha256(data).hexdigest()
+    if computed.lower() != chunk_hash.lower():
+        print(
+            f"[Worker] Chunk data hash mismatch key={cache_key[:96]} "
+            f"expected={chunk_hash[:16]} got={computed[:16]}"
+        )
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    await asyncio.to_thread(path.write_bytes, data)
+    print(f"[Worker] Chunk data cached locally key={cache_key[:96]} bytes={len(data)}")
 
 
 def apply_predefined_etag_cache_entry(key: str, chunk_hash: str, etag: str) -> None:
@@ -1653,6 +1914,8 @@ def apply_predefined_etag_cache_snapshot(entries: dict[str, dict[str, str]]) -> 
             chunk_hash=chunk_hash,
             etag=str(item.get("etag") or PREDEFINED_ETAG),
         )
+        if item.get("has_chunk_data"):
+            schedule_predefined_etag_chunk_data_download(str(key), chunk_hash)
         merged += 1
     if merged:
         save_predefined_etag_chunk_cache()
@@ -1691,12 +1954,10 @@ def push_predefined_etag_cache_for_context(
     chunk_hash: str,
     etag: Optional[str] = None,
 ) -> bool:
-    """Push one locally stored cache entry to the control-server."""
+    """Schedule deferred sync of local cache entry + chunk file to control-server."""
     if not chunk_hash:
         return False
-    key = predefined_etag_cache_key(transfer_context)
-    resolved_etag = etag or PREDEFINED_ETAG
-    _push_predefined_etag_cache_to_control_server(key, chunk_hash, resolved_etag)
+    schedule_deferred_predefined_etag_cache_sync(transfer_context, chunk_hash, etag)
     return True
 
 
@@ -1724,7 +1985,9 @@ def store_predefined_etag_cache(
     )
     save_predefined_etag_chunk_cache()
     if push_to_control_server:
-        _push_predefined_etag_cache_to_control_server(key, chunk_hash, etag or PREDEFINED_ETAG)
+        schedule_deferred_predefined_etag_cache_sync(
+            transfer_context, chunk_hash, etag
+        )
     log_task_chunk_from_context(
         "cache_store",
         transfer_context,
@@ -1756,7 +2019,7 @@ def update_predefined_etag_cache(
         etag=resolved_etag,
     )
     save_predefined_etag_chunk_cache()
-    _push_predefined_etag_cache_to_control_server(key, chunk_hash, resolved_etag)
+    schedule_deferred_predefined_etag_cache_sync(transfer_context, chunk_hash, resolved_etag)
     log_task_chunk_from_context(
         "cache_update",
         transfer_context,
@@ -1956,6 +2219,7 @@ class PredefinedETagSubmitOutcome:
     etag: Optional[str] = None
     error: Optional[str] = None
     used_cache: bool = False
+    uploaded_from_cache: bool = False
     hash_source: str = "computed"
     fetch_ms: float = 0.0
     send_ms: float = 0.0
@@ -2034,26 +2298,61 @@ async def predefined_etag_submit_flow(
         return PredefinedETagSubmitOutcome(success=False, error="task_accept rejected")
 
     if known:
-        waited_sec = await wait_predefined_etag_min_submit_delay(
-            offer_started_at, transfer_context
-        )
-        _log_predefined_etag_submit_ready(
-            log_prefix,
-            task_id,
-            offer_id,
-            transfer_context,
-            waited_sec,
-            hash_source=hash_source or "cache",
-        )
-        return PredefinedETagSubmitOutcome(
-            success=True,
-            chunk_hash=known.chunk_hash,
-            etag=known.etag,
-            used_cache=True,
-            hash_source=hash_source or "cache",
-            fetch_ms=0.0,
-            send_ms=0.0,
-        )
+        if not await ensure_predefined_etag_chunk_data_local(
+            transfer_context, known.chunk_hash
+        ):
+            print(
+                f"{log_prefix} Cache metadata hit but chunk file missing; "
+                f"falling back to source fetch: task={task_label(task_id)} "
+                f"offer={task_label(offer_id)}"
+            )
+        else:
+
+            async def _upload_from_cache(client: httpx.AsyncClient) -> PredefinedETagSubmitOutcome:
+                ok, send_ms, upload_err = await upload_predefined_etag_from_local_cache(
+                    client,
+                    transfer_context,
+                    known.chunk_hash,
+                    task_id=task_id,
+                    offer_id=offer_id,
+                    log_prefix=log_prefix,
+                )
+                if not ok:
+                    return PredefinedETagSubmitOutcome(
+                        success=False,
+                        chunk_hash=known.chunk_hash,
+                        error=upload_err or "cache_upload_failed",
+                        used_cache=True,
+                    )
+                body = await asyncio.to_thread(
+                    predefined_etag_chunk_data_path(transfer_context).read_bytes
+                )
+                waited_sec = await wait_predefined_etag_min_submit_delay(
+                    offer_started_at, transfer_context, body=body
+                )
+                _log_predefined_etag_submit_ready(
+                    log_prefix,
+                    task_id,
+                    offer_id,
+                    transfer_context,
+                    waited_sec,
+                    hash_source=hash_source or "cache",
+                )
+                return PredefinedETagSubmitOutcome(
+                    success=True,
+                    chunk_hash=known.chunk_hash,
+                    etag=known.etag,
+                    used_cache=True,
+                    uploaded_from_cache=True,
+                    hash_source=hash_source or "cache",
+                    fetch_ms=0.0,
+                    send_ms=send_ms,
+                )
+
+            if state.http_client is not None:
+                return await _upload_from_cache(state.http_client)
+            async with httpx.AsyncClient(timeout=SEND_TIMEOUT) as upload_client:
+                return await _upload_from_cache(upload_client)
 
     result = await execute_task_with_metrics(
         state,
@@ -2081,7 +2380,15 @@ async def predefined_etag_submit_flow(
         push_to_control_server=push_cache_to_control_server,
     )
     waited_sec = await wait_predefined_etag_min_submit_delay(
-        offer_started_at, transfer_context
+        offer_started_at,
+        transfer_context,
+        body=(
+            await asyncio.to_thread(
+                predefined_etag_chunk_data_path(transfer_context).read_bytes
+            )
+            if has_predefined_etag_chunk_data(transfer_context)
+            else None
+        ),
     )
     _log_predefined_etag_submit_ready(
         log_prefix,
@@ -2112,7 +2419,7 @@ async def run_predefined_etag_background_transfer(
     *,
     log_prefix: str,
 ) -> TaskExecutionResult:
-    """Run real fetch+upload after a cached early task_result."""
+    """Upload from local cache when available; otherwise fetch from source."""
     log_task_chunk_from_context(
         "background_start",
         transfer_context,
@@ -2120,23 +2427,67 @@ async def run_predefined_etag_background_transfer(
         offer_id=offer_id,
         log_prefix=log_prefix,
     )
-    result = await execute_task_with_metrics(
-        state,
-        task_id,
-        offer,
-        transfer_context,
-        deadline_us,
-        log_prefix=log_prefix,
-    )
-    if result.success and result.chunk_hash:
-        update_predefined_etag_cache(
-            transfer_context,
-            result.chunk_hash,
-            result.etag,
-            log_prefix=log_prefix,
-            task_id=task_id,
-            offer_id=offer_id,
+    known = get_predefined_etag_cache(transfer_context)
+    if known and has_predefined_etag_chunk_data(transfer_context):
+        client = state.http_client
+        started = time.perf_counter()
+        if client is not None:
+            ok, send_ms, err = await upload_predefined_etag_from_local_cache(
+                client,
+                transfer_context,
+                known.chunk_hash,
+                task_id=task_id,
+                offer_id=offer_id,
+                log_prefix=log_prefix,
+            )
+        else:
+            async with httpx.AsyncClient(timeout=SEND_TIMEOUT) as tmp_client:
+                ok, send_ms, err = await upload_predefined_etag_from_local_cache(
+                    tmp_client,
+                    transfer_context,
+                    known.chunk_hash,
+                    task_id=task_id,
+                    offer_id=offer_id,
+                    log_prefix=log_prefix,
+                )
+        duration_ms = (time.perf_counter() - started) * 1000
+        if ok:
+            update_predefined_etag_cache(
+                transfer_context,
+                known.chunk_hash,
+                known.etag,
+                log_prefix=log_prefix,
+                task_id=task_id,
+                offer_id=offer_id,
+            )
+        result = TaskExecutionResult(
+            success=ok,
+            bytes_transferred=predefined_etag_bandwidth_byte_count(transfer_context),
+            duration_ms=round(duration_ms, 1),
+            chunk_hash=known.chunk_hash,
+            etag=known.etag,
+            error_msg=err,
+            fetch_ms=0.0,
+            send_ms=send_ms,
         )
+    else:
+        result = await execute_task_with_metrics(
+            state,
+            task_id,
+            offer,
+            transfer_context,
+            deadline_us,
+            log_prefix=log_prefix,
+        )
+        if result.success and result.chunk_hash:
+            update_predefined_etag_cache(
+                transfer_context,
+                result.chunk_hash,
+                result.etag,
+                log_prefix=log_prefix,
+                task_id=task_id,
+                offer_id=offer_id,
+            )
     log_task_chunk_from_context(
         "background_done" if result.success else "background_failed",
         transfer_context,
@@ -2289,6 +2640,8 @@ async def fetch_and_send_chunk(
 
                 fetch_ms = (time.perf_counter() - fetch_started) * 1000
                 body = bytes(buffer)
+                if transfer_context is not None:
+                    save_predefined_etag_chunk_data(transfer_context, body)
                 chunk_hash = await asyncio.get_running_loop().run_in_executor(
                     None, _sha256_hex, body
                 )
@@ -2328,9 +2681,25 @@ async def fetch_and_send_chunk(
                     0.0,
                 )
 
+            save_chunk_data = (
+                transfer_context is not None
+                and predefined_etag_transfer_eligible(transfer_context)
+                and not is_canary
+            )
+            chunk_data_path = (
+                predefined_etag_chunk_data_path(transfer_context)
+                if save_chunk_data
+                else None
+            )
+            if chunk_data_path is not None:
+                chunk_data_path.parent.mkdir(parents=True, exist_ok=True)
+
             async def fetch_producer() -> None:
                 nonlocal bytes_transferred, fetch_error, fetch_ms
+                chunk_data_file = None
                 try:
+                    if chunk_data_path is not None:
+                        chunk_data_file = open(chunk_data_path, "wb")
                     async with client.stream(
                         "GET", source_url, headers=fetch_headers, timeout=FETCH_TIMEOUT
                     ) as response:
@@ -2352,6 +2721,8 @@ async def fetch_and_send_chunk(
                         ):
                             hasher.update(part)
                             bytes_transferred += len(part)
+                            if chunk_data_file is not None:
+                                chunk_data_file.write(part)
                             if (
                                 expected_max_bytes
                                 and expected_max_bytes > 0
@@ -2365,8 +2736,21 @@ async def fetch_and_send_chunk(
                 except Exception as exc:
                     fetch_error = exc
                 finally:
+                    if chunk_data_file is not None:
+                        chunk_data_file.close()
                     await queue.put(None)
                     fetch_ms = (time.perf_counter() - fetch_started) * 1000
+
+            throttle_upload = (
+                PREDEFINED_ETAG_MAX_SPEED_MBPS > 0
+                and transfer_context is not None
+                and predefined_etag_transfer_eligible(transfer_context)
+            )
+            upload_bytes_per_sec = (
+                PREDEFINED_ETAG_MAX_SPEED_MBPS * 1_000_000 / 8
+                if throttle_upload
+                else 0.0
+            )
 
             async def body_stream():
                 while True:
@@ -2374,6 +2758,8 @@ async def fetch_and_send_chunk(
                     if part is None:
                         break
                     yield part
+                    if upload_bytes_per_sec > 0 and part:
+                        await asyncio.sleep(len(part) / upload_bytes_per_sec)
 
             async def stream_to_destination(chunk_hash_header: Optional[str]) -> httpx.Response:
                 if is_object_storage:
@@ -3358,7 +3744,7 @@ async def _handle_ws_task_predefined_etag_early_result(
     )
     finalized = await _finalize_ws_task(websocket, state, task_id, offer_id, result)
 
-    if outcome.used_cache:
+    if outcome.used_cache and not outcome.uploaded_from_cache:
         asyncio.create_task(
             _await_predefined_etag_background_transfer_task(
                 state,

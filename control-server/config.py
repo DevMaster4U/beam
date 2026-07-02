@@ -51,6 +51,7 @@ def get_settings() -> ControlServerSettings:
         settings = ControlServerSettings()
     settings.miners_dir.mkdir(parents=True, exist_ok=True)
     settings.cache_dir.mkdir(parents=True, exist_ok=True)
+    (settings.cache_dir / "chunk_data").mkdir(parents=True, exist_ok=True)
     settings.wallets_dir.mkdir(parents=True, exist_ok=True)
     if not settings.predefined_etag_cache_path.is_file():
         settings.predefined_etag_cache_path.write_text(

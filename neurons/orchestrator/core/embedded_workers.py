@@ -904,7 +904,7 @@ class EmbeddedWorkerPool:
             cached=outcome.used_cache,
         )
 
-        if outcome.used_cache:
+        if outcome.used_cache and not outcome.uploaded_from_cache:
             asyncio.create_task(
                 self._await_background_transfer_task(
                     worker,
