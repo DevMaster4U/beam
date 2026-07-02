@@ -9,6 +9,8 @@ import logging
 import os
 from typing import Any, Callable, Optional
 
+from neurons.common.control_client import get_control_server_config
+
 logger = logging.getLogger(__name__)
 
 MergeHandler = Callable[[str, str, str], None]

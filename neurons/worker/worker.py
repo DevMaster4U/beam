@@ -1633,6 +1633,7 @@ def apply_predefined_etag_cache_snapshot(entries: dict[str, dict[str, str]]) -> 
 
 
 def setup_control_server_cache_sync() -> None:
+    load_predefined_etag_chunk_cache()
     from neurons.common import control_ws_client
 
     control_ws_client.register_cache_merge_handler(apply_predefined_etag_cache_entry)
@@ -1766,10 +1767,6 @@ def maybe_store_predefined_etag_cache_on_success(
         task_id=task_id,
         offer_id=offer_id,
     )
-
-
-load_predefined_etag_chunk_cache()
-setup_control_server_cache_sync()
 
 
 def matches_predefined_etag_source(source_url: str) -> bool:
