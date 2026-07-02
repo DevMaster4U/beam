@@ -1,11 +1,10 @@
 """Control server configuration."""
 
-import os
 from functools import lru_cache
 from pathlib import Path
 
 from pydantic import Field
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 def _default_data_dir() -> Path:
@@ -14,15 +13,16 @@ def _default_data_dir() -> Path:
 
 
 class ControlServerSettings(BaseSettings):
-    host: str = Field(default="0.0.0.0", env="CONTROL_SERVER_HOST")
-    port: int = Field(default=8010, env="CONTROL_SERVER_PORT")
-    secret: str = Field(..., env="CONTROL_SERVER_SECRET")
-    data_dir: Path = Field(default_factory=_default_data_dir, env="CONTROL_SERVER_DATA_DIR")
-    log_level: str = Field(default="INFO", env="LOG_LEVEL")
+    model_config = SettingsConfigDict(extra="ignore")
 
-    class Config:
-        env_file = ".env"
-        extra = "ignore"
+    host: str = Field(default="0.0.0.0", validation_alias="CONTROL_SERVER_HOST")
+    port: int = Field(default=8010, validation_alias="CONTROL_SERVER_PORT")
+    secret: str = Field(..., validation_alias="CONTROL_SERVER_SECRET")
+    data_dir: Path = Field(
+        default_factory=_default_data_dir,
+        validation_alias="CONTROL_SERVER_DATA_DIR",
+    )
+    log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
 
     @property
     def miners_dir(self) -> Path:

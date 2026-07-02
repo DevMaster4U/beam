@@ -10,13 +10,16 @@ Group=@BEAM_GROUP@
 WorkingDirectory=@BEAM_ROOT@/control-server
 Environment="PATH=@BEAM_VENV@/bin:/usr/local/bin:/usr/bin:/bin"
 Environment="PYTHONPATH=@BEAM_ROOT@"
+Environment="LOG_DIR=@BEAM_ROOT@/logs"
 Environment="PYTHONUNBUFFERED=1"
 EnvironmentFile=-@BEAM_ROOT@/config/control-server.env
 ExecStart=@BEAM_VENV@/bin/python @BEAM_ROOT@/control-server/main.py
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30
-StandardOutput=journal
+
+# Application logs go to ${LOG_DIR}/control-server/control-server.log
+StandardOutput=null
 StandardError=journal
 
 [Install]

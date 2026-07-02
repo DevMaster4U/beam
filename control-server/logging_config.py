@@ -1,13 +1,14 @@
 """Control server logging."""
 
 import logging
+import os
 import sys
 from pathlib import Path
 
 
 def configure_logging(level: str = "INFO") -> Path:
-    root = Path(__file__).resolve().parents[1]
-    log_dir = root / "logs" / "control-server"
+    log_root = Path(os.environ.get("LOG_DIR", Path(__file__).resolve().parents[1] / "logs"))
+    log_dir = log_root / "control-server"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "control-server.log"
 

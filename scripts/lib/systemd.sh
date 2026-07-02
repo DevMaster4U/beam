@@ -56,6 +56,10 @@ beam_prepare_data_dirs() {
     "${BEAM_ROOT}/logs/orchestrators" \
     "${BEAM_ROOT}/logs/workers" \
     "${BEAM_ROOT}/logs/global-gateway" \
+    "${BEAM_ROOT}/logs/control-server" \
+    "${BEAM_ROOT}/data/control-server/miners" \
+    "${BEAM_ROOT}/data/control-server/cache" \
+    "${BEAM_ROOT}/data/control-server/wallets" \
     "${BEAM_ROOT}/run"
 
   beam_chown_if_needed "${BEAM_ROOT}/logs" "$user" "$group"
@@ -374,4 +378,17 @@ beam_ensure_global_gateway() {
 
   beam_require_unit "beam-global-gateway.service"
   beam_systemctl enable "beam-global-gateway.service"
+}
+
+beam_ensure_control_server() {
+  local env_file="${BEAM_ROOT}/config/control-server.env"
+
+  if [[ ! -f "$env_file" ]]; then
+    echo "Missing env file: ${env_file}" >&2
+    echo "Copy config/control-server.env.example to config/control-server.env" >&2
+    exit 1
+  fi
+
+  beam_require_unit "beam-control-server.service"
+  beam_systemctl enable "beam-control-server.service"
 }
