@@ -84,3 +84,5 @@ htmlcov/
 wallets/
 ~/.bittensor/
 .bittensor/
+
+data/control-server/cache

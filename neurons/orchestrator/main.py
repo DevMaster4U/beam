@@ -104,6 +104,7 @@ async def lifespan(app: FastAPI):
     transfer = get_transfer_module()
     transfer.setup_control_server_cache_sync()
     await start_control_ws_client()
+    transfer.start_predefined_etag_chunk_download_bootstrap()
 
     # Initialize rate limiter
     rate_limiter = get_rate_limiter()

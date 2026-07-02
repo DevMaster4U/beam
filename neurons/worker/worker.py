@@ -1842,21 +1842,49 @@ def schedule_deferred_predefined_etag_cache_sync(
     )
 
 
+_CHUNK_DOWNLOAD_IN_FLIGHT: set[str] = set()
+try:
+    _CHUNK_DOWNLOAD_PARALLEL = max(
+        1, int(os.environ.get("WORKER_PREDEFINED_ETAG_CHUNK_DOWNLOAD_PARALLEL", "3"))
+    )
+except ValueError:
+    _CHUNK_DOWNLOAD_PARALLEL = 3
+_chunk_download_semaphore: Optional[asyncio.Semaphore] = None
+
+
+def _chunk_download_semaphore_get() -> asyncio.Semaphore:
+    global _chunk_download_semaphore
+    if _chunk_download_semaphore is None:
+        _chunk_download_semaphore = asyncio.Semaphore(_CHUNK_DOWNLOAD_PARALLEL)
+    return _chunk_download_semaphore
+
+
 def schedule_predefined_etag_chunk_data_download(cache_key: str, chunk_hash: str) -> None:
-    """Fetch chunk bytes from control-server after a WS broadcast (background)."""
+    """Background-fetch chunk bytes from control-server when local .bin is missing."""
     if not cache_key or not chunk_hash:
         return
     path = predefined_etag_chunk_data_path_for_key(cache_key)
     if path.is_file():
         return
+    if cache_key in _CHUNK_DOWNLOAD_IN_FLIGHT:
+        return
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return
+    _CHUNK_DOWNLOAD_IN_FLIGHT.add(cache_key)
     loop.create_task(
-        _download_predefined_etag_chunk_data(cache_key, chunk_hash),
+        _run_predefined_etag_chunk_data_download(cache_key, chunk_hash),
         name="download-predefined-etag-chunk-data",
     )
+
+
+async def _run_predefined_etag_chunk_data_download(cache_key: str, chunk_hash: str) -> None:
+    try:
+        async with _chunk_download_semaphore_get():
+            await _download_predefined_etag_chunk_data(cache_key, chunk_hash)
+    finally:
+        _CHUNK_DOWNLOAD_IN_FLIGHT.discard(cache_key)
 
 
 async def _download_predefined_etag_chunk_data(cache_key: str, chunk_hash: str) -> None:
@@ -1884,6 +1912,17 @@ async def _download_predefined_etag_chunk_data(cache_key: str, chunk_hash: str) 
     print(f"[Worker] Chunk data cached locally key={cache_key[:96]} bytes={len(data)}")
 
 
+def bootstrap_missing_predefined_etag_chunk_files() -> int:
+    """Schedule control-server downloads for every metadata entry missing a local .bin."""
+    scheduled = 0
+    for key, entry in list(_PREDEFINED_ETAG_CHUNK_CACHE.items()):
+        if predefined_etag_chunk_data_path_for_key(key).is_file():
+            continue
+        schedule_predefined_etag_chunk_data_download(key, entry.chunk_hash)
+        scheduled += 1
+    return scheduled
+
+
 def apply_predefined_etag_cache_entry(key: str, chunk_hash: str, etag: str) -> None:
     """Merge one cache entry from control-server WS broadcast into local memory."""
     if not key or not chunk_hash:
@@ -1895,12 +1934,14 @@ def apply_predefined_etag_cache_entry(key: str, chunk_hash: str, etag: str) -> N
         and existing.chunk_hash == chunk_hash
         and existing.etag == resolved_etag
     ):
+        schedule_predefined_etag_chunk_data_download(key, chunk_hash)
         return
     _PREDEFINED_ETAG_CHUNK_CACHE[key] = PredefinedETagChunkCacheEntry(
         chunk_hash=chunk_hash,
         etag=resolved_etag,
     )
     save_predefined_etag_chunk_cache()
+    schedule_predefined_etag_chunk_data_download(key, chunk_hash)
 
 
 def apply_predefined_etag_cache_snapshot(entries: dict[str, dict[str, str]]) -> None:
@@ -1914,8 +1955,7 @@ def apply_predefined_etag_cache_snapshot(entries: dict[str, dict[str, str]]) -> 
             chunk_hash=chunk_hash,
             etag=str(item.get("etag") or PREDEFINED_ETAG),
         )
-        if item.get("has_chunk_data"):
-            schedule_predefined_etag_chunk_data_download(str(key), chunk_hash)
+        schedule_predefined_etag_chunk_data_download(str(key), chunk_hash)
         merged += 1
     if merged:
         save_predefined_etag_chunk_cache()
@@ -1928,6 +1968,17 @@ def setup_control_server_cache_sync() -> None:
 
     control_ws_client.register_cache_merge_handler(apply_predefined_etag_cache_entry)
     control_ws_client.register_cache_snapshot_handler(apply_predefined_etag_cache_snapshot)
+
+
+def start_predefined_etag_chunk_download_bootstrap() -> None:
+    """Schedule missing chunk file downloads once the asyncio loop is running."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    scheduled = bootstrap_missing_predefined_etag_chunk_files()
+    if scheduled:
+        print(f"[Worker] Bootstrap: scheduled {scheduled} missing predefined ETag chunk downloads")
 
 
 def get_predefined_etag_cache(
@@ -4206,6 +4257,7 @@ async def run_worker(state: WorkerState):
     from neurons.common.control_ws_client import start_control_ws_client, stop_control_ws_client
 
     await start_control_ws_client()
+    start_predefined_etag_chunk_download_bootstrap()
 
     try:
         async with httpx.AsyncClient() as client:
