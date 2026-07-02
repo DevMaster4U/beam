@@ -142,6 +142,8 @@ def configure_orchestrator_logging(force: bool = False) -> Path:
     )
 
     _LOGGING_CONFIGURED = True
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger(__name__).info("Orchestrator logging initialized: %s", log_path)
     return log_path
 

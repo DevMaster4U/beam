@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -38,7 +39,10 @@ async def miner_websocket(websocket: WebSocket) -> None:
             message = await websocket.receive_json()
             msg_type = str(message.get("type") or "")
             if msg_type == "cache_update":
-                await miner_hub.handle_cache_update(miner_id, message)
+                asyncio.create_task(
+                    miner_hub.handle_cache_update(miner_id, message),
+                    name=f"cache-update-{miner_id}",
+                )
             elif msg_type == "ping":
                 await miner_hub._send(miner_id, {"type": "pong"})
             else:

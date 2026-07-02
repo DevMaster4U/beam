@@ -818,7 +818,7 @@ class SubnetCoreClient:
                 str(batch_id or "unknown"),
                 valid_offers,
             )
-            logger.info(
+            logger.debug(
                 "worker_task_offer_batch handled by embedded workers: batch=%s offers=%s delivered=%s failed=%s",
                 batch_id,
                 len(offers),

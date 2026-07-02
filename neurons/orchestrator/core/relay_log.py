@@ -88,6 +88,19 @@ def transfer_context_range_label(transfer_context: dict) -> str:
         return "-"
 
 
+def chunk_id_from_transfer_context(transfer_context: dict) -> Optional[int]:
+    """chunk_id = range_start // (range_end - range_start)."""
+    try:
+        range_start = int(transfer_context["range_start"])
+        range_end = int(transfer_context["range_end"])
+        span = range_end - range_start
+        if span <= 0:
+            return None
+        return range_start // span
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def transfer_context_urls(transfer_context: dict) -> tuple[str, str]:
     return (
         redact_capability_url(transfer_context.get("source_url") or ""),
@@ -127,7 +140,7 @@ def log_task_offer_batch(batch_id: Any, offers: list[dict]) -> None:
     lines = format_task_offer_batch_lines(batch_id, valid_offers)
     if not lines:
         return
-    _log.info(lines[0])
+    _log.debug(lines[0])
     if BATCH_DETAIL_LOG:
         for line in lines[1:]:
             _log.info(line)

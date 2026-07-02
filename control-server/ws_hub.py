@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect
@@ -78,7 +78,9 @@ class MinerConnectionHub:
             )
             return
 
-        entry = upsert_predefined_etag_entry(key, chunk_hash, etag)
+        entry = await asyncio.to_thread(
+            upsert_predefined_etag_entry, key, chunk_hash, etag
+        )
         broadcast = {
             "type": "cache_broadcast",
             "key": key,
@@ -86,18 +88,41 @@ class MinerConnectionHub:
             "etag": entry["etag"],
             "source_miner": miner_id,
         }
-        await self.broadcast(broadcast)
+        if "chunk_index" in entry:
+            broadcast["chunk_index"] = entry["chunk_index"]
+        await self.broadcast(broadcast, exclude_miner=miner_id)
         await self._send(miner_id, {"type": "cache_update_ack", "key": key})
         logger.info(
             "Cache update from miner=%s key=%s broadcast_to=%d",
             miner_id,
             key[:96],
-            self.connection_count,
+            max(0, self.connection_count - 1),
         )
 
-    async def broadcast(self, message: dict[str, Any]) -> None:
-        for miner_id in list(self._connections.keys()):
-            await self._send(miner_id, message)
+    async def broadcast(
+        self,
+        message: dict[str, Any],
+        *,
+        exclude_miner: Optional[str] = None,
+    ) -> None:
+        targets = [
+            miner_id
+            for miner_id in list(self._connections.keys())
+            if miner_id != exclude_miner
+        ]
+        if not targets:
+            return
+        results = await asyncio.gather(
+            *(self._send(miner_id, message) for miner_id in targets),
+            return_exceptions=True,
+        )
+        for miner_id, result in zip(targets, results):
+            if isinstance(result, Exception):
+                logger.warning(
+                    "Broadcast to miner=%s failed: %s",
+                    miner_id,
+                    result,
+                )
 
     async def _send(self, miner_id: str, message: dict[str, Any]) -> None:
         conn = self._connections.get(miner_id)

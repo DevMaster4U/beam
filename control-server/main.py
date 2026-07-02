@@ -17,7 +17,9 @@ from logging_config import configure_logging
 from routes.cache import router as cache_router
 from routes.miners import router as miners_router
 from routes.miners_ws import router as miners_ws_router
+from routes.status import router as status_router
 from routes.wallets import router as wallets_router
+from storage import preload_predefined_etag_cache
 from ws_hub import miner_hub
 
 logger = logging.getLogger(__name__)
@@ -27,13 +29,15 @@ logger = logging.getLogger(__name__)
 async def lifespan(_app: FastAPI):
     settings = get_settings()
     configure_logging(settings.log_level)
+    cache_entries = preload_predefined_etag_cache()
     logger.info(
-        "Control server ready on %s:%s data_dir=%s miners=%d wallets=%d ws=/ws/miners",
+        "Control server ready on %s:%s data_dir=%s miners=%d wallets=%d cache_entries=%d ws=/ws/miners",
         settings.host,
         settings.port,
         settings.data_dir,
         len(list(settings.miners_dir.glob("*.env"))),
         len([p for p in settings.wallets_dir.iterdir() if p.is_dir()]),
+        cache_entries,
     )
     yield
     logger.info("Control server stopped")
@@ -43,6 +47,7 @@ app = FastAPI(title="BEAM Control Server", version="0.1.0", lifespan=lifespan)
 app.include_router(miners_router)
 app.include_router(cache_router)
 app.include_router(wallets_router)
+app.include_router(status_router)
 app.include_router(miners_ws_router)
 
 

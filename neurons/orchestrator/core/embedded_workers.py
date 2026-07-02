@@ -20,7 +20,12 @@ import bittensor as bt
 import httpx
 
 from core.config import OrchestratorSettings
-from core.relay_log import short_id, transfer_context_range_label, transfer_context_urls
+from core.relay_log import (
+    chunk_id_from_transfer_context,
+    short_id,
+    transfer_context_range_label,
+    transfer_context_urls,
+)
 from core.transfer_loader import get_transfer_module
 
 logger = logging.getLogger(__name__)
@@ -30,56 +35,69 @@ _WORKERS_LOG = "_workers |"
 
 def _log_embedded_task_offer(
     *,
-    batch_id: str,
     task_id: str,
     offer_id: str,
     worker_slot: int,
-    worker_id: str,
     transfer_context: dict,
     path: str,
 ) -> None:
-    src, dest = transfer_context_urls(transfer_context)
+    chunk_id = chunk_id_from_transfer_context(transfer_context)
     logger.info(
-        "%s task_offer batch=%s task=%s offer=%s worker_slot=%s worker_id=%s "
-        "path=%s src=%s range=%s dest=%s chunk_size=%s",
+        "%s task_offer task=%s offer=%s worker_slot=%s chunk_id=%s range=%s path=%s",
         _WORKERS_LOG,
-        short_id(batch_id, 12),
         short_id(task_id),
         short_id(offer_id),
         worker_slot,
-        short_id(worker_id),
-        path,
-        src,
+        chunk_id if chunk_id is not None else "?",
         transfer_context_range_label(transfer_context),
-        dest,
-        transfer_context.get("chunk_size", "?"),
+        path,
     )
 
 
-def _log_embedded_transfer(
+def _log_embedded_task_done(
     *,
     task_id: str,
     offer_id: str,
     transfer_context: dict,
     chunk_hash: str = "",
     etag: str = "",
-    cached: Optional[bool] = None,
-    stage: str = "transfer",
+    cached: bool = False,
+    fetch_ms: float = 0.0,
+    put_ms: float = 0.0,
 ) -> None:
-    src, dest = transfer_context_urls(transfer_context)
-    cached_label = "?" if cached is None else str(cached).lower()
+    chunk_id = chunk_id_from_transfer_context(transfer_context)
+    src, _dest = transfer_context_urls(transfer_context)
     logger.info(
-        "%s %s task=%s offer=%s src=%s range=%s hash=%s etag=%s cached=%s dest=%s",
+        "%s task_done task=%s offer=%s chunk_id=%s range=%s src=%s "
+        "hash=%s etag=%s cached=%s fetch_ms=%.1f put_ms=%.1f",
         _WORKERS_LOG,
-        stage,
         short_id(task_id),
         short_id(offer_id),
-        src,
+        chunk_id if chunk_id is not None else "?",
         transfer_context_range_label(transfer_context),
+        src,
         chunk_hash or "-",
         etag or "-",
-        cached_label,
-        dest,
+        str(cached).lower(),
+        fetch_ms,
+        put_ms,
+    )
+
+
+def _log_embedded_task_completed(
+    *,
+    task_id: str,
+    offer_id: str,
+    worker_id: str,
+    latency_ms: float,
+) -> None:
+    logger.info(
+        "%s task_completed task=%s offer=%s worker=%s latency_ms=%.1f",
+        _WORKERS_LOG,
+        short_id(task_id),
+        short_id(offer_id),
+        short_id(worker_id),
+        latency_ms,
     )
 
 
@@ -101,34 +119,6 @@ def _log_embedded_task_failed(
         short_id(task_id),
         short_id(offer_id),
         reason,
-        src,
-        transfer_context_range_label(transfer_context),
-        chunk_hash or "-",
-        etag or "-",
-        cached_label,
-        dest,
-    )
-
-
-def _log_embedded_task_completed(
-    *,
-    task_id: str,
-    offer_id: str,
-    worker_id: str,
-    transfer_context: dict,
-    chunk_hash: str = "",
-    etag: str = "",
-    cached: Optional[bool] = None,
-) -> None:
-    src, dest = transfer_context_urls(transfer_context)
-    cached_label = "?" if cached is None else str(cached).lower()
-    logger.info(
-        "%s Embedded task completed on BeamCore task=%s offer=%s worker=%s "
-        "src=%s range=%s hash=%s etag=%s cached=%s dest=%s",
-        _WORKERS_LOG,
-        short_id(task_id),
-        short_id(offer_id),
-        short_id(worker_id),
         src,
         transfer_context_range_label(transfer_context),
         chunk_hash or "-",
@@ -617,11 +607,9 @@ class EmbeddedWorkerPool:
                 batch_used_ips.add(worker.ip)
 
             _log_embedded_task_offer(
-                batch_id=str(batch_id),
                 task_id=str(task_id),
                 offer_id=str(offer_id),
                 worker_slot=worker.slot,
-                worker_id=worker.worker_id,
                 transfer_context=transfer_context,
                 path=path,
             )
@@ -639,7 +627,7 @@ class EmbeddedWorkerPool:
 
         await asyncio.sleep(0)
 
-        logger.info(
+        logger.debug(
             "Embedded batch queued: batch=%s offers=%s delivered=%s failed=%s",
             short_id(batch_id, 12),
             len(offers),
@@ -778,26 +766,16 @@ class EmbeddedWorkerPool:
             payload["etag"] = etag
         if error:
             payload["error"] = error
+        started = time.perf_counter()
         ack = await self.upstream.send_task_result(payload)
+        latency_ms = (time.perf_counter() - started) * 1000
         if ack.get("completed"):
-            if transfer_context is not None:
-                _log_embedded_task_completed(
-                    task_id=str(task_id),
-                    offer_id=str(offer_id),
-                    worker_id=worker.worker_id,
-                    transfer_context=transfer_context,
-                    chunk_hash=chunk_hash,
-                    etag=etag or "",
-                    cached=cached,
-                )
-            else:
-                logger.info(
-                    "%s Embedded task completed on BeamCore task=%s offer=%s worker=%s",
-                    _WORKERS_LOG,
-                    short_id(task_id),
-                    short_id(offer_id),
-                    short_id(worker.worker_id),
-                )
+            _log_embedded_task_completed(
+                task_id=str(task_id),
+                offer_id=str(offer_id),
+                worker_id=worker.worker_id,
+                latency_ms=latency_ms,
+            )
         else:
             logger.warning(
                 "Embedded task result not completed: task=%s offer=%s worker=%s "
@@ -843,17 +821,7 @@ class EmbeddedWorkerPool:
             )
             return
 
-        cached = transfer.get_predefined_etag_cache(transfer_context)
-        cached_hit = cached is not None
-        if cached_hit:
-            _log_embedded_transfer(
-                task_id=str(task_id),
-                offer_id=str(offer_id),
-                transfer_context=transfer_context,
-                chunk_hash=cached.chunk_hash if cached else "",
-                etag=cached.etag if cached else "",
-                cached=True,
-            )
+        cached_hit = transfer.get_predefined_etag_cache(transfer_context) is not None
 
         async def _accept_task() -> bool:
             resp = await self._send_accept(worker, task_id, offer_id)
@@ -902,16 +870,16 @@ class EmbeddedWorkerPool:
                 )
             return
 
-        if not outcome.used_cache:
-            _log_embedded_transfer(
-                task_id=str(task_id),
-                offer_id=str(offer_id),
-                transfer_context=transfer_context,
-                chunk_hash=outcome.chunk_hash,
-                etag=outcome.etag or "",
-                cached=False,
-            )
-
+        _log_embedded_task_done(
+            task_id=str(task_id),
+            offer_id=str(offer_id),
+            transfer_context=transfer_context,
+            chunk_hash=outcome.chunk_hash,
+            etag=outcome.etag or "",
+            cached=outcome.used_cache,
+            fetch_ms=outcome.fetch_ms,
+            put_ms=outcome.send_ms,
+        )
         await self._send_result(
             worker,
             task_id,
@@ -919,8 +887,6 @@ class EmbeddedWorkerPool:
             success=True,
             chunk_hash=outcome.chunk_hash,
             etag=outcome.etag,
-            transfer_context=transfer_context,
-            cached=outcome.used_cache,
         )
 
         if outcome.used_cache:
@@ -979,7 +945,7 @@ class EmbeddedWorkerPool:
             return
 
         if result.success:
-            logger.info(
+            logger.debug(
                 "Embedded background transfer finished after task_result: task=%s offer=%s",
                 short_id(task_id),
                 short_id(offer_id),
@@ -1045,14 +1011,15 @@ class EmbeddedWorkerPool:
                 task_id=str(task_id),
                 offer_id=str(offer_id),
             )
-        if result.success:
-            _log_embedded_transfer(
+            _log_embedded_task_done(
                 task_id=str(task_id),
                 offer_id=str(offer_id),
                 transfer_context=transfer_context,
                 chunk_hash=result.chunk_hash,
                 etag=result.etag or "",
                 cached=False,
+                fetch_ms=result.fetch_ms,
+                put_ms=result.send_ms,
             )
         await self._send_result(
             worker,
@@ -1062,6 +1029,4 @@ class EmbeddedWorkerPool:
             chunk_hash=result.chunk_hash,
             etag=result.etag,
             error=result.error_msg,
-            transfer_context=transfer_context,
-            cached=False,
         )

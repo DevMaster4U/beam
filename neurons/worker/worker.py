@@ -422,6 +422,8 @@ class TaskExecutionResult:
     chunk_hash: str = ""
     etag: Optional[str] = None
     error_msg: Optional[str] = None
+    fetch_ms: float = 0.0
+    send_ms: float = 0.0
 
 
 @dataclass
@@ -841,6 +843,8 @@ def log_task_chunk(
     detail: str = "",
 ) -> None:
     """Grep-friendly per-chunk transfer log: fetch/put URL, chunk_id, byte range, hash."""
+    if log_prefix == "[Embedded]":
+        return
     fields = [
         f"{log_prefix} task_chunk stage={stage}",
         f"task={task_label(task_id)}",
@@ -1044,6 +1048,8 @@ async def execute_task_with_metrics(
     error_msg: Optional[str] = None
     chunk_hash = ""
     etag: Optional[str] = None
+    fetch_ms = 0.0
+    send_ms = 0.0
 
     try:
         async with task_semaphore:
@@ -1052,7 +1058,15 @@ async def execute_task_with_metrics(
                 error_msg = f"Deadline expired while waiting ({remaining_sec:.1f}s)"
                 print(f"{log_prefix} {error_msg}")
             else:
-                bytes_transferred, success, error_msg, chunk_hash, etag = await execute_transfer(
+                (
+                    bytes_transferred,
+                    success,
+                    error_msg,
+                    chunk_hash,
+                    etag,
+                    fetch_ms,
+                    send_ms,
+                ) = await execute_transfer(
                     state,
                     task_id,
                     transfer_context,
@@ -1066,6 +1080,8 @@ async def execute_task_with_metrics(
         print(f"{log_prefix} Task error: {e}")
         if fetch_ready is not None and not fetch_ready.event.is_set():
             fetch_ready.signal_error(error_msg)
+        fetch_ms = 0.0
+        send_ms = 0.0
     finally:
         state.active_tasks = max(0, state.active_tasks - 1)
 
@@ -1078,6 +1094,8 @@ async def execute_task_with_metrics(
         chunk_hash=chunk_hash,
         etag=etag,
         error_msg=error_msg,
+        fetch_ms=round(fetch_ms, 1),
+        send_ms=round(send_ms, 1),
     )
 
 
@@ -1609,10 +1627,19 @@ def apply_predefined_etag_cache_entry(key: str, chunk_hash: str, etag: str) -> N
     """Merge one cache entry from control-server WS broadcast into local memory."""
     if not key or not chunk_hash:
         return
+    resolved_etag = etag or PREDEFINED_ETAG
+    existing = _PREDEFINED_ETAG_CHUNK_CACHE.get(key)
+    if (
+        existing is not None
+        and existing.chunk_hash == chunk_hash
+        and existing.etag == resolved_etag
+    ):
+        return
     _PREDEFINED_ETAG_CHUNK_CACHE[key] = PredefinedETagChunkCacheEntry(
         chunk_hash=chunk_hash,
-        etag=etag or PREDEFINED_ETAG,
+        etag=resolved_etag,
     )
+    save_predefined_etag_chunk_cache()
 
 
 def apply_predefined_etag_cache_snapshot(entries: dict[str, dict[str, str]]) -> None:
@@ -1912,6 +1939,8 @@ class PredefinedETagSubmitOutcome:
     error: Optional[str] = None
     used_cache: bool = False
     hash_source: str = "computed"
+    fetch_ms: float = 0.0
+    send_ms: float = 0.0
 
 
 def _log_predefined_etag_submit_ready(
@@ -2003,6 +2032,8 @@ async def predefined_etag_submit_flow(
             etag=known.etag,
             used_cache=True,
             hash_source=hash_source or "cache",
+            fetch_ms=0.0,
+            send_ms=0.0,
         )
 
     result = await execute_task_with_metrics(
@@ -2046,6 +2077,8 @@ async def predefined_etag_submit_flow(
         etag=etag,
         used_cache=False,
         hash_source="computed",
+        fetch_ms=result.fetch_ms,
+        send_ms=result.send_ms,
     )
 
 
@@ -2590,6 +2623,8 @@ async def execute_transfer(
     is_canary = is_canary_destination(destination_url)
     computed_chunk_hash = ""
     last_etag: Optional[str] = None
+    last_fetch_ms = 0.0
+    last_send_ms = 0.0
     offer_id = task_message.get("offer_id") or task_id
 
     try:
@@ -2613,6 +2648,8 @@ async def execute_transfer(
                     reason,
                     "",
                     last_etag,
+                    0.0,
+                    0.0,
                 )
 
         chunk_started = time.perf_counter()
@@ -2643,6 +2680,9 @@ async def execute_transfer(
             log_prefix=log_prefix,
         )
 
+        last_fetch_ms = fetch_ms
+        last_send_ms = send_ms
+
         if bytes_fetched != chunk_size:
             reason = f"source range returned {bytes_fetched} bytes, expected {chunk_size}"
             _log_transfer_failure(
@@ -2660,6 +2700,8 @@ async def execute_transfer(
                 reason,
                 computed_chunk_hash or "",
                 last_etag,
+                last_fetch_ms,
+                last_send_ms,
             )
 
         if is_canary:
@@ -2719,6 +2761,8 @@ async def execute_transfer(
             reason,
             "",
             last_etag,
+            last_fetch_ms,
+            last_send_ms,
         )
     except httpx.HTTPStatusError as e:
         detail = exception_detail(e)
@@ -2737,6 +2781,8 @@ async def execute_transfer(
             reason,
             "",
             last_etag,
+            last_fetch_ms,
+            last_send_ms,
         )
     except Exception as e:
         detail = exception_detail(e)
@@ -2749,7 +2795,7 @@ async def execute_transfer(
             log_prefix=log_prefix,
             reason=reason,
         )
-        return (total_bytes, False, reason, "", last_etag)
+        return (total_bytes, False, reason, "", last_etag, last_fetch_ms, last_send_ms)
 
     if transfer_context.get("etag_required") and not last_etag:
         reason = "missing ETag from storage PUT response"
@@ -2768,10 +2814,21 @@ async def execute_transfer(
             reason,
             computed_chunk_hash or "",
             last_etag,
+            last_fetch_ms,
+            last_send_ms,
         )
 
-    print(f"[Worker] Transfer complete: {total_bytes} bytes")
-    return (total_bytes, True, None, computed_chunk_hash, last_etag)
+    if log_prefix != "[Embedded]":
+        print(f"[Worker] Transfer complete: {total_bytes} bytes")
+    return (
+        total_bytes,
+        True,
+        None,
+        computed_chunk_hash,
+        last_etag,
+        last_fetch_ms,
+        last_send_ms,
+    )
 
 
 # =============================================================================

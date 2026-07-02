@@ -158,8 +158,28 @@ async def _client_loop() -> None:
                         etag = str(message.get("etag") or "")
                         if key and chunk_hash:
                             _apply_broadcast(key, chunk_hash, etag)
+                            source_miner = str(message.get("source_miner") or "?")
+                            chunk_index = message.get("chunk_index")
+                            idx_label = (
+                                f" chunk_index={chunk_index}"
+                                if chunk_index is not None
+                                else ""
+                            )
+                            logger.info(
+                                "Control-server cache broadcast merged miner_id=%s "
+                                "source_miner=%s key=%s hash=%s%s",
+                                cfg.miner_id or "miner",
+                                source_miner,
+                                key[:96],
+                                chunk_hash[:16],
+                                idx_label,
+                            )
                     elif msg_type == "cache_update_ack":
-                        logger.debug("Control-server ack key=%s", message.get("key"))
+                        logger.info(
+                            "Control-server cache push ack miner_id=%s key=%s",
+                            cfg.miner_id or "miner",
+                            str(message.get("key") or "")[:96],
+                        )
                     elif msg_type == "error":
                         logger.warning("Control-server error: %s", message.get("detail"))
         except ConnectionClosed as exc:
