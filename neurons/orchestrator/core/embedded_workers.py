@@ -913,6 +913,15 @@ class EmbeddedWorkerPool:
             deadline_us,
             log_prefix="[Embedded]",
         )
+        if result.success:
+            transfer.maybe_store_predefined_etag_cache_on_success(
+                transfer_context,
+                result.chunk_hash,
+                result.etag,
+                log_prefix="[Embedded]",
+                task_id=str(task_id),
+                offer_id=str(offer_id),
+            )
         await self._send_result(
             worker,
             task_id,

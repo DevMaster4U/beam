@@ -1598,7 +1598,7 @@ def store_predefined_etag_cache(
     offer_id: Optional[str] = None,
 ) -> bool:
     """Persist hash/etag to JSON when a chunk was not cached and transfer succeeded."""
-    if PREDEFINED_ETAG_ENV_CHUNK_HASH:
+    if get_predefined_etag_env_entry(transfer_context) is not None:
         return False
     if not chunk_hash:
         return False
@@ -1620,6 +1620,38 @@ def store_predefined_etag_cache(
         detail=f"etag={(etag or PREDEFINED_ETAG)!r} file={_predefined_etag_cache_path()}",
     )
     return True
+
+
+def maybe_store_predefined_etag_cache_on_success(
+    transfer_context: dict,
+    chunk_hash: str,
+    etag: Optional[str] = None,
+    *,
+    log_prefix: str = "[Worker]",
+    task_id: Optional[str] = None,
+    offer_id: Optional[str] = None,
+) -> bool:
+    """Store hash/etag after a successful transfer when this chunk was not already known."""
+    if predefined_etag_known_source(transfer_context) is not None:
+        return False
+    if not WORKER_PREDEFINED_ETAG_EARLY_SUBMIT:
+        return False
+    chunk_size = int(transfer_context.get("chunk_size") or 0)
+    if not uses_predefined_etag(chunk_size):
+        return False
+    dest_url = str(transfer_context.get("dest_url") or "")
+    if is_canary_destination(dest_url):
+        return False
+    if not is_object_storage_presigned_url(dest_url):
+        return False
+    return store_predefined_etag_cache(
+        transfer_context,
+        chunk_hash,
+        etag,
+        log_prefix=log_prefix,
+        task_id=task_id,
+        offer_id=offer_id,
+    )
 
 
 load_predefined_etag_chunk_cache()
@@ -1886,7 +1918,7 @@ async def predefined_etag_submit_flow(
         )
 
     etag = result.etag or PREDEFINED_ETAG
-    store_predefined_etag_cache(
+    maybe_store_predefined_etag_cache_on_success(
         transfer_context,
         result.chunk_hash,
         etag,
@@ -3000,6 +3032,15 @@ async def _handle_ws_task_sequential_accept(
         deadline_us,
         log_prefix="[Worker] [WS]",
     )
+    if result.success:
+        maybe_store_predefined_etag_cache_on_success(
+            transfer_context,
+            result.chunk_hash,
+            result.etag,
+            log_prefix="[Worker] [WS]",
+            task_id=task_id,
+            offer_id=offer_id,
+        )
     return await _finalize_ws_task(websocket, state, task_id, offer_id, result)
 
 
@@ -3044,6 +3085,15 @@ async def _finalize_ws_standard_transfer_after_accept(
         deadline_us,
         log_prefix="[Worker] [WS]",
     )
+    if result.success:
+        maybe_store_predefined_etag_cache_on_success(
+            transfer_context,
+            result.chunk_hash,
+            result.etag,
+            log_prefix="[Worker] [WS]",
+            task_id=task_id,
+            offer_id=offer_id,
+        )
     return await _finalize_ws_task(websocket, state, task_id, offer_id, result)
 
 
@@ -3283,6 +3333,15 @@ async def _handle_ws_task_early_transfer(
         )
 
         result = await exec_task
+        if result.success:
+            maybe_store_predefined_etag_cache_on_success(
+                transfer_context,
+                result.chunk_hash,
+                result.etag,
+                log_prefix="[Worker] [WS]",
+                task_id=task_id,
+                offer_id=offer_id,
+            )
         return await _finalize_ws_task(websocket, state, task_id, offer_id, result)
     except asyncio.CancelledError:
         if not exec_task.done():
