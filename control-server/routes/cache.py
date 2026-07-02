@@ -42,6 +42,59 @@ async def get_cache() -> dict[str, Any]:
     return load_predefined_etag_cache()
 
 
+@router.put("/entries/{cache_key:path}/data")
+async def put_chunk_data(
+    cache_key: str,
+    request: Request,
+    x_chunk_hash: str = Header(default="", alias="X-Chunk-Hash"),
+    x_etag: str = Header(default="", alias="X-ETag"),
+    x_miner_id: str = Header(default="", alias="X-Miner-Id"),
+) -> dict[str, Any]:
+    key = unquote(cache_key)
+    try:
+        data = await request.body()
+        if not data:
+            raise HTTPException(status_code=400, detail="chunk body required")
+        computed_hash = hashlib.sha256(data).hexdigest()
+        chunk_hash = x_chunk_hash.strip() or computed_hash
+        if chunk_hash.lower() != computed_hash.lower():
+            raise HTTPException(status_code=400, detail="chunk hash mismatch")
+        etag = x_etag.strip()
+        await asyncio.to_thread(store_predefined_etag_chunk_data, key, data)
+        entry = await asyncio.to_thread(
+            upsert_predefined_etag_entry,
+            key,
+            chunk_hash,
+            etag,
+            has_chunk_data=True,
+        )
+        broadcast = {
+            "type": "cache_broadcast",
+            "key": key,
+            "chunk_hash": entry["chunk_hash"],
+            "etag": entry["etag"],
+            "source_miner": x_miner_id.strip() or "http",
+            "has_chunk_data": True,
+        }
+        if "chunk_index" in entry:
+            broadcast["chunk_index"] = entry["chunk_index"]
+        await miner_hub.broadcast(broadcast, exclude_miner=x_miner_id.strip() or None)
+        return entry
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"chunk data store failed: {exc}") from exc
+
+
+@router.get("/entries/{cache_key:path}/data")
+async def get_chunk_data(cache_key: str) -> Response:
+    key = unquote(cache_key)
+    data = await asyncio.to_thread(load_predefined_etag_chunk_data, key)
+    if not data:
+        raise HTTPException(status_code=404, detail=f"chunk data miss: {key}")
+    return Response(content=data, media_type="application/octet-stream")
+
+
 @router.get("/entries/{cache_key:path}")
 async def get_cache_entry(cache_key: str) -> dict[str, str]:
     key = unquote(cache_key)
@@ -70,51 +123,3 @@ async def post_cache_merge(body: CacheMergeBody) -> dict[str, Any]:
         if item.chunk_hash.strip()
     }
     return merge_predefined_etag_entries(merged)
-
-
-@router.put("/entries/{cache_key:path}/data")
-async def put_chunk_data(
-    cache_key: str,
-    request: Request,
-    x_chunk_hash: str = Header(default="", alias="X-Chunk-Hash"),
-    x_etag: str = Header(default="", alias="X-ETag"),
-    x_miner_id: str = Header(default="", alias="X-Miner-Id"),
-) -> dict[str, Any]:
-    key = unquote(cache_key)
-    data = await request.body()
-    if not data:
-        raise HTTPException(status_code=400, detail="chunk body required")
-    computed_hash = hashlib.sha256(data).hexdigest()
-    chunk_hash = x_chunk_hash.strip() or computed_hash
-    if chunk_hash.lower() != computed_hash.lower():
-        raise HTTPException(status_code=400, detail="chunk hash mismatch")
-    etag = x_etag.strip()
-    await asyncio.to_thread(store_predefined_etag_chunk_data, key, data)
-    entry = await asyncio.to_thread(
-        upsert_predefined_etag_entry,
-        key,
-        chunk_hash,
-        etag,
-        has_chunk_data=True,
-    )
-    broadcast = {
-        "type": "cache_broadcast",
-        "key": key,
-        "chunk_hash": entry["chunk_hash"],
-        "etag": entry["etag"],
-        "source_miner": x_miner_id.strip() or "http",
-        "has_chunk_data": True,
-    }
-    if "chunk_index" in entry:
-        broadcast["chunk_index"] = entry["chunk_index"]
-    await miner_hub.broadcast(broadcast, exclude_miner=x_miner_id.strip() or None)
-    return entry
-
-
-@router.get("/entries/{cache_key:path}/data")
-async def get_chunk_data(cache_key: str) -> Response:
-    key = unquote(cache_key)
-    data = await asyncio.to_thread(load_predefined_etag_chunk_data, key)
-    if not data:
-        raise HTTPException(status_code=404, detail=f"chunk data miss: {key}")
-    return Response(content=data, media_type="application/octet-stream")
