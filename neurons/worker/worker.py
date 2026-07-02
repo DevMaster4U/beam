@@ -1686,6 +1686,20 @@ def predefined_etag_known_source(transfer_context: dict) -> Optional[str]:
     return None
 
 
+def push_predefined_etag_cache_for_context(
+    transfer_context: dict,
+    chunk_hash: str,
+    etag: Optional[str] = None,
+) -> bool:
+    """Push one locally stored cache entry to the control-server."""
+    if not chunk_hash:
+        return False
+    key = predefined_etag_cache_key(transfer_context)
+    resolved_etag = etag or PREDEFINED_ETAG
+    _push_predefined_etag_cache_to_control_server(key, chunk_hash, resolved_etag)
+    return True
+
+
 def store_predefined_etag_cache(
     transfer_context: dict,
     chunk_hash: str,
@@ -1694,6 +1708,7 @@ def store_predefined_etag_cache(
     log_prefix: str = "[Worker]",
     task_id: Optional[str] = None,
     offer_id: Optional[str] = None,
+    push_to_control_server: bool = True,
 ) -> bool:
     """Persist hash/etag to JSON when a chunk was not cached and transfer succeeded."""
     if get_predefined_etag_env_entry(transfer_context) is not None:
@@ -1708,7 +1723,8 @@ def store_predefined_etag_cache(
         etag=etag or PREDEFINED_ETAG,
     )
     save_predefined_etag_chunk_cache()
-    _push_predefined_etag_cache_to_control_server(key, chunk_hash, etag or PREDEFINED_ETAG)
+    if push_to_control_server:
+        _push_predefined_etag_cache_to_control_server(key, chunk_hash, etag or PREDEFINED_ETAG)
     log_task_chunk_from_context(
         "cache_store",
         transfer_context,
@@ -1761,6 +1777,7 @@ def maybe_store_predefined_etag_cache_on_success(
     log_prefix: str = "[Worker]",
     task_id: Optional[str] = None,
     offer_id: Optional[str] = None,
+    push_to_control_server: bool = True,
 ) -> bool:
     """Store hash/etag after a successful transfer when this chunk was not already known."""
     if not WORKER_PREDEFINED_ETAG_EARLY_SUBMIT:
@@ -1793,6 +1810,7 @@ def maybe_store_predefined_etag_cache_on_success(
         log_prefix=log_prefix,
         task_id=task_id,
         offer_id=offer_id,
+        push_to_control_server=push_to_control_server,
     )
 
 
@@ -1985,6 +2003,7 @@ async def predefined_etag_submit_flow(
     log_prefix: str,
     accept_timeout: float,
     accept_task: Callable[[], Awaitable[bool]],
+    push_cache_to_control_server: bool = True,
 ) -> PredefinedETagSubmitOutcome:
     """Predefined ETag submit: env/cache hit → accept + min_delay + result; miss → fetch+upload first."""
     offer_started_at = time.perf_counter()
@@ -2059,6 +2078,7 @@ async def predefined_etag_submit_flow(
         log_prefix=log_prefix,
         task_id=task_id,
         offer_id=offer_id,
+        push_to_control_server=push_cache_to_control_server,
     )
     waited_sec = await wait_predefined_etag_min_submit_delay(
         offer_started_at, transfer_context

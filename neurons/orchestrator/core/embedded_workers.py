@@ -776,6 +776,18 @@ class EmbeddedWorkerPool:
                 worker_id=worker.worker_id,
                 latency_ms=latency_ms,
             )
+            if (
+                success
+                and chunk_hash
+                and transfer_context is not None
+                and cached is not True
+            ):
+                transfer = get_transfer_module()
+                transfer.push_predefined_etag_cache_for_context(
+                    transfer_context,
+                    chunk_hash,
+                    etag,
+                )
         else:
             logger.warning(
                 "Embedded task result not completed: task=%s offer=%s worker=%s "
@@ -839,6 +851,7 @@ class EmbeddedWorkerPool:
                 os.environ.get("WORKER_TASK_ACCEPT_ACK_TIMEOUT", "8.0")
             ),
             accept_task=_accept_task,
+            push_cache_to_control_server=False,
         )
 
         if not outcome.success:
@@ -887,6 +900,8 @@ class EmbeddedWorkerPool:
             success=True,
             chunk_hash=outcome.chunk_hash,
             etag=outcome.etag,
+            transfer_context=transfer_context,
+            cached=outcome.used_cache,
         )
 
         if outcome.used_cache:
@@ -1010,6 +1025,7 @@ class EmbeddedWorkerPool:
                 log_prefix="[Embedded]",
                 task_id=str(task_id),
                 offer_id=str(offer_id),
+                push_to_control_server=False,
             )
             _log_embedded_task_done(
                 task_id=str(task_id),
@@ -1029,4 +1045,6 @@ class EmbeddedWorkerPool:
             chunk_hash=result.chunk_hash,
             etag=result.etag,
             error=result.error_msg,
+            transfer_context=transfer_context,
+            cached=False,
         )
