@@ -179,13 +179,24 @@ async def register_orchestrator_channel(
 ) -> bool:
     settings = get_settings()
     if control_secret != settings.orchestrator_secret:
-        logger.warning("orchestrator control rejected for %s: invalid control_secret", orchestrator_hotkey)
+        logger.warning(
+            "orchestrator control rejected for %s: invalid control_secret "
+            "(orchestrator ORCHESTRATOR_GATEWAY_SECRET must match gateway ORCHESTRATOR_GATEWAY_SECRET)",
+            orchestrator_hotkey,
+        )
         return False
 
     if api_key and not await validate_orchestrator_api_key(
         settings.core_server_url, orchestrator_hotkey, api_key
     ):
-        logger.warning("orchestrator control rejected for %s: API key validation failed", orchestrator_hotkey)
+        logger.warning(
+            "orchestrator control rejected for %s: API key validation failed "
+            "(gateway %s could not verify key against %s; omit api_key or set "
+            "GLOBAL_GATEWAY_CONTROL_USE_API_KEY=false on orchestrators)",
+            orchestrator_hotkey,
+            channel.transport,
+            settings.core_server_url,
+        )
         return False
 
     gateway_state.orchestrator_sessions[orchestrator_hotkey] = channel

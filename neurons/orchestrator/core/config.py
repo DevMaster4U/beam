@@ -273,6 +273,14 @@ class OrchestratorSettings(BaseSettings):
     )
     worker_gateway_mode: str = Field(default="in_process", env="WORKER_GATEWAY_MODE")
     global_gateway_url: Optional[str] = Field(default=None, env="GLOBAL_GATEWAY_URL")
+    global_gateway_control_use_api_key: bool = Field(
+        default=False,
+        env="GLOBAL_GATEWAY_CONTROL_USE_API_KEY",
+        description=(
+            "When true, attach BeamCore api_key to global-gateway control WS. "
+            "Default false: ORCHESTRATOR_GATEWAY_SECRET is sufficient for private gateways."
+        ),
+    )
     pool_coordinator_ipc: Optional[str] = Field(
         default=None,
         env="POOL_COORDINATOR_IPC",

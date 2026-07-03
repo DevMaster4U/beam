@@ -558,6 +558,8 @@ class EmbeddedWorkerPool:
         batch_used_ips: set[str] = set()
         batch_assigned_counts: dict[str, int] = defaultdict(int)
         transfer = get_transfer_module()
+        queued: list[tuple[EmbeddedWorker, dict, dict]] = []
+        cached_prepare: list[tuple[dict, str]] = []
 
         for offer in offers:
             if not isinstance(offer, dict):
@@ -613,6 +615,32 @@ class EmbeddedWorkerPool:
                 transfer_context=transfer_context,
                 path=path,
             )
+
+            if path == "predefined_etag":
+                known = transfer.get_predefined_etag_cache(transfer_context)
+                if (
+                    known
+                    and transfer.has_predefined_etag_chunk_data(transfer_context)
+                ):
+                    cached_prepare.append((transfer_context, known.chunk_hash))
+
+            queued.append((worker, offer, transfer_context))
+
+        if cached_prepare:
+            prepared = await transfer.prepare_cached_offer_batch(
+                batch_id, cached_prepare
+            )
+            if prepared:
+                logger.info(
+                    "Embedded cached batch prepared: batch=%s chunks=%s "
+                    "(parallel read + dest prewarm + sync PUT start)",
+                    short_id(batch_id, 12),
+                    prepared,
+                )
+
+        for worker, offer, transfer_context in queued:
+            task_id = offer.get("task_id") or offer.get("offer_id")
+            offer_id = offer.get("offer_id") or task_id
             task = asyncio.create_task(
                 self._handle_offer(worker, offer, transfer_context)
             )
