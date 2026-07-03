@@ -14,7 +14,7 @@ The orchestrator process:
 6. Relays `task_accept`, `task_reject`, and `task_result` messages upstream.
 7. Stays `READY=true` when it should receive routed production work.
 
-Workers use BeamCore HTTP for registration and payment evidence, but runtime task delivery uses the worker gateway.
+Workers use BeamCore HTTP for registration, but runtime task delivery uses the worker gateway.
 
 ## Mainnet Endpoints
 
@@ -166,8 +166,7 @@ WORKER_GATEWAY_SECRET=your-long-random-worker-secret
 
 ```text
 BeamCore -> orch-gateway -> orchestrator -> worker gateway -> worker
-worker -> worker gateway -> orchestrator -> orch-gateway -> BeamCore
-worker -> BeamCore HTTP payment-evidence
+worker -> worker gateway -> orchestrator -> orch-gateway -> BeamCore task_result
 ```
 
 ## Troubleshooting

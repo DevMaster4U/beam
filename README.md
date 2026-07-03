@@ -104,10 +104,10 @@ Clients / Validators                Orchestrators
 1. **Clients** create transfers via BeamCore HTTP API or SDK (core-server).
 2. **Orchestrators** register over HTTP and keep a **persistent orch-gateway WebSocket** for assignments and control messages — not HTTP polling.
 3. **Workers** register over HTTP, then receive chunk **offers** over the orchestrator's in-process worker gateway WebSocket (`/ws/{worker_id}` on `API_PORT`).
-4. **Workers** move data directly between source and destination connectors; they submit **payment / PoB evidence** to BeamCore HTTP.
+4. **Workers** move data directly between source and destination connectors and report results via the worker gateway.
 5. **Validators** read scores and PRISM inputs from BeamCore HTTP and set weights on Bittensor.
 
-> **Note:** `WORKER_GATEWAY_URL` must target the orchestrator HTTP origin that hosts `/ws/{worker_id}`. BeamCore HTTP (`CORE_SERVER_URL`) is orthogonal (registration, REST, evidence POSTs).
+> **Note:** `WORKER_GATEWAY_URL` must target the orchestrator HTTP origin that hosts `/ws/{worker_id}`. BeamCore HTTP (`CORE_SERVER_URL`) is used for registration and REST APIs.
 
 For operator-level connection maps and env naming, use the BeamCore operator documentation published for your target network.
 

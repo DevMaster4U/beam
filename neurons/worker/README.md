@@ -74,7 +74,7 @@ export WORKER_GATEWAY_SECRET=your-long-random-worker-secret
 1. Registers with the network using your Bittensor wallet (signed authentication)
 2. Connects to the worker gateway via WebSocket to receive `task_offer` messages
 3. For each offer: starts the transfer and sends `task_accept` immediately in parallel, waits for `task_accept_ack`, then submits `task_result` if accepted (aborts transfer if rejected)
-4. Sends `task_result` after the transfer and waits for `task_result_ack` (`completed=true` for scoring/payment)
+4. Sends `task_result` after the transfer and waits for `task_result_ack` (`completed=true` for scoring)
 5. Sends periodic heartbeats to stay registered
 
 ## Environment Variables

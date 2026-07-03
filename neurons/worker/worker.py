@@ -385,9 +385,6 @@ except ValueError:
     WORKER_INITIAL_ORDER = 0
 
 
-# Participant workers default to recording a payment obligation unless opted out.
-WORKER_REQUIRED_PAYMENT = False #_env_bool("WORKER_REQUIRED_PAYMENT", False)
-
 # Global semaphore for task concurrency
 task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
@@ -1254,90 +1251,6 @@ def sign_message(wallet: Any, message: str) -> str:
     """Sign a message with the wallet's hotkey. Returns hex signature."""
     signature = wallet.hotkey.sign(message.encode())
     return "0x" + signature.hex()
-
-
-def payment_evidence_message(
-    worker_id: str,
-    task_id: str,
-    offer_id: str,
-    chunk_hash: str = "",
-) -> str:
-    """Canonical message BeamCore verifies for worker payment evidence."""
-    return ":".join(
-        [
-            "beam-worker-payment-evidence",
-            worker_id,
-            task_id,
-            offer_id,
-            chunk_hash or "",
-        ]
-    )
-
-
-async def submit_worker_payment_evidence(
-    state: WorkerState,
-    task_id: str,
-    offer_id: str,
-    chunk_hash: str = "",
-) -> bool:
-    """Submit durable worker-signed payment evidence directly to BeamCore HTTP."""
-    if not state.worker_id or not state.api_key:
-        print("[Worker] Payment evidence skipped: missing worker_id or api_key")
-        return False
-
-    effective_offer = (offer_id or "").strip()
-    if not effective_offer:
-        print(
-            "[Worker] Payment evidence skipped: missing offer_id "
-            f"(task={task_label(task_id)}) — never substitute task_id for attempt UUID"
-        )
-        return False
-
-    message = payment_evidence_message(
-        state.worker_id,
-        task_id,
-        effective_offer,
-        chunk_hash,
-    )
-    try:
-        worker_signature = sign_message(state.wallet, message)
-    except Exception as e:
-        print(f"[Worker] Payment evidence signing failed: {e}")
-        return False
-
-    payload = {
-        "offer_id": effective_offer,
-        "success": True,
-        "chunk_hash": chunk_hash or "",
-        "worker_signature": worker_signature,
-        "required_payment": WORKER_REQUIRED_PAYMENT,
-    }
-    url = f"{state.api_url.rstrip('/')}/workers/{state.worker_id}/tasks/{task_id}/payment-evidence"
-
-    for attempt in range(3):
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.post(url, json=payload, headers=api_key_headers(state))
-            if 200 <= response.status_code < 300:
-                print(
-                    f"[Worker] Payment evidence OK task={task_label(task_id)} "
-                    f"offer={task_label(effective_offer)}"
-                )
-                return True
-            print(
-                f"[Worker] Payment evidence rejected attempt={attempt + 1}/3 "
-                f"status={response.status_code} task={task_label(task_id)} "
-                f"offer={task_label(effective_offer)}"
-            )
-        except Exception as e:
-            print(f"[Worker] Payment evidence submit error attempt={attempt + 1}/3: {e}")
-        await asyncio.sleep(1 + attempt)
-
-    print(
-        f"[Worker] Payment evidence FAILED after retries task_id={task_id} "
-        f"offer_id={effective_offer} worker_id={state.worker_id}"
-    )
-    return False
 
 
 async def register_worker(client: httpx.AsyncClient, state: WorkerState) -> Dict[str, Any]:
@@ -3651,7 +3564,7 @@ async def _finalize_ws_task(
     offer_id: str,
     result: TaskExecutionResult,
 ) -> bool:
-    summary_ack = await finalize_ws_task_result(
+    await finalize_ws_task_result(
         websocket,
         state,
         task_id,
@@ -3664,57 +3577,12 @@ async def _finalize_ws_task(
         transfer_mbps=transfer_mbps(result.bytes_transferred, result.duration_ms),
     )
 
-    if result.success and summary_ack.completed:
-        await submit_worker_payment_evidence(
-            state,
-            task_id,
-            offer_id,
-            chunk_hash=result.chunk_hash,
-        )
-
     status = "OK" if result.success else f"FAIL: {result.error_msg}"
     print(
         f"[Worker] [WS] Task {task_label(task_id)} offer={task_label(offer_id)}: {status} | "
         f"{result.bytes_transferred} bytes"
     )
     return result.success
-    
-    # finalize_task = asyncio.create_task(
-    #     finalize_ws_task_result(
-    #         websocket,
-    #         state,
-    #         task_id,
-    #         result.success,
-    #         result.bytes_transferred,
-    #         chunk_hash=result.chunk_hash,
-    #         etag=result.etag,
-    #         error=result.error_msg,
-    #         offer_id=offer_id,
-    #         transfer_mbps=transfer_mbps(result.bytes_transferred, result.duration_ms),
-    #     )
-    # )
-
-    # done, _pending = await asyncio.wait({finalize_task}, timeout=0.5)
-
-    # payment_task = asyncio.create_task(
-    #     submit_worker_payment_evidence(
-    #         state,
-    #         task_id,
-    #         offer_id,
-    #         chunk_hash=result.chunk_hash,
-    #     )
-    # )
-
-    # # Make sure both have actually finished before moving on, regardless of
-    # # which fired first.
-    # summary_ack, _ = await asyncio.gather(finalize_task, payment_task)
-
-    # status = "OK" if result.success else f"FAIL: {result.error_msg}"
-    # print(
-    #     f"[Worker] [WS] Task {task_label(task_id)} offer={task_label(offer_id)}: {status} | "
-    #     f"{result.bytes_transferred} bytes"
-    # )
-    # return result.success
 
 
 async def _handle_ws_task_sequential_accept(

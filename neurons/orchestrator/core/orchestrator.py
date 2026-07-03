@@ -1004,17 +1004,6 @@ class Orchestrator:
         except Exception as e:
             logger.error(f"Error distributing epoch rewards: {e}")
 
-        try:
-            await self._epoch_mgr.generate_payment_proofs(
-                self.current_epoch,
-                self.workers.values(),
-                self.hotkey or "",
-                self.our_uid,
-                self.wallet,
-            )
-        except Exception as e:
-            logger.error(f"Error generating payment proofs: {e}")
-
         for worker in self.workers.values():
             worker.bytes_relayed_epoch = 0
             worker.rewards_earned_epoch = 0
