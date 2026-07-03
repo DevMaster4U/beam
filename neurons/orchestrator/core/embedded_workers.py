@@ -833,7 +833,7 @@ class EmbeddedWorkerPool:
             )
             return
 
-        cached_hit = transfer.get_predefined_etag_cache(transfer_context) is not None
+        offer_started_at = time.perf_counter()
 
         async def _accept_task() -> bool:
             resp = await self._send_accept(worker, task_id, offer_id)
@@ -852,6 +852,7 @@ class EmbeddedWorkerPool:
             ),
             accept_task=_accept_task,
             push_cache_to_control_server=False,
+            offer_started_at=offer_started_at,
         )
 
         if not outcome.success:
@@ -904,7 +905,7 @@ class EmbeddedWorkerPool:
             cached=outcome.used_cache,
         )
 
-        if outcome.used_cache and not outcome.uploaded_from_cache:
+        if outcome.used_cache and not outcome.background_upload_started:
             asyncio.create_task(
                 self._await_background_transfer_task(
                     worker,
