@@ -86,3 +86,4 @@ wallets/
 .bittensor/
 
 data/control-server/cache
+*.bin
