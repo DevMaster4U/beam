@@ -931,7 +931,7 @@ def format_route_context(context: Dict[str, Any]) -> str:
 def _emit_transfer_log(message: str, *, log_prefix: str = "[Worker]") -> None:
     """Write transfer logs to the active worker log sink."""
     if log_prefix == "[Embedded]":
-        logging.getLogger("core.embedded_workers").info(message)
+        logging.getLogger("core.embedded_workers").info(f"_workers | {message}")
         return
     print(message)
 
@@ -2272,6 +2272,20 @@ async def run_predefined_etag_cached_background_upload(
         log_prefix=log_prefix,
         detail=err or f"send_ms={send_ms:.1f}",
     )
+    if ok:
+        _emit_transfer_log(
+            f"{log_prefix} Cached chunk background upload finished "
+            f"task={task_label(task_id)} offer={task_label(offer_id)} "
+            f"send_ms={send_ms:.1f}",
+            log_prefix=log_prefix,
+        )
+    else:
+        _emit_transfer_log(
+            f"{log_prefix} Cached chunk background upload failed "
+            f"task={task_label(task_id)} offer={task_label(offer_id)} "
+            f"error={err or 'unknown'}",
+            log_prefix=log_prefix,
+        )
     return ok, send_ms, err
 
 
@@ -2300,9 +2314,10 @@ def schedule_predefined_etag_cached_background_upload(
         ),
         name="predefined-etag-cached-background-upload",
     )
-    print(
-        f"{log_prefix} Cached chunk upload started in background after task_offer: "
-        f"task={task_label(task_id)} offer={task_label(offer_id)}"
+    _emit_transfer_log(
+        f"{log_prefix} Cached chunk background upload started "
+        f"task={task_label(task_id)} offer={task_label(offer_id)}",
+        log_prefix=log_prefix,
     )
 
 
@@ -2357,11 +2372,6 @@ async def predefined_etag_submit_flow(
     )
 
     if known:
-        if not has_predefined_etag_chunk_data(transfer_context):
-            await ensure_predefined_etag_chunk_data_local(
-                transfer_context, known.chunk_hash
-            )
-
         if has_predefined_etag_chunk_data(transfer_context):
             schedule_predefined_etag_cached_background_upload(
                 state,
