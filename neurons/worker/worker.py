@@ -2289,7 +2289,7 @@ async def run_predefined_etag_cached_background_upload(
     return ok, send_ms, err
 
 
-def schedule_predefined_etag_cached_background_upload(
+def start_predefined_etag_cached_background_upload(
     state: WorkerState,
     transfer_context: dict,
     chunk_hash: str,
@@ -2297,13 +2297,13 @@ def schedule_predefined_etag_cached_background_upload(
     task_id: str = None,
     offer_id: str = None,
     log_prefix: str = "[Worker]",
-) -> None:
-    """Fire-and-forget cached upload to dest right after task_accept."""
+) -> Optional[asyncio.Task]:
+    """Start cached upload to dest; caller awaits the task before task_result."""
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        return
-    loop.create_task(
+        return None
+    upload_task = loop.create_task(
         run_predefined_etag_cached_background_upload(
             state,
             transfer_context,
@@ -2319,6 +2319,32 @@ def schedule_predefined_etag_cached_background_upload(
         f"task={task_label(task_id)} offer={task_label(offer_id)}",
         log_prefix=log_prefix,
     )
+    return upload_task
+
+
+async def _await_cached_background_upload_task(
+    upload_task: asyncio.Task,
+    *,
+    task_id: str = None,
+    offer_id: str = None,
+    log_prefix: str = "[Worker]",
+) -> tuple[bool, float, Optional[str]]:
+    """Wait for a cached background upload task and return (ok, send_ms, error)."""
+    try:
+        return await upload_task
+    except asyncio.CancelledError:
+        _emit_transfer_log(
+            f"{log_prefix} Cached chunk background upload cancelled "
+            f"task={task_label(task_id)} offer={task_label(offer_id)}",
+            log_prefix=log_prefix,
+        )
+        raise
+
+
+def _cancel_cached_background_upload(upload_task: Optional[asyncio.Task]) -> None:
+    if upload_task is None or upload_task.done():
+        return
+    upload_task.cancel()
 
 
 async def _predefined_etag_await_accept(
@@ -2356,7 +2382,7 @@ async def predefined_etag_submit_flow(
     push_cache_to_control_server: bool = True,
     offer_started_at: Optional[float] = None,
 ) -> PredefinedETagSubmitOutcome:
-    """Predefined ETag: cache hit → offer-time bg upload + accept + result; miss → accept + fetch."""
+    """Predefined ETag: cache hit → parallel bg upload + accept, then task_result."""
     started_at = offer_started_at if offer_started_at is not None else time.perf_counter()
     hash_source = predefined_etag_known_source(transfer_context)
     known = get_predefined_etag_cache(transfer_context)
@@ -2373,7 +2399,7 @@ async def predefined_etag_submit_flow(
 
     if known:
         if has_predefined_etag_chunk_data(transfer_context):
-            schedule_predefined_etag_cached_background_upload(
+            upload_task = start_predefined_etag_cached_background_upload(
                 state,
                 transfer_context,
                 known.chunk_hash,
@@ -2381,14 +2407,46 @@ async def predefined_etag_submit_flow(
                 offer_id=offer_id,
                 log_prefix=log_prefix,
             )
+            if upload_task is None:
+                return PredefinedETagSubmitOutcome(
+                    success=False,
+                    error="cache_background_upload_not_started",
+                    used_cache=True,
+                )
+
             accepted, fail = await _predefined_etag_await_accept(
                 accept_task, accept_timeout
             )
             if fail is not None:
+                _cancel_cached_background_upload(upload_task)
+                with contextlib.suppress(asyncio.CancelledError):
+                    await upload_task
                 return fail
             waited_sec = await wait_predefined_etag_min_submit_delay(
                 started_at, transfer_context
             )
+            try:
+                ok, send_ms, err = await _await_cached_background_upload_task(
+                    upload_task,
+                    task_id=task_id,
+                    offer_id=offer_id,
+                    log_prefix=log_prefix,
+                )
+            except asyncio.CancelledError:
+                return PredefinedETagSubmitOutcome(
+                    success=False,
+                    error="cache_background_upload_cancelled",
+                    used_cache=True,
+                )
+            if not ok:
+                return PredefinedETagSubmitOutcome(
+                    success=False,
+                    chunk_hash=known.chunk_hash,
+                    etag=known.etag,
+                    used_cache=True,
+                    error=err or "cache_background_upload_failed",
+                    send_ms=send_ms,
+                )
             _log_predefined_etag_submit_ready(
                 log_prefix,
                 task_id,
@@ -2402,11 +2460,11 @@ async def predefined_etag_submit_flow(
                 chunk_hash=known.chunk_hash,
                 etag=known.etag,
                 used_cache=True,
-                uploaded_from_cache=False,
+                uploaded_from_cache=True,
                 background_upload_started=True,
                 hash_source=hash_source or "cache",
                 fetch_ms=0.0,
-                send_ms=0.0,
+                send_ms=send_ms,
             )
 
         if hash_source == "env":
