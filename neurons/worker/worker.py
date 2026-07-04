@@ -43,6 +43,7 @@ import re
 import signal
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version as package_version
@@ -328,6 +329,11 @@ try:
     )
 except ValueError:
     PREDEFINED_ETAG_MAX_SPEED_MBPS = 0.0
+# Larger chunks for cached uploads — less event-loop scheduling overhead when parallel.
+CACHED_UPLOAD_RATE_CHUNK_BYTES = max(
+    256 * 1024,
+    int(os.environ.get("WORKER_CACHED_UPLOAD_RATE_CHUNK_BYTES", str(2 * 1024 * 1024))),
+)
 PREDEFINED_ETAG_SOURCE_URL = (
     os.environ.get("WORKER_PREDEFINED_ETAG_SOURCE_URL", "").strip().rstrip("/")
 )
@@ -521,12 +527,11 @@ def format_predefined_etag_min_submit_detail(
     return " ".join(parts)
 
 
-async def rate_limited_body_stream(body: bytes, max_mbps: float):
+async def rate_limited_body_stream(body: bytes, max_mbps: float, *, chunk_size: int = 256 * 1024):
     """Yield body chunks paced so upload does not exceed max_mbps."""
     if max_mbps <= 0:
         yield body
         return
-    chunk_size = 256 * 1024
     bytes_per_sec = max_mbps * 1_000_000 / 8
     offset = 0
     while offset < len(body):
@@ -536,6 +541,14 @@ async def rate_limited_body_stream(body: bytes, max_mbps: float):
         offset = end
         if offset < len(body):
             await asyncio.sleep(len(part) / bytes_per_sec)
+
+
+async def rate_limited_cached_body_stream(body: bytes, max_mbps: float):
+    """Cached-upload rate limiter — per-task cap, larger chunks for parallel fairness."""
+    async for part in rate_limited_body_stream(
+        body, max_mbps, chunk_size=CACHED_UPLOAD_RATE_CHUNK_BYTES
+    ):
+        yield part
 
 
 async def wait_predefined_etag_min_submit_delay(
@@ -573,6 +586,7 @@ async def upload_buffered_predefined_etag(
     offer_id: str = None,
     source_url: str = "",
     log_prefix: str = "[Worker]",
+    from_local_cache: bool = False,
 ) -> float:
     """PUT/POST a buffered predefined-etag chunk; returns send_ms."""
     is_object_storage = is_object_storage_presigned_url(destination_url)
@@ -596,7 +610,12 @@ async def upload_buffered_predefined_etag(
     send_started = time.perf_counter()
     upload_content: Any = body
     if PREDEFINED_ETAG_MAX_SPEED_MBPS > 0:
-        upload_content = rate_limited_body_stream(body, PREDEFINED_ETAG_MAX_SPEED_MBPS)
+        if from_local_cache:
+            upload_content = rate_limited_cached_body_stream(
+                body, PREDEFINED_ETAG_MAX_SPEED_MBPS
+            )
+        else:
+            upload_content = rate_limited_body_stream(body, PREDEFINED_ETAG_MAX_SPEED_MBPS)
 
     if is_object_storage:
         send_headers = {"Content-Type": "application/octet-stream"}
@@ -711,25 +730,28 @@ async def upload_predefined_etag_from_local_cache(
     offer_id: str = None,
     log_prefix: str = "[Worker]",
 ) -> tuple[bool, float, Optional[str]]:
-    """Upload a cached chunk file to dest after task_accept (rate-limited by env max speed)."""
-    path = predefined_etag_chunk_data_path(transfer_context)
-    if not path.is_file():
-        return False, 0.0, "cache_file_missing"
-
-    body = await asyncio.to_thread(path.read_bytes)
-    if not body:
-        return False, 0.0, "cache_file_empty"
-
-    computed = hashlib.sha256(body).hexdigest()
-    if chunk_hash and computed.lower() != chunk_hash.lower():
-        return False, 0.0, "cache_file_hash_mismatch"
-
-    chunk_size = int(transfer_context["chunk_size"])
-    range_start = int(transfer_context["range_start"])
-    dest_headers = transfer_context.get("dest_headers") or {}
-    source_url = str(transfer_context.get("source_url") or "")
-
+    """Upload a cached chunk file to dest (per-task rate cap, batch-fair PUT start)."""
+    batch_id = str(transfer_context.get("_cached_batch_id") or "").strip()
+    participated = False
     try:
+        body = await read_predefined_etag_cached_body(transfer_context)
+        if not body:
+            await abort_cached_batch_put_slot(transfer_context)
+            return False, 0.0, "cache_file_missing"
+
+        computed = hashlib.sha256(body).hexdigest()
+        if chunk_hash and computed.lower() != chunk_hash.lower():
+            await abort_cached_batch_put_slot(transfer_context)
+            return False, 0.0, "cache_file_hash_mismatch"
+
+        await wait_cached_batch_put_start(transfer_context)
+        participated = True
+
+        chunk_size = int(transfer_context["chunk_size"])
+        range_start = int(transfer_context["range_start"])
+        dest_headers = transfer_context.get("dest_headers") or {}
+        source_url = str(transfer_context.get("source_url") or "")
+
         send_ms = await upload_buffered_predefined_etag(
             client,
             destination_url=transfer_context["dest_url"],
@@ -745,10 +767,17 @@ async def upload_predefined_etag_from_local_cache(
             offer_id=offer_id,
             source_url=source_url,
             log_prefix=log_prefix,
+            from_local_cache=True,
         )
         return True, send_ms, None
     except Exception as exc:
+        if batch_id and not participated:
+            await abort_cached_batch_put_slot(transfer_context)
         return False, 0.0, exception_detail(exc)
+    finally:
+        transfer_context.pop("_preloaded_cached_body", None)
+        if participated:
+            await finish_cached_batch_put_slot(transfer_context)
 
 
 async def ensure_predefined_etag_chunk_data_local(
@@ -1594,6 +1623,145 @@ def has_predefined_etag_chunk_data(transfer_context: dict) -> bool:
     return predefined_etag_chunk_data_path(transfer_context).is_file()
 
 
+_CACHE_READ_EXECUTOR: Optional[ThreadPoolExecutor] = None
+_CACHED_BATCH_PUT_GATES: dict[str, "_CachedBatchPutGate"] = {}
+
+
+def _cache_read_executor() -> ThreadPoolExecutor:
+    global _CACHE_READ_EXECUTOR
+    if _CACHE_READ_EXECUTOR is None:
+        workers = max(4, int(os.environ.get("WORKER_CACHED_READ_THREADS", "8")))
+        _CACHE_READ_EXECUTOR = ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="cached-chunk-read",
+        )
+    return _CACHE_READ_EXECUTOR
+
+
+@dataclass
+class _CachedBatchPutGate:
+    """Synchronize cached PUT start so parallel batch tasks begin together."""
+
+    batch_id: str
+    expected: int
+    ready: int = 0
+    finished: int = 0
+    event: asyncio.Event = field(default_factory=asyncio.Event)
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    async def wait_put_start(self) -> None:
+        async with self.lock:
+            self.ready += 1
+            if self.ready >= self.expected:
+                self.event.set()
+        await self.event.wait()
+
+    async def abort_slot(self) -> None:
+        """Drop a batch participant that will not reach the PUT gate (avoids deadlock)."""
+        async with self.lock:
+            if self.expected > 0:
+                self.expected -= 1
+            if self.ready >= self.expected:
+                self.event.set()
+
+    async def mark_finished(self) -> None:
+        async with self.lock:
+            self.finished += 1
+            if self.finished >= self.expected:
+                _CACHED_BATCH_PUT_GATES.pop(self.batch_id, None)
+
+
+def _cached_batch_put_gate(batch_id: str) -> Optional[_CachedBatchPutGate]:
+    batch_id = str(batch_id or "").strip()
+    if not batch_id:
+        return None
+    return _CACHED_BATCH_PUT_GATES.get(batch_id)
+
+
+async def read_predefined_etag_cached_body(transfer_context: dict) -> bytes:
+    """Load cached chunk bytes from disk (parallel-friendly thread pool)."""
+    preloaded = transfer_context.get("_preloaded_cached_body")
+    if isinstance(preloaded, (bytes, bytearray)) and preloaded:
+        return bytes(preloaded)
+    path = predefined_etag_chunk_data_path(transfer_context)
+    if not path.is_file():
+        return b""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_cache_read_executor(), path.read_bytes)
+
+
+async def prepare_cached_offer_batch(
+    batch_id: str,
+    items: list[tuple[dict, str]],
+) -> int:
+    """Pre-read cached bodies, optionally prewarm dest origins, and arm a batch PUT gate."""
+    if not items:
+        return 0
+    batch_id = str(batch_id or "").strip()
+    if not batch_id:
+        return 0
+
+    bodies = await asyncio.gather(
+        *[read_predefined_etag_cached_body(transfer_context) for transfer_context, _ in items]
+    )
+    prepared = 0
+    origins: set[str] = set()
+    for (transfer_context, chunk_hash), body in zip(items, bodies):
+        if not body:
+            continue
+        computed = hashlib.sha256(body).hexdigest()
+        if chunk_hash and computed.lower() != chunk_hash.lower():
+            continue
+        transfer_context["_preloaded_cached_body"] = body
+        transfer_context["_cached_batch_id"] = batch_id
+        origin = url_origin(str(transfer_context.get("dest_url") or ""))
+        if origin:
+            origins.add(origin)
+        prepared += 1
+
+    if prepared <= 0:
+        return 0
+
+    _CACHED_BATCH_PUT_GATES[batch_id] = _CachedBatchPutGate(
+        batch_id=batch_id,
+        expected=prepared,
+    )
+
+    if PREWARM_ENABLED and origins:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await prewarm_origins(client, list(origins), "cached-batch", 5.0)
+    return prepared
+
+
+async def wait_cached_batch_put_start(transfer_context: dict) -> None:
+    """Block until all cached tasks in this batch are ready to PUT."""
+    batch_id = str(transfer_context.get("_cached_batch_id") or "").strip()
+    if not batch_id:
+        return
+    gate = _cached_batch_put_gate(batch_id)
+    if gate is None:
+        return
+    await gate.wait_put_start()
+
+
+async def abort_cached_batch_put_slot(transfer_context: dict) -> None:
+    batch_id = str(transfer_context.get("_cached_batch_id") or "").strip()
+    if not batch_id:
+        return
+    gate = _cached_batch_put_gate(batch_id)
+    if gate is not None:
+        await gate.abort_slot()
+
+
+async def finish_cached_batch_put_slot(transfer_context: dict) -> None:
+    batch_id = str(transfer_context.get("_cached_batch_id") or "").strip()
+    if not batch_id:
+        return
+    gate = _cached_batch_put_gate(batch_id)
+    if gate is not None:
+        await gate.mark_finished()
+
+
 def save_predefined_etag_chunk_data(transfer_context: dict, data: bytes) -> Optional[Path]:
     """Persist fetched chunk bytes locally (does not block control-server sync)."""
     if not data or not predefined_etag_transfer_eligible(transfer_context):
@@ -2382,8 +2550,13 @@ async def predefined_etag_submit_flow(
     push_cache_to_control_server: bool = True,
     offer_started_at: Optional[float] = None,
 ) -> PredefinedETagSubmitOutcome:
-    """Predefined ETag: cache hit → parallel bg upload + accept, then task_result."""
+    """Predefined ETag: accept immediately, cache hit → parallel bg upload, then task_result."""
     started_at = offer_started_at if offer_started_at is not None else time.perf_counter()
+    # Start accept first so BeamCore sees it before cache prepare / upload work.
+    accept_wait = asyncio.create_task(
+        _predefined_etag_await_accept(accept_task, accept_timeout),
+        name=f"predefined-etag-accept-{task_label(offer_id)}",
+    )
     hash_source = predefined_etag_known_source(transfer_context)
     known = get_predefined_etag_cache(transfer_context)
     stage = hash_source or "cache_miss"
@@ -2408,15 +2581,16 @@ async def predefined_etag_submit_flow(
                 log_prefix=log_prefix,
             )
             if upload_task is None:
+                accept_wait.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await accept_wait
                 return PredefinedETagSubmitOutcome(
                     success=False,
                     error="cache_background_upload_not_started",
                     used_cache=True,
                 )
 
-            accepted, fail = await _predefined_etag_await_accept(
-                accept_task, accept_timeout
-            )
+            accepted, fail = await accept_wait
             if fail is not None:
                 _cancel_cached_background_upload(upload_task)
                 with contextlib.suppress(asyncio.CancelledError):
@@ -2468,9 +2642,7 @@ async def predefined_etag_submit_flow(
             )
 
         if hash_source == "env":
-            accepted, fail = await _predefined_etag_await_accept(
-                accept_task, accept_timeout
-            )
+            accepted, fail = await accept_wait
             if fail is not None:
                 return fail
             waited_sec = await wait_predefined_etag_min_submit_delay(
@@ -2500,7 +2672,7 @@ async def predefined_etag_submit_flow(
             f"offer={task_label(offer_id)}"
         )
 
-    accepted, fail = await _predefined_etag_await_accept(accept_task, accept_timeout)
+    accepted, fail = await accept_wait
     if fail is not None:
         return fail
 

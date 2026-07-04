@@ -54,6 +54,23 @@ def _log_embedded_task_offer(
     )
 
 
+def _log_embedded_task_accept_sent(
+    *,
+    task_id: str,
+    offer_id: str,
+    worker_slot: int,
+    worker_id: str,
+) -> None:
+    logger.info(
+        "%s task_accept_sent task=%s offer=%s worker_slot=%s worker=%s",
+        _WORKERS_LOG,
+        short_id(task_id),
+        short_id(offer_id),
+        worker_slot,
+        short_id(worker_id),
+    )
+
+
 def _log_embedded_task_done(
     *,
     task_id: str,
@@ -320,13 +337,18 @@ class _CoroutinePool:
         self._queue.put_nowait((handle, runner))
 
 
-def _embedded_http_client() -> httpx.AsyncClient:
-    max_tasks = max(1, int(os.environ.get("WORKER_MAX_CONCURRENT_TASKS", "4")))
+def _embedded_http_client(
+  *,
+  worker_slots: int = 1,
+  max_concurrent_per_worker: int = 4,
+) -> httpx.AsyncClient:
+    """HTTP client sized for parallel R2 PUTs across embedded worker slots."""
+    parallel = max(4, worker_slots * max_concurrent_per_worker)
     return httpx.AsyncClient(
         timeout=httpx.Timeout(120.0, connect=30.0),
         limits=httpx.Limits(
-            max_connections=max(max_tasks * 4, 16),
-            max_keepalive_connections=max(max_tasks * 2, 8),
+            max_connections=max(parallel * 2, 32),
+            max_keepalive_connections=max(parallel, 16),
         ),
     )
 
@@ -339,6 +361,7 @@ class EmbeddedWorkerPool:
         self.upstream = upstream
         self.workers: List[EmbeddedWorker] = []
         self.http_client: Optional[httpx.AsyncClient] = None
+        self._upload_client: Optional[httpx.AsyncClient] = None
         self._cursor = 0
         self._offer_pool: Optional[_CoroutinePool] = None
         self._side_pool: Optional[_CoroutinePool] = None
@@ -361,6 +384,12 @@ class EmbeddedWorkerPool:
             limits=httpx.Limits(max_connections=64, max_keepalive_connections=32),
         )
 
+        max_tasks_per_worker = max(cfg.max_concurrent_tasks for cfg in configs)
+        self._upload_client = _embedded_http_client(
+            worker_slots=len(configs),
+            max_concurrent_per_worker=max_tasks_per_worker,
+        )
+
         for cfg in configs:
             wallet = bt.Wallet(
                 name=cfg.wallet_name,
@@ -368,11 +397,10 @@ class EmbeddedWorkerPool:
                 path=self.settings.wallet_path,
             )
             hotkey = wallet.hotkey.ss58_address
-            worker_client = _embedded_http_client()
             state = transfer.WorkerState(
                 wallet=wallet,
                 api_url=self.settings.core_server_url,
-                http_client=worker_client,
+                http_client=self._upload_client,
             )
             state.prewarm_origins = transfer.load_prewarm_origins_from_disk()
 
@@ -402,7 +430,7 @@ class EmbeddedWorkerPool:
                 state=state,
                 initial_order=cfg.initial_order,
                 max_concurrent_tasks=cfg.max_concurrent_tasks,
-                http_client=worker_client,
+                http_client=self._upload_client,
             )
             self.workers.append(worker)
             logger.info(
@@ -412,11 +440,27 @@ class EmbeddedWorkerPool:
                 hotkey[:16],
             )
 
+        parallel_slots = len(self.workers)
+        if parallel_slots > transfer.PREDEFINED_ETAG_MAX_PARALLEL:
+            transfer.predefined_etag_fast_path_semaphore = asyncio.Semaphore(
+                parallel_slots
+            )
+        effective_parallel = max(
+            transfer.PREDEFINED_ETAG_MAX_PARALLEL, parallel_slots
+        )
+
+        logger.info(
+            "Embedded worker pool: slots=%s max_concurrent_per_slot=%s "
+            "shared_upload_client=true upload_max_connections=%s",
+            parallel_slots,
+            max_tasks_per_worker,
+            max(parallel_slots * max_tasks_per_worker * 2, 32),
+        )
         logger.info(
             "Embedded predefined ETag config: early_submit=%s max_parallel=%s "
             "env_source=%r env_file_size=%s cache=source_url+byte_range",
             transfer.WORKER_PREDEFINED_ETAG_EARLY_SUBMIT,
-            transfer.PREDEFINED_ETAG_MAX_PARALLEL,
+            effective_parallel,
             transfer.normalized_capability_url(transfer.PREDEFINED_ETAG_SOURCE_URL)
             or None,
             transfer.PREDEFINED_ETAG_SOURCE_FILE_SIZE,
@@ -448,10 +492,11 @@ class EmbeddedWorkerPool:
                 await task
         self._task_handles.clear()
         for worker in self.workers:
-            if worker.http_client is not None:
-                await worker.http_client.aclose()
-                worker.http_client = None
+            worker.http_client = None
         self.workers.clear()
+        if self._upload_client is not None:
+            await self._upload_client.aclose()
+            self._upload_client = None
         if self.http_client is not None:
             await self.http_client.aclose()
             self.http_client = None
@@ -467,6 +512,8 @@ class EmbeddedWorkerPool:
         pool_size = len(self.workers)
         start = self._cursor % pool_size
         in_batch = batch_used_ips is not None or batch_assigned_counts is not None
+        distinct_ips = {w.ip.strip() for w in self.workers if w.ip.strip()}
+        prefer_unique_ips = len(distinct_ips) > 1
 
         def _eligible(
             worker: EmbeddedWorker,
@@ -483,14 +530,15 @@ class EmbeddedWorkerPool:
                     return False
                 if not allow_reuse_worker and assigned > 0:
                     return False
-            ip = worker.ip.strip()
-            if (
-                not allow_used_ip
-                and batch_used_ips is not None
-                and ip
-                and ip in batch_used_ips
-            ):
-                return False
+            if prefer_unique_ips:
+                ip = worker.ip.strip()
+                if (
+                    not allow_used_ip
+                    and batch_used_ips is not None
+                    and ip
+                    and ip in batch_used_ips
+                ):
+                    return False
             return True
 
         def _pick(
@@ -558,6 +606,10 @@ class EmbeddedWorkerPool:
         batch_used_ips: set[str] = set()
         batch_assigned_counts: dict[str, int] = defaultdict(int)
         transfer = get_transfer_module()
+        queued: list[
+            tuple[EmbeddedWorker, dict, dict, Optional[asyncio.Task]]
+        ] = []
+        cached_prepare: list[tuple[dict, str]] = []
 
         for offer in offers:
             if not isinstance(offer, dict):
@@ -605,6 +657,7 @@ class EmbeddedWorkerPool:
             batch_assigned_counts[worker.worker_id] += 1
             if worker.ip:
                 batch_used_ips.add(worker.ip)
+            worker.active_offer_ids.add(offer_id)
 
             _log_embedded_task_offer(
                 task_id=str(task_id),
@@ -613,8 +666,67 @@ class EmbeddedWorkerPool:
                 transfer_context=transfer_context,
                 path=path,
             )
+
+            # Fire task_accept immediately on offer — before cache prepare / upload.
+            accept_future = asyncio.create_task(
+                self._send_accept(worker, task_id, offer_id),
+                name=f"embedded-task-accept-{short_id(offer_id, 8)}",
+            )
+            _log_embedded_task_accept_sent(
+                task_id=str(task_id),
+                offer_id=str(offer_id),
+                worker_slot=worker.slot,
+                worker_id=worker.worker_id,
+            )
+
+            if path == "predefined_etag":
+                known = transfer.get_predefined_etag_cache(transfer_context)
+                if (
+                    known
+                    and transfer.has_predefined_etag_chunk_data(transfer_context)
+                ):
+                    cached_prepare.append((transfer_context, known.chunk_hash))
+
+            queued.append((worker, offer, transfer_context, accept_future))
+
+        # Yield so accept WS frames flush before disk prepare / upload work.
+        if queued:
+            await asyncio.sleep(0)
+
+        if cached_prepare:
+            prepared = await transfer.prepare_cached_offer_batch(
+                batch_id, cached_prepare
+            )
+            if prepared:
+                logger.info(
+                    "Embedded cached batch prepared: batch=%s chunks=%s "
+                    "(parallel read + sync PUT start)",
+                    short_id(batch_id, 12),
+                    prepared,
+                )
+
+        if queued:
+            slot_summary = ",".join(
+                str(worker.slot) for worker, _, _, _ in queued
+            )
+            logger.info(
+                "%s batch_dispatch batch=%s offers=%s worker_slots=[%s]",
+                _WORKERS_LOG,
+                short_id(batch_id, 12),
+                len(queued),
+                slot_summary,
+            )
+
+        for worker, offer, transfer_context, accept_future in queued:
+            task_id = offer.get("task_id") or offer.get("offer_id")
+            offer_id = offer.get("offer_id") or task_id
             task = asyncio.create_task(
-                self._handle_offer(worker, offer, transfer_context)
+                self._handle_offer(
+                    worker,
+                    offer,
+                    transfer_context,
+                    accept_future=accept_future,
+                )
             )
             self._task_handles.add(task)
             task.add_done_callback(
@@ -641,11 +753,15 @@ class EmbeddedWorkerPool:
         worker: EmbeddedWorker,
         offer: dict,
         transfer_context: dict,
+        *,
+        accept_future: Optional[asyncio.Task] = None,
     ) -> None:
         transfer = get_transfer_module()
         task_id = offer.get("task_id") or offer.get("offer_id")
         offer_id = offer.get("offer_id") or task_id
-        worker.active_offer_ids.add(str(offer_id or ""))
+        offer_key = str(offer_id or "")
+        # active_offer_ids is reserved at batch assign (before early accept).
+        worker.active_offer_ids.add(offer_key)
 
         try:
             deadline_us = int(offer.get("deadline_us") or 0)
@@ -654,7 +770,11 @@ class EmbeddedWorkerPool:
         estimated_bytes = transfer.estimate_task_bytes(offer)
 
         try:
-            capacity_error = self._reserve_capacity(worker, estimated_bytes)
+            capacity_error = self._reserve_capacity(
+                worker,
+                estimated_bytes,
+                already_reserved=accept_future is not None,
+            )
             if capacity_error:
                 logger.warning(
                     "Embedded rejecting offer: task=%s offer=%s worker_slot=%s reason=%s",
@@ -670,7 +790,20 @@ class EmbeddedWorkerPool:
                     offer_id=str(offer_id),
                     reason=capacity_error,
                 )
-                await self._send_reject(worker, task_id, offer_id, capacity_error)
+                # Accept already in flight — fail via task_result, not reject.
+                if accept_future is not None:
+                    with contextlib.suppress(Exception):
+                        await accept_future
+                    await self._send_result(
+                        worker,
+                        task_id,
+                        offer_id,
+                        success=False,
+                        error=capacity_error,
+                        transfer_context=transfer_context,
+                    )
+                else:
+                    await self._send_reject(worker, task_id, offer_id, capacity_error)
                 return
 
             skip_reasons = transfer.predefined_etag_early_submit_skip_reasons(transfer_context)
@@ -691,6 +824,7 @@ class EmbeddedWorkerPool:
                     offer_id,
                     transfer_context,
                     deadline_us,
+                    accept_future=accept_future,
                 )
             else:
                 await self._handle_standard_offer(
@@ -700,6 +834,7 @@ class EmbeddedWorkerPool:
                     offer_id,
                     transfer_context,
                     deadline_us,
+                    accept_future=accept_future,
                 )
         except Exception:
             logger.exception(
@@ -710,12 +845,21 @@ class EmbeddedWorkerPool:
             )
             raise
         finally:
-            worker.active_offer_ids.discard(str(offer_id or ""))
+            worker.active_offer_ids.discard(offer_key)
 
-    def _reserve_capacity(self, worker: EmbeddedWorker, estimated_bytes: int) -> Optional[str]:
+    def _reserve_capacity(
+        self,
+        worker: EmbeddedWorker,
+        estimated_bytes: int,
+        *,
+        already_reserved: bool = False,
+    ) -> Optional[str]:
         transfer = get_transfer_module()
         if estimated_bytes > transfer.MAX_IN_FLIGHT_BYTES:
             return f"task_too_large:{estimated_bytes}"
+        # Early-accept path reserves the slot at batch assign.
+        if already_reserved:
+            return None
         if not worker.has_capacity:
             return f"queue_full:{worker.active_count}"
         return None
@@ -809,6 +953,8 @@ class EmbeddedWorkerPool:
         offer_id: str,
         transfer_context: dict,
         deadline_us: int,
+        *,
+        accept_future: Optional[asyncio.Task] = None,
     ) -> None:
         transfer = get_transfer_module()
 
@@ -830,13 +976,17 @@ class EmbeddedWorkerPool:
                 offer_id,
                 transfer_context,
                 deadline_us,
+                accept_future=accept_future,
             )
             return
 
         offer_started_at = time.perf_counter()
 
         async def _accept_task() -> bool:
-            resp = await self._send_accept(worker, task_id, offer_id)
+            if accept_future is not None:
+                resp = await accept_future
+            else:
+                resp = await self._send_accept(worker, task_id, offer_id)
             return bool(resp.get("accepted"))
 
         outcome = await transfer.predefined_etag_submit_flow(
@@ -989,9 +1139,14 @@ class EmbeddedWorkerPool:
         offer_id: str,
         transfer_context: dict,
         deadline_us: int,
+        *,
+        accept_future: Optional[asyncio.Task] = None,
     ) -> None:
         transfer = get_transfer_module()
-        accept_resp = await self._send_accept(worker, task_id, offer_id)
+        if accept_future is not None:
+            accept_resp = await accept_future
+        else:
+            accept_resp = await self._send_accept(worker, task_id, offer_id)
         if not accept_resp.get("accepted"):
             reason = accept_resp.get("reason") or "task_accept_rejected"
             logger.warning(

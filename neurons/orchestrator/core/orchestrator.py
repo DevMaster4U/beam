@@ -1230,6 +1230,7 @@ class Orchestrator:
                         orchestrator_hotkey=self.hotkey or "unknown",
                         control_secret=control_secret,
                         api_key_provider=_control_api_key,
+                        send_api_key=self.settings.global_gateway_control_use_api_key,
                         ping_interval=self.settings.orch_ws_ping_interval,
                         ping_timeout=self.settings.orch_ws_ping_timeout,
                     )

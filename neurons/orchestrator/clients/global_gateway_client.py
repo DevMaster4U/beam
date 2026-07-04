@@ -16,6 +16,7 @@ from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import urlencode
 
 import websockets
+from websockets.exceptions import ConnectionClosed
 
 from core.relay_log import defer_relay_log, is_failure_summary, log_relay, relay_summary, short_id, SLOW_RELAY_MS
 
@@ -36,6 +37,7 @@ class GlobalGatewayClient:
         control_secret: str,
         *,
         api_key_provider: Optional[ApiKeyProvider] = None,
+        send_api_key: bool = False,
         open_timeout: float = 30.0,
         ping_interval: float = 30.0,
         ping_timeout: float = 45.0,
@@ -44,6 +46,7 @@ class GlobalGatewayClient:
         self._orchestrator_hotkey = orchestrator_hotkey
         self._control_secret = control_secret
         self._api_key_provider = api_key_provider
+        self._send_api_key = send_api_key
         self._open_timeout = open_timeout
         self._ping_interval = ping_interval
         self._ping_timeout = ping_timeout
@@ -148,7 +151,7 @@ class GlobalGatewayClient:
             ws_base = f"{ws_base.rstrip('/')}{path}"
 
         params: dict[str, str] = {"control_secret": self._control_secret}
-        if self._api_key_provider:
+        if self._send_api_key and self._api_key_provider:
             api_key = await self._api_key_provider()
             if api_key:
                 params["api_key"] = api_key
@@ -157,6 +160,32 @@ class GlobalGatewayClient:
         if "?" in ws_base:
             return f"{ws_base}&{query}"
         return f"{ws_base}?{query}"
+
+    @staticmethod
+    def _redact_connect_url(url: str) -> str:
+        """Log-safe control URL (never print api_key query values)."""
+        if "api_key=" not in url:
+            return url
+        base, _, query = url.partition("?")
+        parts = []
+        for piece in query.split("&"):
+            if piece.startswith("api_key="):
+                parts.append("api_key=***")
+            else:
+                parts.append(piece)
+        return f"{base}?{'&'.join(parts)}"
+
+    def _log_control_disconnect(self, exc: Exception) -> None:
+        if isinstance(exc, ConnectionClosed) and exc.code == 1008:
+            logger.warning(
+                "Global gateway control connection rejected (1008 policy violation). "
+                "Check ORCHESTRATOR_GATEWAY_SECRET matches the gateway's "
+                "ORCHESTRATOR_GATEWAY_SECRET on %s. If GLOBAL_GATEWAY_CONTROL_USE_API_KEY=true, "
+                "the gateway must reach CORE_SERVER_URL to validate the orchestrator API key.",
+                self._control_base_url,
+            )
+            return
+        logger.warning("Global gateway control connection error: %s", exc)
 
     async def _connection_loop(self) -> None:
         while self._running:
@@ -171,12 +200,15 @@ class GlobalGatewayClient:
                     self._ws = ws
                     self._connected = True
                     self._reconnect_delay = 5.0
-                    logger.info("Connected to global worker gateway control: %s", url)
+                    logger.info(
+                        "Connected to global worker gateway control: %s",
+                        self._redact_connect_url(url),
+                    )
                     await self._recv_loop(ws)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                logger.warning("Global gateway control connection error: %s", exc)
+                self._log_control_disconnect(exc)
             finally:
                 self._connected = False
                 self._ws = None
