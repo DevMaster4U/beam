@@ -700,7 +700,7 @@ class EmbeddedWorkerPool:
             if prepared:
                 logger.info(
                     "Embedded cached batch prepared: batch=%s chunks=%s "
-                    "(parallel read + dest prewarm + sync PUT start)",
+                    "(parallel read + sync PUT start)",
                     short_id(batch_id, 12),
                     prepared,
                 )

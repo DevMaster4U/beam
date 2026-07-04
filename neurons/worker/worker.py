@@ -1694,7 +1694,7 @@ async def prepare_cached_offer_batch(
     batch_id: str,
     items: list[tuple[dict, str]],
 ) -> int:
-    """Pre-read cached bodies, prewarm dest origins, and arm a batch PUT start gate."""
+    """Pre-read cached bodies, optionally prewarm dest origins, and arm a batch PUT gate."""
     if not items:
         return 0
     batch_id = str(batch_id or "").strip()
@@ -1727,7 +1727,7 @@ async def prepare_cached_offer_batch(
         expected=prepared,
     )
 
-    if origins:
+    if PREWARM_ENABLED and origins:
         async with httpx.AsyncClient(timeout=5.0) as client:
             await prewarm_origins(client, list(origins), "cached-batch", 5.0)
     return prepared
