@@ -70,7 +70,7 @@ async def handle_task_offer_batch(orchestrator_hotkey: str, message: dict) -> di
 
         gateway_state.register_route(orchestrator_hotkey, worker_id, offer_id, task_id)
 
-        payload = {"type": "task_offer", **offer}
+        payload = {"type": "task_offer", "batch_id": batch_id, **offer}
         if await gateway_state.send_to_worker(worker_id, payload):
             gateway_state.mark_worker_busy(worker_id, offer_id)
             batch_assigned_workers.add(worker_id)

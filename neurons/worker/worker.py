@@ -2550,8 +2550,13 @@ async def predefined_etag_submit_flow(
     push_cache_to_control_server: bool = True,
     offer_started_at: Optional[float] = None,
 ) -> PredefinedETagSubmitOutcome:
-    """Predefined ETag: cache hit → parallel bg upload + accept, then task_result."""
+    """Predefined ETag: accept immediately, cache hit → parallel bg upload, then task_result."""
     started_at = offer_started_at if offer_started_at is not None else time.perf_counter()
+    # Start accept first so BeamCore sees it before cache prepare / upload work.
+    accept_wait = asyncio.create_task(
+        _predefined_etag_await_accept(accept_task, accept_timeout),
+        name=f"predefined-etag-accept-{task_label(offer_id)}",
+    )
     hash_source = predefined_etag_known_source(transfer_context)
     known = get_predefined_etag_cache(transfer_context)
     stage = hash_source or "cache_miss"
@@ -2576,15 +2581,16 @@ async def predefined_etag_submit_flow(
                 log_prefix=log_prefix,
             )
             if upload_task is None:
+                accept_wait.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await accept_wait
                 return PredefinedETagSubmitOutcome(
                     success=False,
                     error="cache_background_upload_not_started",
                     used_cache=True,
                 )
 
-            accepted, fail = await _predefined_etag_await_accept(
-                accept_task, accept_timeout
-            )
+            accepted, fail = await accept_wait
             if fail is not None:
                 _cancel_cached_background_upload(upload_task)
                 with contextlib.suppress(asyncio.CancelledError):
@@ -2636,9 +2642,7 @@ async def predefined_etag_submit_flow(
             )
 
         if hash_source == "env":
-            accepted, fail = await _predefined_etag_await_accept(
-                accept_task, accept_timeout
-            )
+            accepted, fail = await accept_wait
             if fail is not None:
                 return fail
             waited_sec = await wait_predefined_etag_min_submit_delay(
@@ -2668,7 +2672,7 @@ async def predefined_etag_submit_flow(
             f"offer={task_label(offer_id)}"
         )
 
-    accepted, fail = await _predefined_etag_await_accept(accept_task, accept_timeout)
+    accepted, fail = await accept_wait
     if fail is not None:
         return fail
 

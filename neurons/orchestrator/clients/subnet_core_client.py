@@ -747,7 +747,8 @@ class SubnetCoreClient:
 
         log_relay(
             f"beamcore ws -> send type={msg_type} request_id={_short_id(request_id, 8)} "
-            f"timeout={wait_timeout:.1f}s task={ctx['task']} offer={ctx['offer']} worker={ctx['worker']}"
+            f"timeout={wait_timeout:.1f}s task={ctx['task']} offer={ctx['offer']} worker={ctx['worker']}",
+            force_info=msg_type in ("task_accept", "task_result"),
         )
 
         try:
