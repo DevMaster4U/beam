@@ -165,6 +165,9 @@ def configure_worker_logging() -> None:
     if not instance:
         return
 
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+
     log_root = Path(os.environ.get("LOG_DIR", _workspace_root() / "logs"))
     log_dir = log_root / "workers"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -177,8 +180,11 @@ def configure_worker_logging() -> None:
     file_handler.setFormatter(formatter)
 
     handlers: list[logging.Handler] = [file_handler]
-    if sys.stderr.isatty():
-        stream_handler = logging.StreamHandler()
+    mirror_out = original_stdout if original_stdout.isatty() else None
+    mirror_err = original_stderr if original_stderr.isatty() else None
+    if mirror_err is not None:
+        # Use the real stderr stream; sys.stderr may later be wrapped for print capture.
+        stream_handler = logging.StreamHandler(mirror_err)
         stream_handler.setFormatter(formatter)
         handlers.append(stream_handler)
 
@@ -189,8 +195,6 @@ def configure_worker_logging() -> None:
     for handler in handlers:
         worker_logger.addHandler(handler)
 
-    mirror_out = sys.stdout if sys.stdout.isatty() else None
-    mirror_err = sys.stderr if sys.stderr.isatty() else None
     sys.stdout = _StreamToLogger(worker_logger.info, mirror_out)
     sys.stderr = _StreamToLogger(worker_logger.warning, mirror_err)
 
@@ -3564,7 +3568,7 @@ async def ws_send_transfer_result(
             msg["send_ms"] = round(put_ms, 1)
         if cached is not None:
             msg["cached"] = cached
-        await websocket.send(json.dumps(msg))
+        await ws_send_json(websocket, state, msg)
         return True
     except Exception as e:
         print(f"[Worker] WS transfer_result error: {e}")
@@ -3683,7 +3687,11 @@ def track_ws_task(state: WorkerState, coro: asyncio.coroutines) -> None:
         except asyncio.CancelledError:
             return
         if exc is not None:
-            print(f"[Worker] [WS] Task handler crashed: {type(exc).__name__}: {exc}")
+            logging.getLogger("worker").error(
+                "[Worker] [WS] Task handler crashed: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
 
     task.add_done_callback(_on_done)
 
