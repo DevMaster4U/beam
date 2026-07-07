@@ -343,18 +343,53 @@ class EmbeddedWorkerPool:
         self._offer_pool: Optional[_CoroutinePool] = None
         self._side_pool: Optional[_CoroutinePool] = None
         self._task_handles: Set[asyncio.Task] = set()
+        self._hidden_worker_gateway: Optional[Any] = None
+        self._transfer_waiters: dict[str, asyncio.Future] = {}
 
     @property
     def worker_count(self) -> int:
         return len(self.workers)
 
+    @property
+    def hybrid_mode(self) -> bool:
+        return (self.settings.worker_gateway_mode or "").strip().lower() == "embedded_global"
+
+    def set_hidden_worker_gateway(self, gateway: Any) -> None:
+        """Route overflow transfer work to hidden workers connected on orchestrator WS."""
+        self._hidden_worker_gateway = gateway
+        if hasattr(gateway, "set_transfer_result_handler"):
+            gateway.set_transfer_result_handler(self.handle_transfer_result)
+
+    async def handle_transfer_result(self, worker_id: str, message: dict) -> None:
+        offer_id = str(message.get("offer_id") or message.get("task_id") or "")
+        future = self._transfer_waiters.pop(offer_id, None)
+        if future is not None and not future.done():
+            future.set_result(message)
+            return
+        logger.warning(
+            "Unexpected transfer_result from hidden worker=%s offer=%s",
+            short_id(worker_id),
+            short_id(offer_id),
+        )
+
     async def start(self) -> None:
         transfer = get_transfer_module()
         configs = parse_embedded_worker_configs(self.settings)
         if not configs:
+            mode = (self.settings.worker_gateway_mode or "embedded").strip().lower()
             raise ValueError(
-                "WORKER_GATEWAY_MODE=embedded requires WORKER_1 (or WORKER_1_HOTKEY) in env"
+                f"WORKER_GATEWAY_MODE={mode} requires WORKER_1 (or WORKER_1_HOTKEY) in env"
             )
+
+        if self.hybrid_mode:
+            if len(configs) > 1:
+                logger.warning(
+                    "embedded_global uses only WORKER_1; ignoring %d extra slot(s)",
+                    len(configs) - 1,
+                )
+            configs = configs[:1]
+            for cfg in configs:
+                cfg.max_concurrent_tasks = 1
 
         self.http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(120.0, connect=30.0),
@@ -557,6 +592,7 @@ class EmbeddedWorkerPool:
         failed = 0
         batch_used_ips: set[str] = set()
         batch_assigned_counts: dict[str, int] = defaultdict(int)
+        hidden_batch_assigned: set[str] = set()
         transfer = get_transfer_module()
 
         for offer in offers:
@@ -584,6 +620,34 @@ class EmbeddedWorkerPool:
 
             worker = self._select_worker(batch_used_ips, batch_assigned_counts)
             if worker is None:
+                if self._hidden_worker_gateway is not None and self.workers:
+                    identity_worker = self.workers[0]
+                    _log_embedded_task_offer(
+                        task_id=str(task_id),
+                        offer_id=str(offer_id),
+                        worker_slot=identity_worker.slot,
+                        transfer_context=transfer_context,
+                        path=f"{path}:overflow",
+                    )
+                    task = asyncio.create_task(
+                        self._handle_overflow_offer(
+                            identity_worker,
+                            offer,
+                            transfer_context,
+                            path=path,
+                            batch_used_ips=batch_used_ips,
+                            batch_assigned_workers=hidden_batch_assigned,
+                        )
+                    )
+                    self._task_handles.add(task)
+                    task.add_done_callback(
+                        lambda t, tid=task_id, oid=offer_id: self._log_offer_task_done(
+                            t, task_id=tid, offer_id=oid
+                        )
+                    )
+                    task.add_done_callback(self._task_handles.discard)
+                    delivered += 1
+                    continue
                 reason = "no_embedded_worker_capacity"
                 logger.warning(
                     "No embedded worker capacity for batch=%s task=%s offer=%s",
@@ -800,6 +864,196 @@ class EmbeddedWorkerPool:
                 ack.get("reason") or ack.get("error") or ack.get("message"),
             )
         return ack
+
+    async def _handle_overflow_offer(
+        self,
+        worker: EmbeddedWorker,
+        offer: dict,
+        transfer_context: dict,
+        *,
+        path: str,
+        batch_used_ips: Optional[set[str]] = None,
+        batch_assigned_workers: Optional[set[str]] = None,
+    ) -> None:
+        """Overflow: task_accept (embedded id) in parallel with hidden worker transfer."""
+        transfer = get_transfer_module()
+        task_id = str(offer.get("task_id") or offer.get("offer_id") or "")
+        offer_id = str(offer.get("offer_id") or task_id or "")
+
+        gateway = self._hidden_worker_gateway
+        if gateway is None:
+            self._log_task_failed(
+                transfer,
+                transfer_context,
+                task_id=task_id,
+                offer_id=offer_id,
+                reason="hidden_worker_gateway_unavailable",
+            )
+            return
+
+        hidden_worker_id = gateway.select_hidden_worker_round_robin(
+            batch_used_ips=batch_used_ips,
+            batch_assigned_workers=batch_assigned_workers,
+        )
+        if not hidden_worker_id:
+            self._log_task_failed(
+                transfer,
+                transfer_context,
+                task_id=task_id,
+                offer_id=offer_id,
+                reason="no_hidden_worker_capacity",
+            )
+            return
+
+        loop = asyncio.get_running_loop()
+        result_future: asyncio.Future = loop.create_future()
+        self._transfer_waiters[offer_id] = result_future
+        if batch_assigned_workers is not None:
+            batch_assigned_workers.add(hidden_worker_id)
+        hidden_ip = ""
+        if hasattr(gateway, "_get_profile"):
+            hidden_ip = gateway._get_profile(hidden_worker_id).ip.strip()
+        if hidden_ip and batch_used_ips is not None:
+            batch_used_ips.add(hidden_ip)
+
+        async def _accept() -> dict:
+            return await self._send_accept(worker, task_id, offer_id)
+
+        async def _dispatch() -> bool:
+            return await gateway.deliver_transfer_offer(hidden_worker_id, offer)
+
+        accept_resp, dispatched = await asyncio.gather(_accept(), _dispatch())
+
+        if not dispatched:
+            self._transfer_waiters.pop(offer_id, None)
+            if batch_assigned_workers is not None:
+                batch_assigned_workers.discard(hidden_worker_id)
+            if accept_resp.get("accepted"):
+                await self._send_result(
+                    worker,
+                    task_id,
+                    offer_id,
+                    success=False,
+                    error="hidden_worker_dispatch_failed",
+                    transfer_context=transfer_context,
+                )
+            else:
+                reason = accept_resp.get("reason") or "task_accept_rejected"
+                self._log_task_failed(
+                    transfer,
+                    transfer_context,
+                    task_id=task_id,
+                    offer_id=offer_id,
+                    reason=str(reason),
+                )
+            return
+
+        if not accept_resp.get("accepted"):
+            self._transfer_waiters.pop(offer_id, None)
+            if batch_assigned_workers is not None:
+                batch_assigned_workers.discard(hidden_worker_id)
+            reason = accept_resp.get("reason") or "task_accept_rejected"
+            logger.warning(
+                "Overflow accept rejected: task=%s offer=%s worker=%s reason=%s",
+                short_id(task_id),
+                short_id(offer_id),
+                short_id(worker.worker_id),
+                reason,
+            )
+            self._log_task_failed(
+                transfer,
+                transfer_context,
+                task_id=task_id,
+                offer_id=offer_id,
+                reason=str(reason),
+            )
+            return
+
+        timeout = float(os.environ.get("WORKER_OVERFLOW_TRANSFER_TIMEOUT", "120"))
+        try:
+            result_msg = await asyncio.wait_for(result_future, timeout=timeout)
+        except asyncio.TimeoutError:
+            self._transfer_waiters.pop(offer_id, None)
+            if batch_assigned_workers is not None:
+                batch_assigned_workers.discard(hidden_worker_id)
+            logger.warning(
+                "Overflow transfer timeout: task=%s offer=%s timeout=%.0fs",
+                short_id(task_id),
+                short_id(offer_id),
+                timeout,
+            )
+            self._log_task_failed(
+                transfer,
+                transfer_context,
+                task_id=task_id,
+                offer_id=offer_id,
+                reason="overflow_transfer_timeout",
+            )
+            await self._send_result(
+                worker,
+                task_id,
+                offer_id,
+                success=False,
+                error="overflow_transfer_timeout",
+                transfer_context=transfer_context,
+            )
+            return
+
+        if batch_assigned_workers is not None:
+            batch_assigned_workers.discard(hidden_worker_id)
+
+        success = bool(result_msg.get("success", False))
+        chunk_hash = str(result_msg.get("chunk_hash") or "")
+        etag = result_msg.get("etag")
+        error = result_msg.get("error")
+        cached = result_msg.get("cached")
+        if isinstance(cached, str):
+            cached = cached.lower() == "true"
+
+        if success:
+            _log_embedded_task_done(
+                task_id=task_id,
+                offer_id=offer_id,
+                transfer_context=transfer_context,
+                chunk_hash=chunk_hash,
+                etag=str(etag or ""),
+                cached=bool(cached),
+                fetch_ms=float(result_msg.get("fetch_ms") or 0.0),
+                put_ms=float(result_msg.get("put_ms") or result_msg.get("send_ms") or 0.0),
+            )
+            if chunk_hash and cached is not True:
+                transfer.maybe_store_predefined_etag_cache_on_success(
+                    transfer_context,
+                    chunk_hash,
+                    etag,
+                    log_prefix="[Embedded/overflow]",
+                    task_id=task_id,
+                    offer_id=offer_id,
+                    push_to_control_server=False,
+                )
+        else:
+            self._log_task_failed(
+                transfer,
+                transfer_context,
+                task_id=task_id,
+                offer_id=offer_id,
+                reason=str(error or "overflow_transfer_failed"),
+                chunk_hash=chunk_hash,
+                etag=str(etag or ""),
+                cached=cached if isinstance(cached, bool) else None,
+            )
+
+        await self._send_result(
+            worker,
+            task_id,
+            offer_id,
+            success=success,
+            chunk_hash=chunk_hash,
+            etag=etag,
+            error=str(error) if error else None,
+            transfer_context=transfer_context,
+            cached=cached if isinstance(cached, bool) else None,
+        )
 
     async def _handle_predefined_etag_offer(
         self,

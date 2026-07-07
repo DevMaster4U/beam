@@ -34,6 +34,8 @@ async def handle_task_offer_batch(orchestrator_hotkey: str, message: dict) -> di
     offer_index = 0
     batch_used_ips: set[str] = set()
     batch_assigned_workers: set[str] = set()
+    worker_pool = str(message.get("worker_pool") or "").strip().lower()
+    hidden_only = worker_pool == "hidden"
     for offer in offers:
         offer_index += 1
         if not isinstance(offer, dict):
@@ -53,6 +55,7 @@ async def handle_task_offer_batch(orchestrator_hotkey: str, message: dict) -> di
         worker_id = gateway_state.select_worker(
             batch_used_ips=batch_used_ips,
             batch_assigned_workers=batch_assigned_workers,
+            hidden_only=hidden_only,
         )
         if not worker_id:
             logger.warning(
@@ -130,6 +133,67 @@ async def handle_task_offer_batch(orchestrator_hotkey: str, message: dict) -> di
     }
 
 
+async def handle_transfer_offer(orchestrator_hotkey: str, message: dict) -> dict:
+    """Dispatch transfer-only work to a hidden worker (no BeamCore task_accept on worker)."""
+    offer = message.get("offer")
+    if not isinstance(offer, dict):
+        return {
+            "type": "transfer_offer_result",
+            "delivered": False,
+            "reason": "invalid_offer",
+        }
+
+    offer_id = offer.get("offer_id") or offer.get("task_id")
+    task_id = offer.get("task_id") or offer_id
+
+    worker_id = gateway_state.select_worker(hidden_only=True)
+    if not worker_id:
+        logger.warning(
+            "transfer_offer: no hidden worker with capacity (%s) task=%s offer=%s",
+            gateway_state.worker_pool_summary(),
+            task_id,
+            offer_id,
+        )
+        return {
+            "type": "transfer_offer_result",
+            "delivered": False,
+            "task_id": task_id,
+            "offer_id": offer_id,
+            "reason": "no_hidden_worker_capacity",
+        }
+
+    gateway_state.register_route(orchestrator_hotkey, worker_id, offer_id, task_id)
+    payload = {"type": "transfer_offer", **offer}
+    if await gateway_state.send_to_worker(worker_id, payload):
+        gateway_state.mark_worker_busy(worker_id, str(offer_id))
+        profile = gateway_state.get_profile(worker_id)
+        logger.info(
+            "transfer_offer: orch=%s -> hidden worker=%s ip=%s active=%d/%d task=%s offer=%s",
+            orchestrator_hotkey[:16],
+            worker_id,
+            profile.ip or "?",
+            profile.active_count,
+            profile.max_concurrent_tasks,
+            task_id,
+            offer_id,
+        )
+        return {
+            "type": "transfer_offer_result",
+            "delivered": True,
+            "task_id": task_id,
+            "offer_id": offer_id,
+            "worker_id": worker_id,
+        }
+
+    return {
+        "type": "transfer_offer_result",
+        "delivered": False,
+        "task_id": task_id,
+        "offer_id": offer_id,
+        "reason": "send_failed",
+    }
+
+
 async def handle_orchestrator_message(
     orchestrator_hotkey: str,
     message: dict,
@@ -139,6 +203,11 @@ async def handle_orchestrator_message(
 
     if msg_type == "task_offer_batch":
         result = await handle_task_offer_batch(orchestrator_hotkey, message)
+        await channel.send(result)
+        return
+
+    if msg_type == "transfer_offer":
+        result = await handle_transfer_offer(orchestrator_hotkey, message)
         await channel.send(result)
         return
 

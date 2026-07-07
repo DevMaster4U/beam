@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 ApiKeyProvider = Callable[[], Awaitable[Optional[str]]]
 WorkerMessageHandler = Callable[[str, dict], Awaitable[None]]
 PoolStatusHandler = Callable[[int], Awaitable[None]]
+TransferResultHandler = Callable[[str, dict], Awaitable[None]]
 
 
 class GlobalGatewayClient:
@@ -56,6 +57,7 @@ class GlobalGatewayClient:
 
         self._worker_message_handler: Optional[WorkerMessageHandler] = None
         self._pool_status_handler: Optional[PoolStatusHandler] = None
+        self._transfer_result_handler: Optional[TransferResultHandler] = None
 
     @property
     def connected(self) -> bool:
@@ -66,6 +68,9 @@ class GlobalGatewayClient:
 
     def set_pool_status_handler(self, handler: PoolStatusHandler) -> None:
         self._pool_status_handler = handler
+
+    def set_transfer_result_handler(self, handler: TransferResultHandler) -> None:
+        self._transfer_result_handler = handler
 
     async def start(self) -> None:
         if self._running:
@@ -86,29 +91,59 @@ class GlobalGatewayClient:
         self._ws = None
         self._connected = False
 
-    async def send_task_offer_batch(self, batch_id: str, offers: list[dict]) -> tuple[int, int]:
+    async def send_task_offer_batch(
+        self,
+        batch_id: str,
+        offers: list[dict],
+        *,
+        overflow: bool = False,
+    ) -> tuple[int, int]:
         if not self._connected or not self._ws:
             logger.warning("Global gateway not connected; cannot send task_offer_batch")
             return 0, len(offers)
         try:
-            await self._ws.send(
-                json.dumps(
-                    {
-                        "type": "task_offer_batch",
-                        "batch_id": batch_id,
-                        "offers": offers,
-                    }
-                )
-            )
+            payload: dict[str, Any] = {
+                "type": "task_offer_batch",
+                "batch_id": batch_id,
+                "offers": offers,
+            }
+            if overflow:
+                payload["worker_pool"] = "hidden"
+            await self._ws.send(json.dumps(payload))
             log_relay(
                 f"global gateway ws -> send task_offer_batch batch={short_id(batch_id, 12)} "
-                f"offers={len(offers)}",
+                f"offers={len(offers)} overflow={str(overflow).lower()}",
                 force_info=True,
             )
             return len(offers), 0
         except Exception as exc:
             logger.error("Failed to send task_offer_batch to global gateway: %s", exc)
             return 0, len(offers)
+
+    async def send_transfer_offer(self, offer: dict) -> bool:
+        if not self._connected or not self._ws:
+            logger.warning("Global gateway not connected; cannot send transfer_offer")
+            return False
+        task_id = offer.get("task_id") or offer.get("offer_id")
+        offer_id = offer.get("offer_id") or task_id
+        try:
+            await self._ws.send(
+                json.dumps(
+                    {
+                        "type": "transfer_offer",
+                        "offer": offer,
+                    }
+                )
+            )
+            log_relay(
+                f"global gateway ws -> send transfer_offer task={short_id(task_id)} "
+                f"offer={short_id(offer_id)}",
+                force_info=True,
+            )
+            return True
+        except Exception as exc:
+            logger.error("Failed to send transfer_offer to global gateway: %s", exc)
+            return False
 
     async def send_to_worker(self, worker_id: str, payload: dict) -> bool:
         if not self._connected or not self._ws:
@@ -212,18 +247,31 @@ class GlobalGatewayClient:
         if msg_type == "from_worker":
             worker_id = str(data.get("worker_id") or "")
             message = data.get("message")
-            if worker_id and isinstance(message, dict) and self._worker_message_handler:
-                log_relay(
-                    f"global gateway ws <- recv from_worker worker={short_id(worker_id)} "
-                    f"type={message.get('type') or '?'} task={short_id(message.get('task_id'))} "
-                    f"offer={short_id(message.get('offer_id') or message.get('task_id'))}"
-                )
-                # Do not block the control recv loop on BeamCore round-trips; workers
-                # finish in parallel and each needs its own ack path.
-                asyncio.create_task(
-                    self._dispatch_worker_message(worker_id, message),
-                    name=f"global-gateway-relay-{worker_id[:8]}",
-                )
+            if worker_id and isinstance(message, dict):
+                inner_type = message.get("type")
+                if inner_type == "transfer_result" and self._transfer_result_handler:
+                    log_relay(
+                        f"global gateway ws <- recv transfer_result worker={short_id(worker_id)} "
+                        f"task={short_id(message.get('task_id'))} "
+                        f"offer={short_id(message.get('offer_id') or message.get('task_id'))}"
+                    )
+                    asyncio.create_task(
+                        self._dispatch_transfer_result(worker_id, message),
+                        name=f"global-gateway-transfer-{worker_id[:8]}",
+                    )
+                    return
+                if self._worker_message_handler:
+                    log_relay(
+                        f"global gateway ws <- recv from_worker worker={short_id(worker_id)} "
+                        f"type={inner_type or '?'} task={short_id(message.get('task_id'))} "
+                        f"offer={short_id(message.get('offer_id') or message.get('task_id'))}"
+                    )
+                    # Do not block the control recv loop on BeamCore round-trips; workers
+                    # finish in parallel and each needs its own ack path.
+                    asyncio.create_task(
+                        self._dispatch_worker_message(worker_id, message),
+                        name=f"global-gateway-relay-{worker_id[:8]}",
+                    )
             return
 
         if msg_type == "task_offer_batch_result":
@@ -235,7 +283,42 @@ class GlobalGatewayClient:
             )
             return
 
+        if msg_type == "transfer_offer_result":
+            logger.debug(
+                "global gateway transfer_offer_result delivered=%s offer=%s worker=%s",
+                data.get("delivered"),
+                short_id(data.get("offer_id")),
+                short_id(data.get("worker_id")),
+            )
+            return
+
         logger.debug("Unhandled global gateway message type=%s", msg_type)
+
+    async def _dispatch_transfer_result(self, worker_id: str, message: dict) -> None:
+        handler = self._transfer_result_handler
+        if handler is None:
+            return
+        offer_id = message.get("offer_id") or message.get("task_id")
+        started = time.monotonic()
+        try:
+            await handler(worker_id, message)
+        except Exception as exc:
+            elapsed_ms = (time.monotonic() - started) * 1000
+            logger.warning(
+                "global gateway transfer_result failed worker=%s offer=%s latency_ms=%.1f: %s",
+                short_id(worker_id),
+                short_id(offer_id),
+                elapsed_ms,
+                exc,
+            )
+            return
+        elapsed_ms = (time.monotonic() - started) * 1000
+        defer_relay_log(
+            f"global gateway transfer_result done worker={short_id(worker_id)} "
+            f"offer={short_id(offer_id)}",
+            latency_ms=elapsed_ms,
+            force_info=elapsed_ms >= SLOW_RELAY_MS,
+        )
 
     async def _dispatch_worker_message(self, worker_id: str, message: dict) -> None:
         handler = self._worker_message_handler

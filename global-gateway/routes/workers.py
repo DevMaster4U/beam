@@ -122,10 +122,11 @@ async def _handle_worker_message(worker_id: str, message: dict) -> None:
         )
         profile = gateway_state.get_profile(worker_id)
         logger.info(
-            "Worker connected: %s ip=%s version=%s max_tasks=%d active=%d initial_order=%d avg_mbps=%.1f score=%.4f (%d/%d)",
+            "Worker connected: %s ip=%s version=%s hidden=%s max_tasks=%d active=%d initial_order=%d avg_mbps=%.1f score=%.4f (%d/%d)",
             worker_id,
             profile.ip or "?",
             profile.worker_version or "?",
+            str(profile.hidden).lower(),
             profile.max_concurrent_tasks,
             profile.active_count,
             profile.initial_order,
@@ -135,6 +136,34 @@ async def _handle_worker_message(worker_id: str, message: dict) -> None:
             gateway_state.max_workers,
         )
         await gateway_state.notify_pool_status()
+        return
+
+    if msg_type == "transfer_result":
+        offer_id = str(message.get("offer_id") or message.get("task_id") or "")
+        gateway_state.observe_worker_transfer(
+            worker_id,
+            message.get("transfer_mbps"),
+            success=bool(message.get("success", False)),
+        )
+        gateway_state.mark_worker_idle(worker_id, offer_id or None)
+        profile = gateway_state.get_profile(worker_id)
+        logger.info(
+            "worker %s transfer_result offer=%s active_tasks=%d success=%s",
+            worker_id,
+            offer_id or "?",
+            profile.active_count,
+            message.get("success"),
+        )
+        orch_hotkey = gateway_state.resolve_orchestrator_hotkey(message)
+        if not orch_hotkey:
+            logger.warning(
+                "no orchestrator route for transfer_result worker=%s task=%s offer=%s",
+                worker_id,
+                message.get("task_id"),
+                message.get("offer_id"),
+            )
+            return
+        await gateway_state.forward_to_orchestrator(orch_hotkey, message)
         return
 
     if msg_type == "task_accept":
@@ -213,21 +242,34 @@ async def worker_ws(websocket: WebSocket, worker_id: str) -> None:
     settings = get_settings()
     gateway_state.max_workers = settings.max_workers
 
+    hidden = websocket.query_params.get("hidden", "").strip().lower() in ("1", "true", "yes")
     api_key = websocket.query_params.get("api_key") or ""
-    if not api_key:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-        return
 
     if _worker_secret(websocket) != settings.worker_secret:
         logger.warning("worker %s rejected: invalid worker_secret", worker_id)
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
-    profile_data = await fetch_worker_profile(settings.core_server_url, worker_id, api_key)
-    if not profile_data:
-        logger.warning("worker %s rejected: API key validation failed", worker_id)
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-        return
+    profile_data: Optional[dict] = None
+    if hidden:
+        if not settings.hidden_workers_enabled:
+            logger.warning("worker %s rejected: hidden workers disabled", worker_id)
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+        if not worker_id or len(worker_id) < 8:
+            logger.warning("worker %s rejected: invalid hidden worker_id", worker_id)
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+    else:
+        if not api_key:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+
+        profile_data = await fetch_worker_profile(settings.core_server_url, worker_id, api_key)
+        if not profile_data:
+            logger.warning("worker %s rejected: API key validation failed", worker_id)
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
 
     if (
         gateway_state.worker_count() >= settings.max_workers
@@ -245,18 +287,20 @@ async def worker_ws(websocket: WebSocket, worker_id: str) -> None:
     gateway_state.register_worker_session(
         worker_id,
         websocket,
-        ip=fields["ip"],
+        ip=fields["ip"] or peer_ip,
         claimed_bandwidth_mbps=fields["claimed_bandwidth_mbps"],
         trust_score=fields["trust_score"],
         success_rate=fields["success_rate"],
         max_concurrent_tasks=fields["max_concurrent_tasks"],
         worker_version=worker_version,
+        hidden=hidden,
     )
     logger.debug(
-        "Worker WS accepted: %s peer=%s version=%s (%d/%d)",
+        "Worker WS accepted: %s peer=%s version=%s hidden=%s (%d/%d)",
         worker_id,
         fields["ip"] or peer_ip or "?",
         worker_version or "?",
+        str(hidden).lower(),
         gateway_state.worker_count(),
         settings.max_workers,
     )
@@ -279,6 +323,7 @@ async def worker_ws(websocket: WebSocket, worker_id: str) -> None:
                 "task_accept",
                 "task_reject",
                 "task_result",
+                "transfer_result",
             ):
                 logger.debug("ignored worker message type %s from %s", msg_type, worker_id)
                 continue

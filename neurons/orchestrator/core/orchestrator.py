@@ -469,6 +469,11 @@ class Orchestrator:
                     self.embedded_worker_pool is not None
                     and self.embedded_worker_pool.worker_count > 0
                 ) or bool(self.settings.ready)
+            elif mode == "embedded_global":
+                should_ready = (
+                    self.embedded_worker_pool is not None
+                    and self.embedded_worker_pool.worker_count > 0
+                ) or bool(self.settings.ready)
             elif mode == "in_process":
                 should_ready = (
                     self.worker_gateway.connected_count > 0 or bool(self.settings.ready)
@@ -1172,7 +1177,7 @@ class Orchestrator:
             self.subnet_core_client.set_worker_gateway(self.worker_gateway)
 
             gateway_mode = (self.settings.worker_gateway_mode or "in_process").strip().lower()
-            if gateway_mode == "embedded":
+            if gateway_mode in ("embedded", "embedded_global"):
                 from core.embedded_workers import EmbeddedWorkerPool
 
                 self.embedded_worker_pool = EmbeddedWorkerPool(
@@ -1181,11 +1186,15 @@ class Orchestrator:
                 )
                 await self.embedded_worker_pool.start()
                 self.subnet_core_client.set_embedded_worker_pool(self.embedded_worker_pool)
+                if gateway_mode == "embedded_global":
+                    self.embedded_worker_pool.set_hidden_worker_gateway(self.worker_gateway)
                 logger.info(
-                    "Embedded worker pool started: %s worker(s)",
+                    "Embedded worker pool started: %s worker(s) mode=%s",
                     self.embedded_worker_pool.worker_count,
+                    gateway_mode,
                 )
-            elif gateway_mode in ("global", "coordinator"):
+
+            if gateway_mode in ("global", "coordinator"):
                 control_secret = self.settings.orchestrator_gateway_secret
                 if not control_secret:
                     raise ValueError(
@@ -1219,8 +1228,8 @@ class Orchestrator:
                     control_base = self.settings.global_gateway_url or self.settings.worker_gateway_url
                     if not control_base:
                         raise ValueError(
-                            "WORKER_GATEWAY_MODE=global requires GLOBAL_GATEWAY_URL (or "
-                            "ORCHESTRATOR_WORKER_GATEWAY_URL)"
+                            "WORKER_GATEWAY_MODE=%s requires GLOBAL_GATEWAY_URL (or "
+                            "ORCHESTRATOR_WORKER_GATEWAY_URL)" % gateway_mode
                         )
 
                     from clients.global_gateway_client import GlobalGatewayClient
@@ -1239,7 +1248,9 @@ class Orchestrator:
                     self._handle_global_gateway_worker_message
                 )
                 self.global_gateway_client.set_pool_status_handler(self._on_global_pool_ready)
-                self.worker_gateway.set_outbound_sender(self.global_gateway_client.send_to_worker)
+                self.worker_gateway.set_outbound_sender(
+                    self.global_gateway_client.send_to_worker
+                )
                 self.subnet_core_client.set_global_gateway_client(self.global_gateway_client)
                 await self.global_gateway_client.start()
                 logger.info(
@@ -1248,6 +1259,8 @@ class Orchestrator:
                     pool_control_label,
                     self.hotkey,
                 )
+            elif gateway_mode == "embedded":
+                pass
 
             # Configure registration message sent on every WS connect
             import socket as _socket
@@ -1272,6 +1285,11 @@ class Orchestrator:
             )
             if gateway_mode == "embedded":
                 gateway_url = self.settings.worker_gateway_url or f"http://{local_ip}:{self.settings.api_port}"
+            elif gateway_mode == "embedded_global":
+                gateway_url = (
+                    self.settings.worker_gateway_url
+                    or f"http://{local_ip}:{self.settings.api_port}"
+                )
             self.subnet_core_client.set_registration_config(
                 url=orch_url,
                 region=self.settings.region,

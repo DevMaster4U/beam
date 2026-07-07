@@ -62,6 +62,7 @@ class WorkerProfile:
     max_concurrent_tasks: int = 5
     worker_version: str = ""
     initial_order: int = 0
+    hidden: bool = False
     active_offer_ids: set[str] = field(default_factory=set)
 
     @property
@@ -172,6 +173,7 @@ class GlobalGatewayState:
         success_rate: float = 1.0,
         max_concurrent_tasks: int = 5,
         worker_version: str = "",
+        hidden: bool = False,
     ) -> None:
         self.worker_sessions[worker_id] = websocket
         profile = self.get_profile(worker_id)
@@ -185,6 +187,7 @@ class GlobalGatewayState:
             profile.max_concurrent_tasks = int(max_concurrent_tasks)
         if worker_version:
             profile.worker_version = worker_version.strip()
+        profile.hidden = bool(hidden)
 
     def unregister_worker_session(self, worker_id: str) -> None:
         self.worker_sessions.pop(worker_id, None)
@@ -263,9 +266,13 @@ class GlobalGatewayState:
             parts.append(f"busy_workers={','.join(short)}")
         return " ".join(parts)
 
-    def select_best_worker(self) -> Optional[str]:
+    def select_best_worker(self, *, hidden_only: bool = False) -> Optional[str]:
         """Pick the best worker that still has capacity (active < max_concurrent_tasks)."""
         connected = self.list_worker_ids()
+        if hidden_only:
+            connected = [
+                wid for wid in connected if self.get_profile(wid).hidden
+            ]
         if not connected:
             return None
 
@@ -314,19 +321,24 @@ class GlobalGatewayState:
         self,
         batch_used_ips: Optional[set[str]] = None,
         batch_assigned_workers: Optional[set[str]] = None,
+        *,
+        hidden_only: bool = False,
     ) -> Optional[str]:
         """Pick the next worker for a task offer."""
         if self.worker_selection == "best_score":
-            return self.select_best_worker()
+            return self.select_best_worker(hidden_only=hidden_only)
         return self.select_worker_round_robin(
             batch_used_ips=batch_used_ips,
             batch_assigned_workers=batch_assigned_workers,
+            hidden_only=hidden_only,
         )
 
     def select_worker_round_robin(
         self,
         batch_used_ips: Optional[set[str]] = None,
         batch_assigned_workers: Optional[set[str]] = None,
+        *,
+        hidden_only: bool = False,
     ) -> Optional[str]:
         """Pick the next worker with capacity in round-robin order.
 
@@ -336,6 +348,10 @@ class GlobalGatewayState:
         Across separate batches omit both sets for pure round-robin.
         """
         connected = self.ordered_worker_ids(self.list_worker_ids())
+        if hidden_only:
+            connected = [
+                wid for wid in connected if self.get_profile(wid).hidden
+            ]
         if not connected:
             return None
 
@@ -345,6 +361,8 @@ class GlobalGatewayState:
 
         def _eligible(worker_id: str, *, allow_used_ip: bool) -> bool:
             profile = self.get_profile(worker_id)
+            if hidden_only and not profile.hidden:
+                return False
             if not profile.has_capacity:
                 return False
             if batch_assigned_workers and worker_id in batch_assigned_workers:
@@ -611,6 +629,7 @@ class GlobalGatewayState:
             "active_tasks": profile.active_count,
             "max_concurrent_tasks": profile.max_concurrent_tasks,
             "initial_order": profile.initial_order,
+            "hidden": profile.hidden,
             "active_offer_ids": sorted(profile.active_offer_ids),
             "active_task_records": self.active_tasks_for_worker(worker_id),
         }

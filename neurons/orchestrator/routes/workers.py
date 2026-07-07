@@ -62,17 +62,7 @@ async def worker_ws(websocket: WebSocket, worker_id: str) -> None:
         await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER)
         return
 
-    # --- Auth ---
-    api_key = websocket.query_params.get("api_key") or ""
-    if not api_key:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-        return
-
-    core_url = orchestrator.settings.core_server_url
-    if not await _validate_worker_api_key(core_url, worker_id, api_key):
-        logger.warning("Worker %s: API key validation failed", worker_id)
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-        return
+    hidden = websocket.query_params.get("hidden", "").strip().lower() in ("1", "true", "yes")
 
     configured_secret: Optional[str] = orchestrator.settings.worker_gateway_worker_secret
     if not configured_secret:
@@ -89,6 +79,23 @@ async def worker_ws(websocket: WebSocket, worker_id: str) -> None:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
+    if hidden:
+        if not worker_id or len(worker_id) < 4:
+            logger.warning("Hidden worker %s rejected: invalid worker_id", worker_id)
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+    else:
+        api_key = websocket.query_params.get("api_key") or ""
+        if not api_key:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+
+        core_url = orchestrator.settings.core_server_url
+        if not await _validate_worker_api_key(core_url, worker_id, api_key):
+            logger.warning("Worker %s: API key validation failed", worker_id)
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+
     # --- Capacity check ---
     if gateway.is_full() and worker_id not in gateway.worker_ids:
         await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER)
@@ -104,7 +111,7 @@ async def worker_ws(websocket: WebSocket, worker_id: str) -> None:
     if worker_version:
         gateway.note_worker_version(worker_id, worker_version)
 
-    if not gateway.connect(worker_id, websocket, ip=peer_ip):
+    if not gateway.connect(worker_id, websocket, ip=peer_ip, hidden=hidden):
         await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER)
         return
 

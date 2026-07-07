@@ -11,13 +11,15 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Optional, Set
+from typing import Awaitable, Callable, Dict, Optional, Set
 
 from core.relay_log import defer_relay_log, is_failure_summary, log_relay, relay_summary, short_id
 
 logger = logging.getLogger(__name__)
 
 MAX_WORKERS = 10
+
+TransferResultHandler = Callable[[str, dict], Awaitable[None]]
 
 
 @dataclass
@@ -30,6 +32,7 @@ class _WorkerProfile:
     claimed_bandwidth_mbps: float = 0.0
     transfer_mbps_sum: float = 0.0
     transfer_count: int = 0
+    hidden: bool = False
     active_offer_ids: Set[str] = field(default_factory=set)
 
     @property
@@ -75,12 +78,17 @@ class WorkerGateway:
         self._sessions: Dict[str, object] = {}  # worker_id → WebSocket
         self._profiles: Dict[str, _WorkerProfile] = {}
         self._cursor = 0
+        self._hidden_cursor = 0
         self._on_ready_change = on_ready_change
         self._upstream: Optional[object] = None  # SubnetCoreClient ref
         self._outbound_send: Optional[Callable] = None
+        self._transfer_result_handler: Optional[TransferResultHandler] = None
 
     def set_upstream(self, upstream: object) -> None:
         self._upstream = upstream
+
+    def set_transfer_result_handler(self, handler: TransferResultHandler) -> None:
+        self._transfer_result_handler = handler
 
     def set_outbound_sender(self, sender: Callable) -> None:
         """Send payloads to workers via global gateway (or other external transport)."""
@@ -104,18 +112,20 @@ class WorkerGateway:
             self._profiles[worker_id] = profile
         return profile
 
-    def connect(self, worker_id: str, ws: object, *, ip: str = "") -> bool:
+    def connect(self, worker_id: str, ws: object, *, ip: str = "", hidden: bool = False) -> bool:
         if self.is_full() and worker_id not in self._sessions:
             logger.warning("Worker cap reached (%d); rejecting %s", MAX_WORKERS, worker_id)
             return False
         was_empty = len(self._sessions) == 0
         self._sessions[worker_id] = ws
         profile = self._get_profile(worker_id)
+        profile.hidden = bool(hidden)
         if ip.strip():
             profile.ip = ip.strip()
         logger.info(
-            "Worker connected: %s version=%s ip=%s (%d/%d)",
+            "Worker connected: %s hidden=%s version=%s ip=%s (%d/%d)",
             worker_id,
+            str(profile.hidden).lower(),
             profile.worker_version or "?",
             profile.ip or "?",
             len(self._sessions),
@@ -261,6 +271,72 @@ class WorkerGateway:
 
         return _pick(allow_used_ip=True)
 
+    def select_hidden_worker_round_robin(
+        self,
+        batch_used_ips: Optional[set[str]] = None,
+        batch_assigned_workers: Optional[set[str]] = None,
+    ) -> Optional[str]:
+        """Pick the next hidden overflow worker with capacity."""
+        connected = [
+            wid for wid in self._ordered_connected_worker_ids()
+            if self._get_profile(wid).hidden
+        ]
+        if not connected:
+            return None
+
+        pool_size = len(connected)
+        start = self._hidden_cursor % pool_size
+        in_batch = batch_used_ips is not None or batch_assigned_workers is not None
+
+        def _eligible(worker_id: str, *, allow_used_ip: bool) -> bool:
+            profile = self._get_profile(worker_id)
+            if not profile.hidden or not profile.has_capacity:
+                return False
+            if batch_assigned_workers and worker_id in batch_assigned_workers:
+                return False
+            ip = profile.ip.strip()
+            if (
+                not allow_used_ip
+                and batch_used_ips is not None
+                and ip
+                and ip in batch_used_ips
+            ):
+                return False
+            return True
+
+        def _pick(allow_used_ip: bool) -> Optional[str]:
+            for offset in range(pool_size):
+                idx = (start + offset) % pool_size
+                worker_id = connected[idx]
+                if not _eligible(worker_id, allow_used_ip=allow_used_ip):
+                    continue
+                self._hidden_cursor = (idx + 1) % pool_size
+                return worker_id
+            return None
+
+        if in_batch:
+            worker_id = _pick(allow_used_ip=False)
+            if worker_id:
+                return worker_id
+            return _pick(allow_used_ip=True)
+        return _pick(allow_used_ip=True)
+
+    async def deliver_transfer_offer(self, worker_id: str, offer: dict) -> bool:
+        ws = self._sessions.get(worker_id)
+        if ws is None:
+            logger.warning("deliver_transfer_offer: worker %s not connected", worker_id)
+            return False
+        try:
+            await ws.send_text(json.dumps({"type": "transfer_offer", **offer}))
+            offer_id = offer.get("offer_id") or offer.get("task_id")
+            if offer_id:
+                self.mark_worker_busy(worker_id, str(offer_id))
+            return True
+        except Exception as exc:
+            logger.warning("deliver_transfer_offer send failed for %s: %s", worker_id, exc)
+            self._sessions.pop(worker_id, None)
+            return False
+
     def get_workers_round_robin(self, n: int = 1) -> list[str]:
         """Return up to n worker_ids with batch-aware round-robin (IP + capacity)."""
         selected: list[str] = []
@@ -396,6 +472,23 @@ class WorkerGateway:
                 self._get_profile(worker_id).observe_transfer(transfer_mbps)
             offer_id = msg.get("offer_id") or msg.get("task_id")
             self.mark_worker_idle(worker_id, str(offer_id) if offer_id else None)
+        elif msg_type == "transfer_result":
+            log_relay(
+                f"worker ws <- recv type=transfer_result worker={short_id(worker_id)} "
+                f"task={short_id(msg.get('task_id'))} offer={short_id(msg.get('offer_id') or msg.get('task_id'))} "
+                f"success={msg.get('success')}"
+            )
+            transfer_mbps = msg.get("transfer_mbps")
+            if transfer_mbps is not None:
+                self._get_profile(worker_id).observe_transfer(transfer_mbps)
+            offer_id = msg.get("offer_id") or msg.get("task_id")
+            self.mark_worker_idle(worker_id, str(offer_id) if offer_id else None)
+            handler = self._transfer_result_handler
+            if handler is not None:
+                asyncio.create_task(
+                    handler(worker_id, msg),
+                    name=f"transfer-result-{worker_id[:8]}",
+                )
         else:
             logger.debug("Unhandled worker message type %s from %s", msg_type, worker_id)
 

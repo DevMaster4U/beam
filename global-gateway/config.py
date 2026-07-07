@@ -56,6 +56,12 @@ class GatewaySettings(BaseSettings):
     )
     ipc_enabled: bool = Field(default=True, env="GATEWAY_IPC_ENABLED")
 
+    hidden_workers_enabled: bool = Field(
+        default=True,
+        env="GATEWAY_HIDDEN_WORKERS_ENABLED",
+        description="Allow workers to connect with hidden=1 without BeamCore API key validation",
+    )
+
     class Config:
         env_file = ".env"
         extra = "ignore"
