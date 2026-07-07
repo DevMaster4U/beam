@@ -137,6 +137,8 @@ def _worker_instance_name() -> Optional[str]:
 class _StreamToLogger:
     """Capture print() output into the worker log file."""
 
+    _active = False
+
     def __init__(self, log_fn, mirror):
         self._log_fn = log_fn
         self._mirror = mirror
@@ -144,12 +146,21 @@ class _StreamToLogger:
     def write(self, buf: str) -> None:
         if not buf:
             return
-        for line in buf.rstrip().splitlines():
-            if line:
-                self._log_fn(line)
-        if self._mirror is not None:
-            self._mirror.write(buf)
-            self._mirror.flush()
+        if _StreamToLogger._active:
+            if self._mirror is not None:
+                self._mirror.write(buf)
+                self._mirror.flush()
+            return
+        _StreamToLogger._active = True
+        try:
+            for line in buf.rstrip().splitlines():
+                if line:
+                    self._log_fn(line)
+            if self._mirror is not None:
+                self._mirror.write(buf)
+                self._mirror.flush()
+        finally:
+            _StreamToLogger._active = False
 
     def flush(self) -> None:
         if self._mirror is not None:
@@ -182,11 +193,8 @@ def configure_worker_logging() -> None:
     handlers: list[logging.Handler] = [file_handler]
     mirror_out = original_stdout if original_stdout.isatty() else None
     mirror_err = original_stderr if original_stderr.isatty() else None
-    if mirror_err is not None:
-        # Use the real stderr stream; sys.stderr may later be wrapped for print capture.
-        stream_handler = logging.StreamHandler(mirror_err)
-        stream_handler.setFormatter(formatter)
-        handlers.append(stream_handler)
+    # Console output is mirrored by _StreamToLogger; avoid StreamHandler here because
+    # it would write through wrapped stderr and can recurse with print capture.
 
     worker_logger = logging.getLogger("worker")
     worker_logger.handlers.clear()
@@ -3569,9 +3577,21 @@ async def ws_send_transfer_result(
         if cached is not None:
             msg["cached"] = cached
         await ws_send_json(websocket, state, msg)
+        logging.getLogger("worker").info(
+            "[Worker] [WS] transfer_result sent task=%s offer=%s success=%s",
+            task_label(task_id),
+            task_label(offer_id),
+            success,
+        )
         return True
     except Exception as e:
-        print(f"[Worker] WS transfer_result error: {e}")
+        logging.getLogger("worker").error(
+            "[Worker] [WS] transfer_result error task=%s offer=%s: %s: %s",
+            task_label(task_id),
+            task_label(offer_id),
+            type(e).__name__,
+            e,
+        )
         return False
 
 
@@ -4188,7 +4208,15 @@ async def handle_ws_transfer_offer(state: WorkerState, websocket, task: dict) ->
             chunk_hash = outcome.chunk_hash
             etag = outcome.etag
             error = outcome.error
-            bytes_transferred = int(transfer_context.get("chunk_size") or 0)
+            bytes_transferred = max(
+                0,
+                int(transfer_context.get("chunk_size") or 0)
+                or (
+                    int(transfer_context.get("range_end") or 0)
+                    - int(transfer_context.get("range_start") or 0)
+                    + 1
+                ),
+            )
             fetch_ms = outcome.fetch_ms
             put_ms = outcome.send_ms
             cached = outcome.used_cache
