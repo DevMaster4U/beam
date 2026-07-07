@@ -3611,7 +3611,19 @@
       "etag": "\"281ed1d5ae50e8419f9b978aab16de83\"",
       "chunk_index": 136,
       "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/b1m_test/bin10GB.bin|1289748480|1321205759": {
+      "chunk_hash": "75c91b29d5522c8a97c779e50bc33f11e07ed37b2baa31c8c727016e92915c1d",
+      "etag": "\"281ed1d5ae50e8419f9b978aab16de83\"",
+      "chunk_index": 41,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/b1m_test/bin10GB.bin|4341104640|4372561919": {
+      "chunk_hash": "75c91b29d5522c8a97c779e50bc33f11e07ed37b2baa31c8c727016e92915c1d",
+      "etag": "\"281ed1d5ae50e8419f9b978aab16de83\"",
+      "chunk_index": 138,
+      "has_chunk_data": true
     }
   },
-  "updated_at": "2026-07-07T07:20:24.657029+00:00"
+  "updated_at": "2026-07-07T07:40:19.366829+00:00"
 }

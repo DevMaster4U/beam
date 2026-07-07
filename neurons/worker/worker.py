@@ -394,8 +394,8 @@ task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 class WorkerState:
     """Worker runtime state."""
 
-    wallet: Optional[Any] = None  # bittensor.wallet; not used in WORKER_HIDDEN mode
     api_url: str
+    wallet: Optional[Any] = None  # bittensor.wallet; not used in WORKER_HIDDEN mode
     worker_gateway_url: Optional[str] = None
     worker_gateway_secret: Optional[str] = None
     hidden: bool = False
