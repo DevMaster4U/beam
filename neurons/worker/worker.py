@@ -2200,6 +2200,7 @@ def _log_predefined_etag_submit_ready(
     waited_sec: float,
     *,
     hash_source: str,
+    result_label: str = "task_result",
 ) -> None:
     kind = {
         "env": "env hash/etag",
@@ -2209,10 +2210,10 @@ def _log_predefined_etag_submit_ready(
     if waited_sec > 0:
         detail = (
             f"accept_ack + {kind}, waited {waited_sec:.3f}s "
-            f"({format_predefined_etag_min_submit_detail(transfer_context)}) before task_result"
+            f"({format_predefined_etag_min_submit_detail(transfer_context)}) before {result_label}"
         )
     else:
-        detail = f"accept_ack + {kind}, submitting task_result"
+        detail = f"accept_ack + {kind}, submitting {result_label}"
     log_task_chunk_from_context(
         "submit_ready",
         transfer_context,
@@ -2383,6 +2384,7 @@ async def predefined_etag_submit_flow(
     accept_task: Callable[[], Awaitable[bool]],
     push_cache_to_control_server: bool = True,
     offer_started_at: Optional[float] = None,
+    result_label: str = "task_result",
 ) -> PredefinedETagSubmitOutcome:
     """Predefined ETag: cache hit → parallel bg upload + accept, then task_result."""
     started_at = offer_started_at if offer_started_at is not None else time.perf_counter()
@@ -2456,6 +2458,7 @@ async def predefined_etag_submit_flow(
                 transfer_context,
                 waited_sec,
                 hash_source=hash_source or "cache",
+                result_label=result_label,
             )
             return PredefinedETagSubmitOutcome(
                 success=True,
@@ -2485,6 +2488,7 @@ async def predefined_etag_submit_flow(
                 transfer_context,
                 waited_sec,
                 hash_source="env",
+                result_label=result_label,
             )
             return PredefinedETagSubmitOutcome(
                 success=True,
@@ -2542,6 +2546,7 @@ async def predefined_etag_submit_flow(
         transfer_context,
         waited_sec,
         hash_source="computed",
+        result_label=result_label,
     )
     return PredefinedETagSubmitOutcome(
         success=True,
@@ -4169,6 +4174,7 @@ async def handle_ws_transfer_offer(state: WorkerState, websocket, task: dict) ->
                 accept_timeout=1.0,
                 accept_task=_already_accepted,
                 push_cache_to_control_server=True,
+                result_label="transfer_result",
             )
             success = outcome.success
             chunk_hash = outcome.chunk_hash
@@ -4195,6 +4201,16 @@ async def handle_ws_transfer_offer(state: WorkerState, websocket, task: dict) ->
             fetch_ms = result.fetch_ms
             put_ms = result.send_ms
             cached = False
+            if success and chunk_hash:
+                maybe_store_predefined_etag_cache_on_success(
+                    transfer_context,
+                    chunk_hash,
+                    etag,
+                    log_prefix="[Hidden]",
+                    task_id=str(task_id),
+                    offer_id=str(offer_id),
+                    push_to_control_server=True,
+                )
 
         transfer_mbps = 0.0
         if put_ms > 0 and bytes_transferred > 0:

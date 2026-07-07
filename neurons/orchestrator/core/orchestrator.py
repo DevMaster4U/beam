@@ -409,7 +409,13 @@ class Orchestrator:
 
     def _on_worker_gateway_ready_change(self, ready: bool) -> None:
         """Toggle orchestrator readiness when the first/last local worker connects."""
-        if self.settings.worker_gateway_mode in ("global", "coordinator", "embedded"):
+        # embedded / embedded_global: capacity comes from embedded pool; hidden WS is overflow only.
+        if self.settings.worker_gateway_mode in (
+            "global",
+            "coordinator",
+            "embedded",
+            "embedded_global",
+        ):
             return
         if self._routing_paused:
             return

@@ -678,7 +678,14 @@ class EmbeddedWorkerPool:
                 path=path,
             )
             task = asyncio.create_task(
-                self._handle_offer(worker, offer, transfer_context)
+                self._handle_offer(
+                    worker,
+                    offer,
+                    transfer_context,
+                    path=path,
+                    batch_used_ips=batch_used_ips,
+                    batch_assigned_workers=hidden_batch_assigned,
+                )
             )
             self._task_handles.add(task)
             task.add_done_callback(
@@ -705,11 +712,14 @@ class EmbeddedWorkerPool:
         worker: EmbeddedWorker,
         offer: dict,
         transfer_context: dict,
+        *,
+        path: str = "standard",
+        batch_used_ips: Optional[set[str]] = None,
+        batch_assigned_workers: Optional[set[str]] = None,
     ) -> None:
         transfer = get_transfer_module()
         task_id = offer.get("task_id") or offer.get("offer_id")
         offer_id = offer.get("offer_id") or task_id
-        worker.active_offer_ids.add(str(offer_id or ""))
 
         try:
             deadline_us = int(offer.get("deadline_us") or 0)
@@ -720,6 +730,25 @@ class EmbeddedWorkerPool:
         try:
             capacity_error = self._reserve_capacity(worker, estimated_bytes)
             if capacity_error:
+                if (
+                    self.hybrid_mode
+                    and self._hidden_worker_gateway is not None
+                    and capacity_error.startswith("queue_full")
+                ):
+                    logger.info(
+                        "Embedded at capacity; overflowing task=%s offer=%s to hidden worker",
+                        short_id(task_id),
+                        short_id(offer_id),
+                    )
+                    await self._handle_overflow_offer(
+                        worker,
+                        offer,
+                        transfer_context,
+                        path=f"{path}:overflow",
+                        batch_used_ips=batch_used_ips,
+                        batch_assigned_workers=batch_assigned_workers,
+                    )
+                    return
                 logger.warning(
                     "Embedded rejecting offer: task=%s offer=%s worker_slot=%s reason=%s",
                     short_id(task_id),
@@ -736,6 +765,8 @@ class EmbeddedWorkerPool:
                 )
                 await self._send_reject(worker, task_id, offer_id, capacity_error)
                 return
+
+            worker.active_offer_ids.add(str(offer_id or ""))
 
             skip_reasons = transfer.predefined_etag_early_submit_skip_reasons(transfer_context)
             if skip_reasons:
@@ -1029,7 +1060,7 @@ class EmbeddedWorkerPool:
                     log_prefix="[Embedded/overflow]",
                     task_id=task_id,
                     offer_id=offer_id,
-                    push_to_control_server=False,
+                    push_to_control_server=True,
                 )
         else:
             self._log_task_failed(
