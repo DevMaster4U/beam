@@ -12,6 +12,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BEAM_ROOT="$ROOT"
 # shellcheck disable=SC1091
 source "${ROOT}/scripts/lib/systemd.sh"
 
