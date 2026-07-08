@@ -4478,13 +4478,21 @@ async def websocket_loop(state: WorkerState):
             if status == 403:
                 print(
                     "[Worker] [WS] HTTP 403 usually means worker gateway auth failed. Check:\n"
-                    "  - WORKER_GATEWAY_URL points to an orchestrator/global-gateway that serves /ws/{worker_id}\n"
+                    "  - WORKER_GATEWAY_URL points to an orchestrator with WORKER_GATEWAY_MODE=embedded_global\n"
+                    "    (or in_process/global-gateway) that serves /ws/{worker_id}\n"
                     "  - WORKER_GATEWAY_SECRET matches the gateway's WORKER_GATEWAY_SECRET\n"
-                    "  - Orchestrator is NOT in embedded mode (embedded workers run in-process; no WS)"
+                    "  - Orchestrator WORKER_GATEWAY_MODE=embedded rejects external WS (use embedded_global)\n"
+                    "  - Hidden workers must use ?hidden=1 (set WORKER_HIDDEN=true)"
                 )
-            raise RuntimeError(
-                f"worker gateway websocket rejected the connection with HTTP {status_label}"
-            ) from e
+                if not state.hidden:
+                    raise RuntimeError(
+                        f"worker gateway websocket rejected the connection with HTTP {status_label}"
+                    ) from e
+                print("[Worker] [WS] Hidden worker will retry after gateway becomes ready")
+            else:
+                raise RuntimeError(
+                    f"worker gateway websocket rejected the connection with HTTP {status_label}"
+                ) from e
 
         except ConnectionRefusedError:
             print("[Worker] [WS] Connection refused")
@@ -4554,7 +4562,11 @@ async def run_worker(state: WorkerState):
         )
 
     hidden_worker = WORKER_HIDDEN or state.hidden
-    from neurons.common.control_ws_client import start_control_ws_client, stop_control_ws_client
+    from neurons.common.control_ws_client import (
+        start_control_ws_client,
+        stop_control_ws_client,
+        wait_for_cache_sync_done,
+    )
 
     setup_control_server_cache_sync()
     await start_control_ws_client()
@@ -4569,6 +4581,20 @@ async def run_worker(state: WorkerState):
             print("[Worker] Hidden mode: transfer-only worker (no BeamCore registration)")
             print(f"[Worker] Instance: {hidden_worker_identity()}")
             print(f"[Worker] Local worker id: {state.worker_id}")
+            sync_timeout_raw = os.environ.get("CONTROL_SERVER_SYNC_DONE_TIMEOUT_SEC", "300").strip()
+            try:
+                sync_timeout = float(sync_timeout_raw) if sync_timeout_raw else None
+            except ValueError:
+                sync_timeout = 300.0
+            print("[Worker] Waiting for control-server cache sync_done before gateway connect...")
+            synced = await wait_for_cache_sync_done(timeout=sync_timeout)
+            if synced:
+                print("[Worker] Control-server cache sync_done — connecting to worker gateway")
+            else:
+                print(
+                    f"[Worker] Warning: cache sync_done not received within {sync_timeout_raw}s; "
+                    "connecting to gateway anyway"
+                )
         else:
             if state.wallet is None:
                 raise RuntimeError("Wallet is required unless WORKER_HIDDEN=true")

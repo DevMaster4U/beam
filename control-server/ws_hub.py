@@ -51,8 +51,9 @@ class MinerConnectionHub:
                 "updated_at": snapshot.get("updated_at"),
             },
         )
+        await self._send(miner_id, {"type": "sync_done"})
         logger.info(
-            "Miner connected miner_id=%s entries=%d total_connections=%d",
+            "Miner connected miner_id=%s entries=%d total_connections=%d sync_done=sent",
             miner_id,
             len(snapshot.get("entries") or {}),
             self.connection_count,

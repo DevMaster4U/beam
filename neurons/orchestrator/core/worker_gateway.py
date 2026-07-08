@@ -329,6 +329,13 @@ class WorkerGateway:
         try:
             await ws.send_text(json.dumps({"type": "transfer_offer", **offer}))
             offer_id = offer.get("offer_id") or offer.get("task_id")
+            task_id = offer.get("task_id") or offer_id
+            logger.info(
+                "deliver_transfer_offer: hidden_worker=%s task=%s offer=%s",
+                short_id(worker_id),
+                short_id(task_id),
+                short_id(offer_id),
+            )
             if offer_id:
                 self.mark_worker_busy(worker_id, str(offer_id))
             return True

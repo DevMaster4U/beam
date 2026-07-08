@@ -15,9 +15,12 @@ logger = logging.getLogger(__name__)
 
 MergeHandler = Callable[[str, str, str], None]
 SnapshotHandler = Callable[[dict[str, dict[str, str]]], None]
+SyncDoneHandler = Callable[[], None]
 
 _merge_handler: Optional[MergeHandler] = None
 _snapshot_handler: Optional[SnapshotHandler] = None
+_sync_done_handler: Optional[SyncDoneHandler] = None
+_cache_sync_done_event: Optional[asyncio.Event] = None
 _update_queue: Optional[asyncio.Queue] = None
 _client_task: Optional[asyncio.Task] = None
 _stop_event: Optional[asyncio.Event] = None
@@ -31,6 +34,37 @@ def register_cache_merge_handler(handler: MergeHandler) -> None:
 def register_cache_snapshot_handler(handler: SnapshotHandler) -> None:
     global _snapshot_handler
     _snapshot_handler = handler
+
+
+def register_sync_done_handler(handler: SyncDoneHandler) -> None:
+    global _sync_done_handler
+    _sync_done_handler = handler
+
+
+def _mark_cache_sync_done() -> None:
+    global _cache_sync_done_event
+    if _cache_sync_done_event is not None and not _cache_sync_done_event.is_set():
+        _cache_sync_done_event.set()
+
+
+async def wait_for_cache_sync_done(timeout: Optional[float] = None) -> bool:
+    """Block until control-server sends sync_done (or cache WS is disabled)."""
+    cfg = get_control_server_config()
+    if not cfg.cache_ws_enabled:
+        return True
+    global _cache_sync_done_event
+    if _cache_sync_done_event is None:
+        _cache_sync_done_event = asyncio.Event()
+    if _cache_sync_done_event.is_set():
+        return True
+    if timeout is None:
+        await _cache_sync_done_event.wait()
+        return True
+    try:
+        await asyncio.wait_for(_cache_sync_done_event.wait(), timeout=timeout)
+        return True
+    except asyncio.TimeoutError:
+        return False
 
 
 try:
@@ -195,6 +229,17 @@ async def _client_loop() -> None:
                             cfg.miner_id or "miner",
                             str(message.get("key") or "")[:96],
                         )
+                    elif msg_type == "sync_done":
+                        logger.info(
+                            "Control-server cache sync_done miner_id=%s",
+                            cfg.miner_id or "miner",
+                        )
+                        _mark_cache_sync_done()
+                        if _sync_done_handler is not None:
+                            try:
+                                _sync_done_handler()
+                            except Exception as exc:
+                                logger.warning("sync_done handler failed: %s", exc)
                     elif msg_type == "error":
                         logger.warning("Control-server error: %s", message.get("detail"))
         except ConnectionClosed as exc:
@@ -220,12 +265,14 @@ async def start_control_ws_client() -> None:
 
     _update_queue = asyncio.Queue(maxsize=1000)
     _stop_event = asyncio.Event()
+    global _cache_sync_done_event
+    _cache_sync_done_event = asyncio.Event()
     _client_task = asyncio.create_task(_client_loop(), name="control-ws-client")
     logger.info("Control-server WS client started miner_id=%s", cfg.miner_id or "miner")
 
 
 async def stop_control_ws_client() -> None:
-    global _client_task, _stop_event, _update_queue
+    global _client_task, _stop_event, _update_queue, _cache_sync_done_event
     if _stop_event is not None:
         _stop_event.set()
     if _client_task is not None:
@@ -235,3 +282,4 @@ async def stop_control_ws_client() -> None:
     _client_task = None
     _stop_event = None
     _update_queue = None
+    _cache_sync_done_event = None

@@ -1194,6 +1194,18 @@ class Orchestrator:
                 self.subnet_core_client.set_embedded_worker_pool(self.embedded_worker_pool)
                 if gateway_mode == "embedded_global":
                     self.embedded_worker_pool.set_hidden_worker_gateway(self.worker_gateway)
+                    from neurons.common import control_ws_client
+                    from neurons.common.control_client import get_control_server_config
+
+                    if get_control_server_config().cache_ws_enabled:
+                        control_ws_client.register_sync_done_handler(
+                            self.embedded_worker_pool.mark_cache_sync_done
+                        )
+                        logger.info(
+                            "embedded_global: hybrid overflow deferred until control-server sync_done"
+                        )
+                    else:
+                        self.embedded_worker_pool.mark_cache_sync_done()
                 logger.info(
                     "Embedded worker pool started: %s worker(s) mode=%s",
                     self.embedded_worker_pool.worker_count,

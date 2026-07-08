@@ -40,18 +40,23 @@ def _log_embedded_task_offer(
     worker_slot: int,
     transfer_context: dict,
     path: str,
+    beamcore_worker_id: str = "",
+    hidden_worker_id: str = "",
 ) -> None:
     chunk_id = chunk_id_from_transfer_context(transfer_context)
-    logger.info(
-        "%s task_offer task=%s offer=%s worker_slot=%s chunk_id=%s range=%s path=%s",
-        _WORKERS_LOG,
-        short_id(task_id),
-        short_id(offer_id),
-        worker_slot,
-        chunk_id if chunk_id is not None else "?",
-        transfer_context_range_label(transfer_context),
-        path,
-    )
+    fields = [
+        f"{_WORKERS_LOG} task_offer task={short_id(task_id)}",
+        f"offer={short_id(offer_id)}",
+        f"worker_slot={worker_slot}",
+        f"chunk_id={chunk_id if chunk_id is not None else '?'}",
+        f"range={transfer_context_range_label(transfer_context)}",
+        f"path={path}",
+    ]
+    if beamcore_worker_id:
+        fields.append(f"beamcore_worker={short_id(beamcore_worker_id)}")
+    if hidden_worker_id:
+        fields.append(f"hidden_worker={short_id(hidden_worker_id)}")
+    logger.info(" ".join(fields))
 
 
 def _log_embedded_task_done(
@@ -345,6 +350,7 @@ class EmbeddedWorkerPool:
         self._task_handles: Set[asyncio.Task] = set()
         self._hidden_worker_gateway: Optional[Any] = None
         self._transfer_waiters: dict[str, asyncio.Future] = {}
+        self._hybrid_routing_enabled = False
 
     @property
     def worker_count(self) -> int:
@@ -353,6 +359,37 @@ class EmbeddedWorkerPool:
     @property
     def hybrid_mode(self) -> bool:
         return (self.settings.worker_gateway_mode or "").strip().lower() == "embedded_global"
+
+    @property
+    def uses_overflow_routing(self) -> bool:
+        """Hybrid overflow to hidden workers (enabled after control-server sync_done)."""
+        return self.hybrid_mode and self._hybrid_routing_enabled
+
+    @property
+    def overflow_beamcore_worker(self) -> Optional[EmbeddedWorker]:
+        """WORKER_2 identity for overflow task_accept/task_result (hybrid mode)."""
+        if not self.uses_overflow_routing or len(self.workers) < 2:
+            return None
+        return self.workers[1]
+
+    def mark_cache_sync_done(self) -> None:
+        if not self.hybrid_mode or self._hybrid_routing_enabled:
+            return
+        self._hybrid_routing_enabled = True
+        if self.workers:
+            self.workers[0].max_concurrent_tasks = 1
+        logger.info(
+            "embedded_global: cache sync done — hybrid overflow routing enabled "
+            "(WORKER_1 embedded max=1, overflow via hidden workers + WORKER_2 identity)"
+        )
+
+    def _routing_workers(self) -> List[EmbeddedWorker]:
+        if self.uses_overflow_routing:
+            return self.workers[:1] if self.workers else []
+        return self.workers
+
+    def _beamcore_worker_for_overflow(self, embedded: EmbeddedWorker) -> EmbeddedWorker:
+        return self.overflow_beamcore_worker or embedded
 
     def set_hidden_worker_gateway(self, gateway: Any) -> None:
         """Route overflow transfer work to hidden workers connected on orchestrator WS."""
@@ -382,14 +419,16 @@ class EmbeddedWorkerPool:
             )
 
         if self.hybrid_mode:
-            if len(configs) > 1:
+            if len(configs) < 2:
                 logger.warning(
-                    "embedded_global uses only WORKER_1; ignoring %d extra slot(s)",
-                    len(configs) - 1,
+                    "embedded_global: configure WORKER_2 for overflow task_accept identity; "
+                    "overflow will reuse WORKER_1 until WORKER_2 is set"
                 )
-            configs = configs[:1]
-            for cfg in configs:
-                cfg.max_concurrent_tasks = 1
+            logger.info(
+                "embedded_global: starting in embedded-only mode until control-server sync_done "
+                "(%d worker slot(s), parallel routing)",
+                len(configs),
+            )
 
         self.http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(120.0, connect=30.0),
@@ -496,10 +535,11 @@ class EmbeddedWorkerPool:
         batch_used_ips: Optional[set[str]] = None,
         batch_assigned_counts: Optional[dict[str, int]] = None,
     ) -> Optional[EmbeddedWorker]:
-        if not self.workers:
+        workers_pool = self._routing_workers()
+        if not workers_pool:
             return None
 
-        pool_size = len(self.workers)
+        pool_size = len(workers_pool)
         start = self._cursor % pool_size
         in_batch = batch_used_ips is not None or batch_assigned_counts is not None
 
@@ -535,7 +575,7 @@ class EmbeddedWorkerPool:
         ) -> Optional[EmbeddedWorker]:
             for offset in range(pool_size):
                 idx = (start + offset) % pool_size
-                worker = self.workers[idx]
+                worker = workers_pool[idx]
                 if not _eligible(
                     worker,
                     allow_used_ip=allow_used_ip,
@@ -620,18 +660,24 @@ class EmbeddedWorkerPool:
 
             worker = self._select_worker(batch_used_ips, batch_assigned_counts)
             if worker is None:
-                if self._hidden_worker_gateway is not None and self.workers:
-                    identity_worker = self.workers[0]
+                if (
+                    self.uses_overflow_routing
+                    and self._hidden_worker_gateway is not None
+                    and self.workers
+                ):
+                    embedded_worker = self.workers[0]
+                    beamcore_worker = self._beamcore_worker_for_overflow(embedded_worker)
                     _log_embedded_task_offer(
                         task_id=str(task_id),
                         offer_id=str(offer_id),
-                        worker_slot=identity_worker.slot,
+                        worker_slot=beamcore_worker.slot,
                         transfer_context=transfer_context,
                         path=f"{path}:overflow",
+                        beamcore_worker_id=beamcore_worker.worker_id,
                     )
                     task = asyncio.create_task(
                         self._handle_overflow_offer(
-                            identity_worker,
+                            embedded_worker,
                             offer,
                             transfer_context,
                             path=path,
@@ -731,7 +777,7 @@ class EmbeddedWorkerPool:
             capacity_error = self._reserve_capacity(worker, estimated_bytes)
             if capacity_error:
                 if (
-                    self.hybrid_mode
+                    self.uses_overflow_routing
                     and self._hidden_worker_gateway is not None
                     and capacity_error.startswith("queue_full")
                 ):
@@ -906,10 +952,11 @@ class EmbeddedWorkerPool:
         batch_used_ips: Optional[set[str]] = None,
         batch_assigned_workers: Optional[set[str]] = None,
     ) -> None:
-        """Overflow: task_accept (embedded id) in parallel with hidden worker transfer."""
+        """Overflow: task_accept (WORKER_2 id) in parallel with hidden worker transfer."""
         transfer = get_transfer_module()
         task_id = str(offer.get("task_id") or offer.get("offer_id") or "")
         offer_id = str(offer.get("offer_id") or task_id or "")
+        beamcore_worker = self._beamcore_worker_for_overflow(worker)
 
         gateway = self._hidden_worker_gateway
         if gateway is None:
@@ -947,8 +994,17 @@ class EmbeddedWorkerPool:
         if hidden_ip and batch_used_ips is not None:
             batch_used_ips.add(hidden_ip)
 
+        logger.info(
+            "%s overflow_dispatch task=%s offer=%s beamcore_worker=%s hidden_worker=%s",
+            _WORKERS_LOG,
+            short_id(task_id),
+            short_id(offer_id),
+            short_id(beamcore_worker.worker_id),
+            short_id(hidden_worker_id),
+        )
+
         async def _accept() -> dict:
-            return await self._send_accept(worker, task_id, offer_id)
+            return await self._send_accept(beamcore_worker, task_id, offer_id)
 
         async def _dispatch() -> bool:
             return await gateway.deliver_transfer_offer(hidden_worker_id, offer)
@@ -961,7 +1017,7 @@ class EmbeddedWorkerPool:
                 batch_assigned_workers.discard(hidden_worker_id)
             if accept_resp.get("accepted"):
                 await self._send_result(
-                    worker,
+                    beamcore_worker,
                     task_id,
                     offer_id,
                     success=False,
@@ -985,10 +1041,10 @@ class EmbeddedWorkerPool:
                 batch_assigned_workers.discard(hidden_worker_id)
             reason = accept_resp.get("reason") or "task_accept_rejected"
             logger.warning(
-                "Overflow accept rejected: task=%s offer=%s worker=%s reason=%s",
+                "Overflow accept rejected: task=%s offer=%s beamcore_worker=%s reason=%s",
                 short_id(task_id),
                 short_id(offer_id),
-                short_id(worker.worker_id),
+                short_id(beamcore_worker.worker_id),
                 reason,
             )
             self._log_task_failed(
@@ -1021,7 +1077,7 @@ class EmbeddedWorkerPool:
                 reason="overflow_transfer_timeout",
             )
             await self._send_result(
-                worker,
+                beamcore_worker,
                 task_id,
                 offer_id,
                 success=False,
@@ -1075,7 +1131,7 @@ class EmbeddedWorkerPool:
             )
 
         await self._send_result(
-            worker,
+            beamcore_worker,
             task_id,
             offer_id,
             success=success,
