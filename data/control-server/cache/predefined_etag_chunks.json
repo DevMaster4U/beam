@@ -4049,7 +4049,43 @@
       "etag": "\"281ed1d5ae50e8419f9b978aab16de83\"",
       "chunk_index": 220,
       "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/b1m_test/bin10GB.bin|4718592000|4750049279": {
+      "chunk_hash": "75c91b29d5522c8a97c779e50bc33f11e07ed37b2baa31c8c727016e92915c1d",
+      "etag": "\"281ed1d5ae50e8419f9b978aab16de83\"",
+      "chunk_index": 150,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/b1m_test/bin10GB.bin|9720299520|9751756799": {
+      "chunk_hash": "75c91b29d5522c8a97c779e50bc33f11e07ed37b2baa31c8c727016e92915c1d",
+      "etag": "\"281ed1d5ae50e8419f9b978aab16de83\"",
+      "chunk_index": 309,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/b1m_test/bin10GB.bin|3711959040|3743416319": {
+      "chunk_hash": "75c91b29d5522c8a97c779e50bc33f11e07ed37b2baa31c8c727016e92915c1d",
+      "etag": "\"281ed1d5ae50e8419f9b978aab16de83\"",
+      "chunk_index": 118,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/b1m_test/bin10GB.bin|10443816960|10475274239": {
+      "chunk_hash": "75c91b29d5522c8a97c779e50bc33f11e07ed37b2baa31c8c727016e92915c1d",
+      "etag": "\"281ed1d5ae50e8419f9b978aab16de83\"",
+      "chunk_index": 332,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/b1m_test/bin10GB.bin|4309647360|4341104639": {
+      "chunk_hash": "75c91b29d5522c8a97c779e50bc33f11e07ed37b2baa31c8c727016e92915c1d",
+      "etag": "\"281ed1d5ae50e8419f9b978aab16de83\"",
+      "chunk_index": 137,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/b1m_test/bin10GB.bin|10286530560|10317987839": {
+      "chunk_hash": "75c91b29d5522c8a97c779e50bc33f11e07ed37b2baa31c8c727016e92915c1d",
+      "etag": "\"281ed1d5ae50e8419f9b978aab16de83\"",
+      "chunk_index": 327,
+      "has_chunk_data": true
     }
   },
-  "updated_at": "2026-07-08T03:20:11.523658+00:00"
+  "updated_at": "2026-07-09T05:10:12.706344+00:00"
 }

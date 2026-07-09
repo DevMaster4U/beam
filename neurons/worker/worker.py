@@ -384,7 +384,6 @@ WS_TASK_ACCEPT_ACK_TIMEOUT = float(os.environ.get("WORKER_TASK_ACCEPT_ACK_TIMEOU
 WS_TASK_RESULT_ACK_TIMEOUT = float(os.environ.get("WORKER_TASK_RESULT_ACK_TIMEOUT", "45.0"))
 WORKER_EARLY_TRANSFER = _env_bool("WORKER_EARLY_TRANSFER", True)
 WORKER_PREDEFINED_ETAG_EARLY_SUBMIT = _env_bool("WORKER_PREDEFINED_ETAG_EARLY_SUBMIT", True)
-WORKER_HIDDEN = _env_bool("WORKER_HIDDEN", False)
 PREDEFINED_ETAG_MAX_PARALLEL = max(
     1, int(os.environ.get("WORKER_PREDEFINED_ETAG_MAX_PARALLEL", "1"))
 )
@@ -407,10 +406,9 @@ class WorkerState:
     """Worker runtime state."""
 
     api_url: str
-    wallet: Optional[Any] = None  # bittensor.wallet; not used in WORKER_HIDDEN mode
+    wallet: Optional[Any] = None
     worker_gateway_url: Optional[str] = None
     worker_gateway_secret: Optional[str] = None
-    hidden: bool = False
     worker_id: Optional[str] = None
     api_key: Optional[str] = None
     worker_ip: Optional[str] = None
@@ -3409,8 +3407,6 @@ def get_ws_url(
     api_key: str,
     gateway_url: str,
     worker_secret: Optional[str] = None,
-    *,
-    hidden: bool = False,
 ) -> str:
     """Convert worker gateway URL to the worker WebSocket URL."""
     base = gateway_url.rstrip("/")
@@ -3430,8 +3426,6 @@ def get_ws_url(
         params["api_key"] = api_key
     if worker_secret:
         params["worker_secret"] = worker_secret
-    if hidden:
-        params["hidden"] = "1"
     params["worker_version"] = WORKER_VERSION
     if params:
         url = f"{url}?{urlencode(params)}"
@@ -3534,84 +3528,6 @@ async def ws_send_task_result(
     except Exception as e:
         print(f"[Worker] WS task_result error: {e}")
         return False
-
-
-async def ws_send_transfer_result(
-    websocket,
-    state: WorkerState,
-    task_id: str,
-    offer_id: str,
-    *,
-    success: bool,
-    bytes_transferred: int = 0,
-    chunk_hash: str = "",
-    etag: Optional[str] = None,
-    error: Optional[str] = None,
-    fetch_ms: float = 0.0,
-    put_ms: float = 0.0,
-    cached: Optional[bool] = None,
-    transfer_mbps: float = 0.0,
-) -> bool:
-    """Send transfer-only completion (hidden worker; no BeamCore task_result)."""
-    try:
-        msg: dict[str, Any] = {
-            "type": "transfer_result",
-            "task_id": task_id,
-            "offer_id": offer_id or task_id,
-            "success": success,
-            "bytes_transferred": bytes_transferred,
-        }
-        if transfer_mbps > 0:
-            msg["transfer_mbps"] = round(transfer_mbps, 1)
-        if chunk_hash:
-            msg["chunk_hash"] = chunk_hash
-        if etag:
-            msg["etag"] = etag
-        if error:
-            msg["error"] = error
-        if fetch_ms > 0:
-            msg["fetch_ms"] = round(fetch_ms, 1)
-        if put_ms > 0:
-            msg["put_ms"] = round(put_ms, 1)
-            msg["send_ms"] = round(put_ms, 1)
-        if cached is not None:
-            msg["cached"] = cached
-        await ws_send_json(websocket, state, msg)
-        logging.getLogger("worker").info(
-            "[Worker] [WS] transfer_result sent task=%s offer=%s success=%s",
-            task_label(task_id),
-            task_label(offer_id),
-            success,
-        )
-        return True
-    except Exception as e:
-        logging.getLogger("worker").error(
-            "[Worker] [WS] transfer_result error task=%s offer=%s: %s: %s",
-            task_label(task_id),
-            task_label(offer_id),
-            type(e).__name__,
-            e,
-        )
-        return False
-
-
-def hidden_worker_id(identity: str) -> str:
-    """Stable local worker id for hidden workers (not registered on BeamCore)."""
-    normalized = identity.strip() or "hidden"
-    return "h" + hashlib.sha256(normalized.encode()).hexdigest()[:15]
-
-
-def hidden_worker_identity() -> str:
-    """Label used to derive the hidden worker's local gateway id."""
-    instance = os.environ.get("WORKER_INSTANCE", "").strip()
-    if instance:
-        return instance
-    env_file, _ = _extract_env_file_arg(sys.argv[1:])
-    if env_file is not None:
-        return Path(env_file).stem
-    import socket
-
-    return socket.gethostname()
 
 
 async def finalize_ws_task_result(
@@ -4130,148 +4046,6 @@ async def _handle_ws_task_early_transfer(
         raise
 
 
-async def handle_ws_transfer_offer(state: WorkerState, websocket, task: dict) -> bool:
-    """Hidden worker: execute transfer only (orchestrator owns task_accept/result)."""
-    task_id = task.get("task_id") or task.get("offer_id")
-    offer_id = task.get("offer_id") or task_id
-    task_key = offer_id or task_id
-    deadline_us = task.get("deadline_us", 0)
-    transfer_context, validation_error = build_transfer_context(task)
-    estimated_bytes = estimate_task_bytes(task)
-    reserved_capacity = False
-
-    print(
-        f"[Worker] [WS] Transfer offer: {task_label(task_id)} "
-        f"offer={task_label(offer_id)}..."
-    )
-    if not task_id:
-        return False
-    if validation_error or transfer_context is None:
-        reason = validation_error or "invalid_offer"
-        await ws_send_transfer_result(
-            websocket,
-            state,
-            str(task_id),
-            str(offer_id),
-            success=False,
-            error=reason,
-        )
-        return False
-
-    capacity_error = try_reserve_ws_capacity(state, task_key, estimated_bytes)
-    if capacity_error == "duplicate":
-        return False
-    if capacity_error:
-        await ws_send_transfer_result(
-            websocket,
-            state,
-            str(task_id),
-            str(offer_id),
-            success=False,
-            error=capacity_error,
-        )
-        return False
-    reserved_capacity = True
-
-    try:
-        remaining_sec = remaining_deadline_seconds(deadline_us)
-        if remaining_sec is not None and remaining_sec < 5:
-            reason = f"deadline_too_close:{remaining_sec:.1f}s"
-            await ws_send_transfer_result(
-                websocket,
-                state,
-                str(task_id),
-                str(offer_id),
-                success=False,
-                error=reason,
-            )
-            return False
-
-        if uses_predefined_etag_early_submit(transfer_context):
-            async def _already_accepted() -> bool:
-                return True
-
-            outcome = await predefined_etag_submit_flow(
-                state,
-                str(task_id),
-                str(offer_id),
-                task,
-                transfer_context,
-                int(deadline_us or 0),
-                log_prefix="[Hidden]",
-                accept_timeout=1.0,
-                accept_task=_already_accepted,
-                push_cache_to_control_server=True,
-                result_label="transfer_result",
-            )
-            success = outcome.success
-            chunk_hash = outcome.chunk_hash
-            etag = outcome.etag
-            error = outcome.error
-            bytes_transferred = max(
-                0,
-                int(transfer_context.get("chunk_size") or 0)
-                or (
-                    int(transfer_context.get("range_end") or 0)
-                    - int(transfer_context.get("range_start") or 0)
-                    + 1
-                ),
-            )
-            fetch_ms = outcome.fetch_ms
-            put_ms = outcome.send_ms
-            cached = outcome.used_cache
-        else:
-            result = await execute_task_with_metrics(
-                state,
-                str(task_id),
-                task,
-                transfer_context,
-                int(deadline_us or 0),
-                log_prefix="[Hidden]",
-            )
-            success = result.success
-            chunk_hash = result.chunk_hash
-            etag = result.etag
-            error = result.error_msg
-            bytes_transferred = result.bytes_transferred
-            fetch_ms = result.fetch_ms
-            put_ms = result.send_ms
-            cached = False
-            if success and chunk_hash:
-                maybe_store_predefined_etag_cache_on_success(
-                    transfer_context,
-                    chunk_hash,
-                    etag,
-                    log_prefix="[Hidden]",
-                    task_id=str(task_id),
-                    offer_id=str(offer_id),
-                    push_to_control_server=True,
-                )
-
-        transfer_mbps = 0.0
-        if put_ms > 0 and bytes_transferred > 0:
-            transfer_mbps = (bytes_transferred * 8) / (put_ms * 1000)
-
-        await ws_send_transfer_result(
-            websocket,
-            state,
-            str(task_id),
-            str(offer_id),
-            success=success,
-            bytes_transferred=bytes_transferred,
-            chunk_hash=chunk_hash,
-            etag=etag,
-            error=error,
-            fetch_ms=fetch_ms,
-            put_ms=put_ms,
-            cached=cached,
-            transfer_mbps=transfer_mbps,
-        )
-        return success
-    finally:
-        release_ws_capacity(state, task_key, estimated_bytes, reserved_capacity)
-
-
 async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
     """Handle a task received via WebSocket push."""
     task_id = task.get("task_id") or task.get("offer_id")
@@ -4377,7 +4151,6 @@ async def websocket_loop(state: WorkerState):
         state.api_key or "",
         state.worker_gateway_url,
         state.worker_gateway_secret,
-        hidden=state.hidden,
     )
     print(f"[Worker] Connecting to WebSocket: {ws_url.split('?')[0]}")
     reconnect_delay = WS_RECONNECT_MIN_DELAY
@@ -4411,12 +4184,6 @@ async def websocket_loop(state: WorkerState):
 
                             elif msg_type == "task_offer":
                                 track_ws_task(state, handle_ws_task(state, websocket, message))
-
-                            elif msg_type == "transfer_offer":
-                                track_ws_task(
-                                    state,
-                                    handle_ws_transfer_offer(state, websocket, message),
-                                )
 
                             elif msg_type == "task_accept_ack":
                                 ack_task_id = message.get("task_id")
@@ -4478,21 +4245,14 @@ async def websocket_loop(state: WorkerState):
             if status == 403:
                 print(
                     "[Worker] [WS] HTTP 403 usually means worker gateway auth failed. Check:\n"
-                    "  - WORKER_GATEWAY_URL points to an orchestrator with WORKER_GATEWAY_MODE=embedded_global\n"
-                    "    (or in_process/global-gateway) that serves /ws/{worker_id}\n"
+                    "  - WORKER_GATEWAY_URL points to an orchestrator with WORKER_GATEWAY_MODE=in_process\n"
+                    "    (or global-gateway) that serves /ws/{worker_id}\n"
                     "  - WORKER_GATEWAY_SECRET matches the gateway's WORKER_GATEWAY_SECRET\n"
-                    "  - Orchestrator WORKER_GATEWAY_MODE=embedded rejects external WS (use embedded_global)\n"
-                    "  - Hidden workers must use ?hidden=1 (set WORKER_HIDDEN=true)"
+                    "  - Orchestrator WORKER_GATEWAY_MODE=embedded rejects external WS (use in_process)"
                 )
-                if not state.hidden:
-                    raise RuntimeError(
-                        f"worker gateway websocket rejected the connection with HTTP {status_label}"
-                    ) from e
-                print("[Worker] [WS] Hidden worker will retry after gateway becomes ready")
-            else:
-                raise RuntimeError(
-                    f"worker gateway websocket rejected the connection with HTTP {status_label}"
-                ) from e
+            raise RuntimeError(
+                f"worker gateway websocket rejected the connection with HTTP {status_label}"
+            ) from e
 
         except ConnectionRefusedError:
             print("[Worker] [WS] Connection refused")
@@ -4561,54 +4321,26 @@ async def run_worker(state: WorkerState):
             PREWARM_TIMEOUT,
         )
 
-    hidden_worker = WORKER_HIDDEN or state.hidden
-    from neurons.common.control_ws_client import (
-        start_control_ws_client,
-        stop_control_ws_client,
-        wait_for_cache_sync_done,
-    )
+    from neurons.common.control_ws_client import start_control_ws_client, stop_control_ws_client
 
     setup_control_server_cache_sync()
     await start_control_ws_client()
     start_predefined_etag_chunk_download_bootstrap()
 
     try:
-        if hidden_worker:
-            state.hidden = True
-            state.worker_id = hidden_worker_id(hidden_worker_identity())
-            state.api_key = None
-            state.worker_ip = await get_public_ip()
-            print("[Worker] Hidden mode: transfer-only worker (no BeamCore registration)")
-            print(f"[Worker] Instance: {hidden_worker_identity()}")
-            print(f"[Worker] Local worker id: {state.worker_id}")
-            sync_timeout_raw = os.environ.get("CONTROL_SERVER_SYNC_DONE_TIMEOUT_SEC", "300").strip()
-            try:
-                sync_timeout = float(sync_timeout_raw) if sync_timeout_raw else None
-            except ValueError:
-                sync_timeout = 300.0
-            print("[Worker] Waiting for control-server cache sync_done before gateway connect...")
-            synced = await wait_for_cache_sync_done(timeout=sync_timeout)
-            if synced:
-                print("[Worker] Control-server cache sync_done — connecting to worker gateway")
-            else:
-                print(
-                    f"[Worker] Warning: cache sync_done not received within {sync_timeout_raw}s; "
-                    "connecting to gateway anyway"
-                )
-        else:
-            if state.wallet is None:
-                raise RuntimeError("Wallet is required unless WORKER_HIDDEN=true")
-            hotkey = state.wallet.hotkey.ss58_address
-            async with httpx.AsyncClient() as client:
-                print("[Worker] Registering with SubnetCore...")
-                print(f"[Worker] Hotkey: {hotkey}")
-                print(f"[Worker] API URL: {state.api_url}")
+        if state.wallet is None:
+            raise RuntimeError("Wallet is required")
+        hotkey = state.wallet.hotkey.ss58_address
+        async with httpx.AsyncClient() as client:
+            print("[Worker] Registering with SubnetCore...")
+            print(f"[Worker] Hotkey: {hotkey}")
+            print(f"[Worker] API URL: {state.api_url}")
 
-                result = await register_worker(client, state)
-                state.worker_id = result.get("worker_id")
-                state.api_key = result.get("api_key")
-                state.worker_ip = _public_ip or state.worker_ip
-                print(f"[Worker] Registered: {state.worker_id}")
+            result = await register_worker(client, state)
+            state.worker_id = result.get("worker_id")
+            state.api_key = result.get("api_key")
+            state.worker_ip = _public_ip or state.worker_ip
+            print(f"[Worker] Registered: {state.worker_id}")
 
         if CONNECTION_MODE not in {"websocket", "auto"}:
             raise RuntimeError("Worker transport is websocket-only; remove CONNECTION_MODE=http")
@@ -4700,46 +4432,39 @@ async def main():
             print(f"  - {env_file}")
         print()
 
-    if not WORKER_HIDDEN:
-        try:
-            from neurons.common.wallet_sync import ensure_wallets_from_control_server
+    try:
+        from neurons.common.wallet_sync import ensure_wallets_from_control_server
 
-            ensure_wallets_from_control_server()
-        except Exception as exc:
-            print(f"Failed to sync wallet from control-server: {exc}")
-            sys.exit(1)
+        ensure_wallets_from_control_server()
+    except Exception as exc:
+        print(f"Failed to sync wallet from control-server: {exc}")
+        sys.exit(1)
 
-    wallet = None
-    if WORKER_HIDDEN:
-        print("Hidden worker mode: skipping Bittensor wallet")
-        api_url = os.environ.get("CORE_SERVER_URL", "").strip()
+    config = get_config()
+
+    # Load bittensor wallet
+    wallet = bt.Wallet(config=config)
+    print(f"Wallet name: {wallet.name}")
+    print(f"Hotkey name: {wallet.hotkey_str}")
+
+    # Unlock hotkey (will prompt for password if encrypted)
+    try:
+        _ = wallet.hotkey
+        print(f"Hotkey address: {wallet.hotkey.ss58_address}")
+    except Exception as e:
+        print(f"Failed to load hotkey: {e}")
+        sys.exit(1)
+
+    # Determine API URL based on network
+    network = config.subtensor.get("network", "finney")
+    if network not in ("finney", "mainnet"):
+        api_url = os.environ.get("CORE_SERVER_URL")
+        if not api_url:
+            raise RuntimeError("CORE_SERVER_URL is required when running the public worker on a non-mainnet network")
+        print(f"Network: {network}")
     else:
-        # Parse configuration
-        config = get_config()
-
-        # Load bittensor wallet
-        wallet = bt.Wallet(config=config)
-        print(f"Wallet name: {wallet.name}")
-        print(f"Hotkey name: {wallet.hotkey_str}")
-
-        # Unlock hotkey (will prompt for password if encrypted)
-        try:
-            _ = wallet.hotkey
-            print(f"Hotkey address: {wallet.hotkey.ss58_address}")
-        except Exception as e:
-            print(f"Failed to load hotkey: {e}")
-            sys.exit(1)
-
-        # Determine API URL based on network
-        network = config.subtensor.get("network", "finney")
-        if network not in ("finney", "mainnet"):
-            api_url = os.environ.get("CORE_SERVER_URL")
-            if not api_url:
-                raise RuntimeError("CORE_SERVER_URL is required when running the public worker on a non-mainnet network")
-            print(f"Network: {network}")
-        else:
-            api_url = os.environ.get("CORE_SERVER_URL", MAINNET_URL)
-            print("Network: mainnet")
+        api_url = os.environ.get("CORE_SERVER_URL", MAINNET_URL)
+        print("Network: mainnet")
     worker_gateway_url = os.environ.get("WORKER_GATEWAY_URL")
     worker_gateway_secret = (
         os.environ.get("WORKER_GATEWAY_SECRET", "").strip()
@@ -4767,7 +4492,6 @@ async def main():
         api_url=api_url,
         worker_gateway_url=worker_gateway_url,
         worker_gateway_secret=worker_gateway_secret,
-        hidden=WORKER_HIDDEN,
     )
 
     # Setup signal handlers

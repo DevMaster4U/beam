@@ -409,12 +409,16 @@ class Orchestrator:
 
     def _on_worker_gateway_ready_change(self, ready: bool) -> None:
         """Toggle orchestrator readiness when the first/last local worker connects."""
-        # embedded / embedded_global: capacity comes from embedded pool; hidden WS is overflow only.
+        # embedded / in_process+embedded: capacity comes from embedded pool.
         if self.settings.worker_gateway_mode in (
             "global",
             "coordinator",
             "embedded",
-            "embedded_global",
+        ):
+            return
+        if (
+            self.embedded_worker_pool is not None
+            and self.embedded_worker_pool.worker_count > 0
         ):
             return
         if self._routing_paused:
@@ -475,14 +479,14 @@ class Orchestrator:
                     self.embedded_worker_pool is not None
                     and self.embedded_worker_pool.worker_count > 0
                 ) or bool(self.settings.ready)
-            elif mode == "embedded_global":
-                should_ready = (
-                    self.embedded_worker_pool is not None
-                    and self.embedded_worker_pool.worker_count > 0
-                ) or bool(self.settings.ready)
             elif mode == "in_process":
                 should_ready = (
-                    self.worker_gateway.connected_count > 0 or bool(self.settings.ready)
+                    (
+                        self.embedded_worker_pool is not None
+                        and self.embedded_worker_pool.worker_count > 0
+                    )
+                    or self.worker_gateway.connected_count > 0
+                    or bool(self.settings.ready)
                 )
             else:
                 # Shared pool modes: workers connect via global gateway, not local sessions.
@@ -1183,29 +1187,30 @@ class Orchestrator:
             self.subnet_core_client.set_worker_gateway(self.worker_gateway)
 
             gateway_mode = (self.settings.worker_gateway_mode or "in_process").strip().lower()
-            if gateway_mode in ("embedded", "embedded_global"):
-                from core.embedded_workers import EmbeddedWorkerPool
+            if gateway_mode == "embedded_global":
+                raise ValueError(
+                    "WORKER_GATEWAY_MODE=embedded_global is removed; use in_process with "
+                    "WORKER_1 (optional embedded) + external workers on /ws/{worker_id}"
+                )
 
+            from core.embedded_workers import EmbeddedWorkerPool, parse_embedded_worker_configs
+
+            embedded_configs = parse_embedded_worker_configs(self.settings)
+            if gateway_mode == "embedded" or (
+                gateway_mode == "in_process" and embedded_configs
+            ):
                 self.embedded_worker_pool = EmbeddedWorkerPool(
                     self.settings,
                     self.subnet_core_client,
                 )
                 await self.embedded_worker_pool.start()
                 self.subnet_core_client.set_embedded_worker_pool(self.embedded_worker_pool)
-                if gateway_mode == "embedded_global":
-                    self.embedded_worker_pool.set_hidden_worker_gateway(self.worker_gateway)
-                    from neurons.common import control_ws_client
-                    from neurons.common.control_client import get_control_server_config
-
-                    if get_control_server_config().cache_ws_enabled:
-                        control_ws_client.register_sync_done_handler(
-                            self.embedded_worker_pool.mark_cache_sync_done
-                        )
-                        logger.info(
-                            "embedded_global: hybrid overflow deferred until control-server sync_done"
-                        )
-                    else:
-                        self.embedded_worker_pool.mark_cache_sync_done()
+                if gateway_mode == "in_process":
+                    self.embedded_worker_pool.set_worker_gateway(self.worker_gateway)
+                    logger.info(
+                        "In-process mode: embedded pool (%d) + external worker gateway",
+                        self.embedded_worker_pool.worker_count,
+                    )
                 logger.info(
                     "Embedded worker pool started: %s worker(s) mode=%s",
                     self.embedded_worker_pool.worker_count,
@@ -1303,11 +1308,6 @@ class Orchestrator:
             )
             if gateway_mode == "embedded":
                 gateway_url = self.settings.worker_gateway_url or f"http://{local_ip}:{self.settings.api_port}"
-            elif gateway_mode == "embedded_global":
-                gateway_url = (
-                    self.settings.worker_gateway_url
-                    or f"http://{local_ip}:{self.settings.api_port}"
-                )
             self.subnet_core_client.set_registration_config(
                 url=orch_url,
                 region=self.settings.region,

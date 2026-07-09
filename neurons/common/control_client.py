@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import quote, urlparse, urlunparse
 
 import httpx
@@ -201,4 +201,53 @@ def fetch_predefined_etag_chunk_data(
             cache_key[:96],
             exc,
         )
+        return None
+
+
+def delete_predefined_etag_chunk_data_remote(
+    cache_key: str,
+    config: Optional[ControlServerConfig] = None,
+) -> bool:
+    """Delete one chunk .bin file on control-server."""
+    cfg = config or get_control_server_config()
+    if not cfg.http_url or not cfg.secret or not cache_key:
+        return False
+    url = (
+        f"{cfg.http_url}/cache/predefined-etag/entries/"
+        f"{quote(cache_key, safe='')}/data"
+    )
+    try:
+        with httpx.Client(timeout=CHUNK_DATA_TIMEOUT) as client:
+            resp = client.delete(url, headers=_headers(cfg.secret))
+            if resp.status_code == 404:
+                return False
+            resp.raise_for_status()
+        return True
+    except Exception as exc:
+        logger.warning(
+            "Control server chunk data delete failed key=%s err=%s",
+            cache_key[:96],
+            exc,
+        )
+        return False
+
+
+def prune_predefined_etag_chunk_data_remote(
+    *,
+    all_files: bool = False,
+    config: Optional[ControlServerConfig] = None,
+) -> Optional[dict[str, Any]]:
+    """Prune orphan chunk .bin files on control-server (or delete all when all_files=True)."""
+    cfg = config or get_control_server_config()
+    if not cfg.http_url or not cfg.secret:
+        return None
+    url = f"{cfg.http_url}/cache/predefined-etag/chunk-data"
+    params = {"all_files": "true"} if all_files else {}
+    try:
+        with httpx.Client(timeout=CHUNK_DATA_TIMEOUT) as client:
+            resp = client.delete(url, headers=_headers(cfg.secret), params=params)
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as exc:
+        logger.warning("Control server chunk data prune failed err=%s", exc)
         return None

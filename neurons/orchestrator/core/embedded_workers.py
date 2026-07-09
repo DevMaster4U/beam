@@ -41,7 +41,6 @@ def _log_embedded_task_offer(
     transfer_context: dict,
     path: str,
     beamcore_worker_id: str = "",
-    hidden_worker_id: str = "",
 ) -> None:
     chunk_id = chunk_id_from_transfer_context(transfer_context)
     fields = [
@@ -54,8 +53,6 @@ def _log_embedded_task_offer(
     ]
     if beamcore_worker_id:
         fields.append(f"beamcore_worker={short_id(beamcore_worker_id)}")
-    if hidden_worker_id:
-        fields.append(f"hidden_worker={short_id(hidden_worker_id)}")
     logger.info(" ".join(fields))
 
 
@@ -348,66 +345,15 @@ class EmbeddedWorkerPool:
         self._offer_pool: Optional[_CoroutinePool] = None
         self._side_pool: Optional[_CoroutinePool] = None
         self._task_handles: Set[asyncio.Task] = set()
-        self._hidden_worker_gateway: Optional[Any] = None
-        self._transfer_waiters: dict[str, asyncio.Future] = {}
-        self._hybrid_routing_enabled = False
+        self._worker_gateway: Optional[Any] = None
 
     @property
     def worker_count(self) -> int:
         return len(self.workers)
 
-    @property
-    def hybrid_mode(self) -> bool:
-        return (self.settings.worker_gateway_mode or "").strip().lower() == "embedded_global"
-
-    @property
-    def uses_overflow_routing(self) -> bool:
-        """Hybrid overflow to hidden workers (enabled after control-server sync_done)."""
-        return self.hybrid_mode and self._hybrid_routing_enabled
-
-    @property
-    def overflow_beamcore_worker(self) -> Optional[EmbeddedWorker]:
-        """WORKER_2 identity for overflow task_accept/task_result (hybrid mode)."""
-        if not self.uses_overflow_routing or len(self.workers) < 2:
-            return None
-        return self.workers[1]
-
-    def mark_cache_sync_done(self) -> None:
-        if not self.hybrid_mode or self._hybrid_routing_enabled:
-            return
-        self._hybrid_routing_enabled = True
-        if self.workers:
-            self.workers[0].max_concurrent_tasks = 1
-        logger.info(
-            "embedded_global: cache sync done — hybrid overflow routing enabled "
-            "(WORKER_1 embedded max=1, overflow via hidden workers + WORKER_2 identity)"
-        )
-
-    def _routing_workers(self) -> List[EmbeddedWorker]:
-        if self.uses_overflow_routing:
-            return self.workers[:1] if self.workers else []
-        return self.workers
-
-    def _beamcore_worker_for_overflow(self, embedded: EmbeddedWorker) -> EmbeddedWorker:
-        return self.overflow_beamcore_worker or embedded
-
-    def set_hidden_worker_gateway(self, gateway: Any) -> None:
-        """Route overflow transfer work to hidden workers connected on orchestrator WS."""
-        self._hidden_worker_gateway = gateway
-        if hasattr(gateway, "set_transfer_result_handler"):
-            gateway.set_transfer_result_handler(self.handle_transfer_result)
-
-    async def handle_transfer_result(self, worker_id: str, message: dict) -> None:
-        offer_id = str(message.get("offer_id") or message.get("task_id") or "")
-        future = self._transfer_waiters.pop(offer_id, None)
-        if future is not None and not future.done():
-            future.set_result(message)
-            return
-        logger.warning(
-            "Unexpected transfer_result from hidden worker=%s offer=%s",
-            short_id(worker_id),
-            short_id(offer_id),
-        )
+    def set_worker_gateway(self, gateway: Any) -> None:
+        """Overflow task offers to external workers connected on orchestrator WS."""
+        self._worker_gateway = gateway
 
     async def start(self) -> None:
         transfer = get_transfer_module()
@@ -416,18 +362,6 @@ class EmbeddedWorkerPool:
             mode = (self.settings.worker_gateway_mode or "embedded").strip().lower()
             raise ValueError(
                 f"WORKER_GATEWAY_MODE={mode} requires WORKER_1 (or WORKER_1_HOTKEY) in env"
-            )
-
-        if self.hybrid_mode:
-            if len(configs) < 2:
-                logger.warning(
-                    "embedded_global: configure WORKER_2 for overflow task_accept identity; "
-                    "overflow will reuse WORKER_1 until WORKER_2 is set"
-                )
-            logger.info(
-                "embedded_global: starting in embedded-only mode until control-server sync_done "
-                "(%d worker slot(s), parallel routing)",
-                len(configs),
             )
 
         self.http_client = httpx.AsyncClient(
@@ -535,7 +469,7 @@ class EmbeddedWorkerPool:
         batch_used_ips: Optional[set[str]] = None,
         batch_assigned_counts: Optional[dict[str, int]] = None,
     ) -> Optional[EmbeddedWorker]:
-        workers_pool = self._routing_workers()
+        workers_pool = self.workers
         if not workers_pool:
             return None
 
@@ -632,7 +566,7 @@ class EmbeddedWorkerPool:
         failed = 0
         batch_used_ips: set[str] = set()
         batch_assigned_counts: dict[str, int] = defaultdict(int)
-        hidden_batch_assigned: set[str] = set()
+        batch_gateway_assigned: set[str] = set()
         transfer = get_transfer_module()
 
         for offer in offers:
@@ -660,43 +594,37 @@ class EmbeddedWorkerPool:
 
             worker = self._select_worker(batch_used_ips, batch_assigned_counts)
             if worker is None:
-                if (
-                    self.uses_overflow_routing
-                    and self._hidden_worker_gateway is not None
-                    and self.workers
-                ):
-                    embedded_worker = self.workers[0]
-                    beamcore_worker = self._beamcore_worker_for_overflow(embedded_worker)
-                    _log_embedded_task_offer(
-                        task_id=str(task_id),
-                        offer_id=str(offer_id),
-                        worker_slot=beamcore_worker.slot,
-                        transfer_context=transfer_context,
-                        path=f"{path}:overflow",
-                        beamcore_worker_id=beamcore_worker.worker_id,
+                gateway = self._worker_gateway
+                if gateway is not None:
+                    external_id = gateway.select_worker_round_robin(
+                        batch_used_ips=batch_used_ips,
+                        batch_assigned_workers=batch_gateway_assigned,
                     )
-                    task = asyncio.create_task(
-                        self._handle_overflow_offer(
-                            embedded_worker,
-                            offer,
-                            transfer_context,
-                            path=path,
-                            batch_used_ips=batch_used_ips,
-                            batch_assigned_workers=hidden_batch_assigned,
+                    if external_id:
+                        if await gateway.deliver_task_offer(external_id, offer):
+                            delivered += 1
+                            batch_gateway_assigned.add(external_id)
+                            profile = gateway._get_profile(external_id)
+                            if profile.ip:
+                                batch_used_ips.add(profile.ip)
+                            logger.info(
+                                "%s external_dispatch task=%s offer=%s worker=%s",
+                                _WORKERS_LOG,
+                                short_id(task_id),
+                                short_id(offer_id),
+                                short_id(external_id),
+                            )
+                            continue
+                        logger.warning(
+                            "External worker dispatch failed: batch=%s task=%s offer=%s worker=%s",
+                            short_id(batch_id, 12),
+                            short_id(task_id),
+                            short_id(offer_id),
+                            short_id(external_id),
                         )
-                    )
-                    self._task_handles.add(task)
-                    task.add_done_callback(
-                        lambda t, tid=task_id, oid=offer_id: self._log_offer_task_done(
-                            t, task_id=tid, offer_id=oid
-                        )
-                    )
-                    task.add_done_callback(self._task_handles.discard)
-                    delivered += 1
-                    continue
-                reason = "no_embedded_worker_capacity"
+                reason = "no_worker_capacity"
                 logger.warning(
-                    "No embedded worker capacity for batch=%s task=%s offer=%s",
+                    "No worker capacity for batch=%s task=%s offer=%s",
                     short_id(batch_id, 12),
                     short_id(task_id),
                     short_id(offer_id),
@@ -730,7 +658,6 @@ class EmbeddedWorkerPool:
                     transfer_context,
                     path=path,
                     batch_used_ips=batch_used_ips,
-                    batch_assigned_workers=hidden_batch_assigned,
                 )
             )
             self._task_handles.add(task)
@@ -761,7 +688,6 @@ class EmbeddedWorkerPool:
         *,
         path: str = "standard",
         batch_used_ips: Optional[set[str]] = None,
-        batch_assigned_workers: Optional[set[str]] = None,
     ) -> None:
         transfer = get_transfer_module()
         task_id = offer.get("task_id") or offer.get("offer_id")
@@ -776,25 +702,6 @@ class EmbeddedWorkerPool:
         try:
             capacity_error = self._reserve_capacity(worker, estimated_bytes)
             if capacity_error:
-                if (
-                    self.uses_overflow_routing
-                    and self._hidden_worker_gateway is not None
-                    and capacity_error.startswith("queue_full")
-                ):
-                    logger.info(
-                        "Embedded at capacity; overflowing task=%s offer=%s to hidden worker",
-                        short_id(task_id),
-                        short_id(offer_id),
-                    )
-                    await self._handle_overflow_offer(
-                        worker,
-                        offer,
-                        transfer_context,
-                        path=f"{path}:overflow",
-                        batch_used_ips=batch_used_ips,
-                        batch_assigned_workers=batch_assigned_workers,
-                    )
-                    return
                 logger.warning(
                     "Embedded rejecting offer: task=%s offer=%s worker_slot=%s reason=%s",
                     short_id(task_id),
@@ -941,206 +848,6 @@ class EmbeddedWorkerPool:
                 ack.get("reason") or ack.get("error") or ack.get("message"),
             )
         return ack
-
-    async def _handle_overflow_offer(
-        self,
-        worker: EmbeddedWorker,
-        offer: dict,
-        transfer_context: dict,
-        *,
-        path: str,
-        batch_used_ips: Optional[set[str]] = None,
-        batch_assigned_workers: Optional[set[str]] = None,
-    ) -> None:
-        """Overflow: task_accept (WORKER_2 id) in parallel with hidden worker transfer."""
-        transfer = get_transfer_module()
-        task_id = str(offer.get("task_id") or offer.get("offer_id") or "")
-        offer_id = str(offer.get("offer_id") or task_id or "")
-        beamcore_worker = self._beamcore_worker_for_overflow(worker)
-
-        gateway = self._hidden_worker_gateway
-        if gateway is None:
-            self._log_task_failed(
-                transfer,
-                transfer_context,
-                task_id=task_id,
-                offer_id=offer_id,
-                reason="hidden_worker_gateway_unavailable",
-            )
-            return
-
-        hidden_worker_id = gateway.select_hidden_worker_round_robin(
-            batch_used_ips=batch_used_ips,
-            batch_assigned_workers=batch_assigned_workers,
-        )
-        if not hidden_worker_id:
-            self._log_task_failed(
-                transfer,
-                transfer_context,
-                task_id=task_id,
-                offer_id=offer_id,
-                reason="no_hidden_worker_capacity",
-            )
-            return
-
-        loop = asyncio.get_running_loop()
-        result_future: asyncio.Future = loop.create_future()
-        self._transfer_waiters[offer_id] = result_future
-        if batch_assigned_workers is not None:
-            batch_assigned_workers.add(hidden_worker_id)
-        hidden_ip = ""
-        if hasattr(gateway, "_get_profile"):
-            hidden_ip = gateway._get_profile(hidden_worker_id).ip.strip()
-        if hidden_ip and batch_used_ips is not None:
-            batch_used_ips.add(hidden_ip)
-
-        logger.info(
-            "%s overflow_dispatch task=%s offer=%s beamcore_worker=%s hidden_worker=%s",
-            _WORKERS_LOG,
-            short_id(task_id),
-            short_id(offer_id),
-            short_id(beamcore_worker.worker_id),
-            short_id(hidden_worker_id),
-        )
-
-        async def _accept() -> dict:
-            return await self._send_accept(beamcore_worker, task_id, offer_id)
-
-        async def _dispatch() -> bool:
-            return await gateway.deliver_transfer_offer(hidden_worker_id, offer)
-
-        accept_resp, dispatched = await asyncio.gather(_accept(), _dispatch())
-
-        if not dispatched:
-            self._transfer_waiters.pop(offer_id, None)
-            if batch_assigned_workers is not None:
-                batch_assigned_workers.discard(hidden_worker_id)
-            if accept_resp.get("accepted"):
-                await self._send_result(
-                    beamcore_worker,
-                    task_id,
-                    offer_id,
-                    success=False,
-                    error="hidden_worker_dispatch_failed",
-                    transfer_context=transfer_context,
-                )
-            else:
-                reason = accept_resp.get("reason") or "task_accept_rejected"
-                self._log_task_failed(
-                    transfer,
-                    transfer_context,
-                    task_id=task_id,
-                    offer_id=offer_id,
-                    reason=str(reason),
-                )
-            return
-
-        if not accept_resp.get("accepted"):
-            self._transfer_waiters.pop(offer_id, None)
-            if batch_assigned_workers is not None:
-                batch_assigned_workers.discard(hidden_worker_id)
-            reason = accept_resp.get("reason") or "task_accept_rejected"
-            logger.warning(
-                "Overflow accept rejected: task=%s offer=%s beamcore_worker=%s reason=%s",
-                short_id(task_id),
-                short_id(offer_id),
-                short_id(beamcore_worker.worker_id),
-                reason,
-            )
-            self._log_task_failed(
-                transfer,
-                transfer_context,
-                task_id=task_id,
-                offer_id=offer_id,
-                reason=str(reason),
-            )
-            return
-
-        timeout = float(os.environ.get("WORKER_OVERFLOW_TRANSFER_TIMEOUT", "120"))
-        try:
-            result_msg = await asyncio.wait_for(result_future, timeout=timeout)
-        except asyncio.TimeoutError:
-            self._transfer_waiters.pop(offer_id, None)
-            if batch_assigned_workers is not None:
-                batch_assigned_workers.discard(hidden_worker_id)
-            logger.warning(
-                "Overflow transfer timeout: task=%s offer=%s timeout=%.0fs",
-                short_id(task_id),
-                short_id(offer_id),
-                timeout,
-            )
-            self._log_task_failed(
-                transfer,
-                transfer_context,
-                task_id=task_id,
-                offer_id=offer_id,
-                reason="overflow_transfer_timeout",
-            )
-            await self._send_result(
-                beamcore_worker,
-                task_id,
-                offer_id,
-                success=False,
-                error="overflow_transfer_timeout",
-                transfer_context=transfer_context,
-            )
-            return
-
-        if batch_assigned_workers is not None:
-            batch_assigned_workers.discard(hidden_worker_id)
-
-        success = bool(result_msg.get("success", False))
-        chunk_hash = str(result_msg.get("chunk_hash") or "")
-        etag = result_msg.get("etag")
-        error = result_msg.get("error")
-        cached = result_msg.get("cached")
-        if isinstance(cached, str):
-            cached = cached.lower() == "true"
-
-        if success:
-            _log_embedded_task_done(
-                task_id=task_id,
-                offer_id=offer_id,
-                transfer_context=transfer_context,
-                chunk_hash=chunk_hash,
-                etag=str(etag or ""),
-                cached=bool(cached),
-                fetch_ms=float(result_msg.get("fetch_ms") or 0.0),
-                put_ms=float(result_msg.get("put_ms") or result_msg.get("send_ms") or 0.0),
-            )
-            if chunk_hash and cached is not True:
-                transfer.maybe_store_predefined_etag_cache_on_success(
-                    transfer_context,
-                    chunk_hash,
-                    etag,
-                    log_prefix="[Embedded/overflow]",
-                    task_id=task_id,
-                    offer_id=offer_id,
-                    push_to_control_server=True,
-                )
-        else:
-            self._log_task_failed(
-                transfer,
-                transfer_context,
-                task_id=task_id,
-                offer_id=offer_id,
-                reason=str(error or "overflow_transfer_failed"),
-                chunk_hash=chunk_hash,
-                etag=str(etag or ""),
-                cached=cached if isinstance(cached, bool) else None,
-            )
-
-        await self._send_result(
-            beamcore_worker,
-            task_id,
-            offer_id,
-            success=success,
-            chunk_hash=chunk_hash,
-            etag=etag,
-            error=str(error) if error else None,
-            transfer_context=transfer_context,
-            cached=cached if isinstance(cached, bool) else None,
-        )
 
     async def _handle_predefined_etag_offer(
         self,

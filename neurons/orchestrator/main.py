@@ -140,10 +140,6 @@ async def lifespan(app: FastAPI):
         logger.info("Worker gateway: WORKER_GATEWAY_SECRET configured (workers must authenticate)")
     elif (settings.worker_gateway_mode or "in_process").strip().lower() == "embedded":
         logger.info("Worker gateway: embedded mode — workers run in-process (no external WS)")
-    elif (settings.worker_gateway_mode or "").strip().lower() == "embedded_global":
-        logger.info(
-            "Worker gateway: embedded_global — WORKER_1 in-process; hidden workers via /ws?hidden=1"
-        )
     else:
         logger.warning(
             "Worker gateway: WORKER_GATEWAY_SECRET is not set — all worker WebSocket connections will be rejected"
@@ -275,10 +271,10 @@ if _gateway_mode in ("global", "coordinator", "embedded"):
     )
 else:
     app.include_router(workers.router)
-    if _gateway_mode == "embedded_global":
+    if _gateway_mode == "in_process":
         logger.info(
-            "WORKER_GATEWAY_MODE=embedded_global — hidden workers connect via "
-            "/ws/{worker_id}?hidden=1&worker_secret=..."
+            "WORKER_GATEWAY_MODE=in_process — external workers connect via "
+            "/ws/{worker_id}?api_key=...&worker_secret=..."
         )
 
 

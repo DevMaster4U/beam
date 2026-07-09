@@ -13,9 +13,12 @@ from pydantic import BaseModel, Field
 
 from auth import require_control_secret
 from storage import (
+    delete_all_chunk_data_files,
+    delete_predefined_etag_chunk_data,
     load_predefined_etag_cache,
     load_predefined_etag_chunk_data,
     merge_predefined_etag_entries,
+    prune_orphan_chunk_data_files,
     store_predefined_etag_chunk_data,
     upsert_predefined_etag_entry,
 )
@@ -93,6 +96,25 @@ async def get_chunk_data(cache_key: str) -> Response:
     if not data:
         raise HTTPException(status_code=404, detail=f"chunk data miss: {key}")
     return Response(content=data, media_type="application/octet-stream")
+
+
+@router.delete("/entries/{cache_key:path}/data")
+async def delete_chunk_data(cache_key: str) -> dict[str, Any]:
+    key = unquote(cache_key)
+    removed = await asyncio.to_thread(delete_predefined_etag_chunk_data, key)
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"chunk data miss: {key}")
+    return {"key": key, "deleted": True}
+
+
+@router.delete("/chunk-data")
+async def delete_chunk_data_bulk(all_files: bool = False) -> dict[str, Any]:
+    """Prune orphan .bin files, or delete all chunk bytes when all_files=true."""
+    if all_files:
+        removed = await asyncio.to_thread(delete_all_chunk_data_files)
+        return {"deleted_files": removed, "mode": "all"}
+    result = await asyncio.to_thread(prune_orphan_chunk_data_files)
+    return {"mode": "orphans", **result}
 
 
 @router.get("/entries/{cache_key:path}")

@@ -102,6 +102,89 @@ def has_predefined_etag_chunk_data(key: str) -> bool:
     return predefined_etag_chunk_data_path(key).is_file()
 
 
+def delete_predefined_etag_chunk_data(key: str) -> bool:
+    """Remove on-disk chunk bytes and clear has_chunk_data on the metadata entry."""
+    path = predefined_etag_chunk_data_path(key)
+    removed = False
+    if path.is_file():
+        path.unlink()
+        removed = True
+    with _cache_lock:
+        payload = _ensure_cache_loaded_locked()
+        entries = payload.get("entries") or {}
+        item = entries.get(key)
+        if isinstance(item, dict) and item.pop("has_chunk_data", None) is not None:
+            _persist_cache_payload(payload)
+            removed = True
+    return removed
+
+
+def prune_orphan_chunk_data_files() -> dict[str, int]:
+    """Delete .bin files with no matching cache entry, or entries without has_chunk_data."""
+    chunk_dir = predefined_etag_chunk_data_dir()
+    if not chunk_dir.is_dir():
+        return {"removed_files": 0, "cleared_flags": 0}
+
+    with _cache_lock:
+        payload = _ensure_cache_loaded_locked()
+        entries = payload.get("entries") or {}
+        keys_with_data = {
+            str(key)
+            for key, item in entries.items()
+            if isinstance(item, dict) and item.get("has_chunk_data")
+        }
+
+    digest_to_key: dict[str, str] = {}
+    for key in keys_with_data:
+        digest = hashlib.sha256(str(key).encode()).hexdigest()
+        digest_to_key[digest] = key
+
+    removed_files = 0
+    for path in chunk_dir.glob("*.bin"):
+        digest = path.stem
+        key = digest_to_key.get(digest)
+        if key is None or not has_predefined_etag_chunk_data(key):
+            if path.is_file():
+                path.unlink()
+                removed_files += 1
+
+    cleared_flags = 0
+    with _cache_lock:
+        payload = _ensure_cache_loaded_locked()
+        entries = payload.get("entries") or {}
+        for key, item in list(entries.items()):
+            if not isinstance(item, dict):
+                continue
+            if item.get("has_chunk_data") and not predefined_etag_chunk_data_path(str(key)).is_file():
+                item.pop("has_chunk_data", None)
+                cleared_flags += 1
+        if cleared_flags:
+            _persist_cache_payload(payload)
+
+    return {"removed_files": removed_files, "cleared_flags": cleared_flags}
+
+
+def delete_all_chunk_data_files() -> int:
+    """Remove every chunk .bin file and clear has_chunk_data on all entries."""
+    chunk_dir = predefined_etag_chunk_data_dir()
+    removed = 0
+    if chunk_dir.is_dir():
+        for path in chunk_dir.glob("*.bin"):
+            if path.is_file():
+                path.unlink()
+                removed += 1
+    with _cache_lock:
+        payload = _ensure_cache_loaded_locked()
+        entries = payload.get("entries") or {}
+        changed = False
+        for item in entries.values():
+            if isinstance(item, dict) and item.pop("has_chunk_data", None) is not None:
+                changed = True
+        if changed:
+            _persist_cache_payload(payload)
+    return removed
+
+
 def _enrich_cache_entries(payload: dict[str, Any]) -> bool:
     """Ensure every entry has chunk_index derived from its key. Returns True if mutated."""
     entries = payload.get("entries")
