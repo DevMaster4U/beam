@@ -430,7 +430,14 @@ class SubnetCoreClient:
             logger.warning("BeamCore NATS control re-registration failed after reconnect: %s", exc)
 
     async def _on_nats_error(self, exc: Exception) -> None:
-        logger.warning("BeamCore NATS control error: %s", exc)
+        # asyncio.TimeoutError stringifies to "" — always log type/repr for ops.
+        detail = str(exc).strip() or repr(exc)
+        logger.warning(
+            "BeamCore NATS control error: %s (%s) endpoint=%s",
+            detail,
+            type(exc).__name__,
+            self.ws_base_url,
+        )
         if self._is_authorization_error(exc):
             self._schedule_auth_recovery()
 
