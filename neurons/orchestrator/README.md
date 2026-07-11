@@ -21,7 +21,7 @@ WALLET_HOTKEY=your_hotkey \
 SUBTENSOR_NETWORK=finney \
 NETUID=105 \
 CORE_SERVER_URL=https://beamcore.b1m.ai \
-ORCH_GATEWAY_URL=https://orch-gateway.b1m.ai \
+ORCH_GATEWAY_URL=tls://orch-gateway.b1m.ai:4222 \
 ORCHESTRATOR_WORKER_GATEWAY_URL=https://orchestrator.example.com \
 READY=true \
 python main.py
@@ -36,7 +36,7 @@ python main.py
 | `SUBTENSOR_NETWORK`               | Bittensor network                                   | `finney`                      |
 | `NETUID`                          | Beam subnet UID                                     | `105`                         |
 | `CORE_SERVER_URL`                 | BeamCore HTTP base                                  | `https://beamcore.b1m.ai`     |
-| `ORCH_GATEWAY_URL`                | Orchestrator gateway origin                         | `https://orch-gateway.b1m.ai` |
+| `ORCH_GATEWAY_URL`                | Orchestrator gateway origin                         | `tls://orch-gateway.b1m.ai:4222` |
 | `ORCHESTRATOR_WORKER_GATEWAY_URL` | Public worker gateway origin advertised to BeamCore | operator-provided             |
 | `READY`                           | Opt in to routed work                               | `true`                        |
 | `API_PORT`                        | Local HTTP and in-process worker-gateway port       | `8000`                        |

@@ -21,7 +21,7 @@ Workers use BeamCore HTTP for registration, but runtime task delivery uses the w
 | Setting | Value |
 |---|---|
 | `CORE_SERVER_URL` | `https://beamcore.b1m.ai` |
-| `ORCH_GATEWAY_URL` | `https://orch-gateway.b1m.ai` |
+| `ORCH_GATEWAY_URL` | `tls://orch-gateway.b1m.ai:4222` |
 | `ORCHESTRATOR_WORKER_GATEWAY_URL` | Your externally reachable worker gateway origin |
 | `SUBTENSOR_NETWORK` | `finney` |
 | `NETUID` | `105` |
@@ -68,7 +68,7 @@ Example `neurons/orchestrator/.env`:
 WALLET_NAME=orchestrator
 WALLET_HOTKEY=default
 CORE_SERVER_URL=https://beamcore.b1m.ai
-ORCH_GATEWAY_URL=https://orch-gateway.b1m.ai
+ORCH_GATEWAY_URL=tls://orch-gateway.b1m.ai:4222
 ORCHESTRATOR_WORKER_GATEWAY_URL=https://orchestrator.example.com
 WORKER_GATEWAY_SECRET=your-long-random-worker-secret
 SUBTENSOR_NETWORK=finney
@@ -197,4 +197,4 @@ worker -> worker gateway -> orchestrator -> orch-gateway -> BeamCore task_result
 curl https://beamcore.b1m.ai/health
 ```
 
-Check network egress, DNS, wallet signing errors, and `ORCH_GATEWAY_URL=https://orch-gateway.b1m.ai`.
+Check network egress, DNS, wallet signing errors, and `ORCH_GATEWAY_URL=tls://orch-gateway.b1m.ai:4222`.

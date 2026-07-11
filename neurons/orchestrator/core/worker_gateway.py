@@ -7,6 +7,8 @@ and relays task_accept / task_reject / task_result upstream.
 """
 
 import asyncio
+import os
+from collections import deque
 import json
 import logging
 import time
@@ -18,6 +20,14 @@ from core.relay_log import defer_relay_log, is_failure_summary, log_relay, relay
 logger = logging.getLogger(__name__)
 
 MAX_WORKERS = 10
+RESULT_FORWARD_CONCURRENCY = max(1, int(os.environ.get("ORCH_RESULT_FORWARD_CONCURRENCY", "8")))
+RESULT_FORWARD_MAX_ATTEMPTS = max(1, int(os.environ.get("ORCH_RESULT_FORWARD_MAX_ATTEMPTS", "8")))
+RESULT_FORWARD_RETRY_BASE_SECONDS = max(0.0, float(os.environ.get("ORCH_RESULT_FORWARD_RETRY_BASE_SECONDS", "0.25")))
+RESULT_FORWARD_RETRY_MAX_SECONDS = max(
+    RESULT_FORWARD_RETRY_BASE_SECONDS,
+    float(os.environ.get("ORCH_RESULT_FORWARD_RETRY_MAX_SECONDS", "2.0")),
+)
+RESULT_SEEN_CACHE_SIZE = max(1, int(os.environ.get("ORCH_RESULT_SEEN_CACHE_SIZE", "100000")))
 
 
 @dataclass
@@ -78,6 +88,10 @@ class WorkerGateway:
         self._on_ready_change = on_ready_change
         self._upstream: Optional[object] = None  # SubnetCoreClient ref
         self._outbound_send: Optional[Callable] = None
+        self._result_forward_semaphore = asyncio.Semaphore(RESULT_FORWARD_CONCURRENCY)
+        self._result_forward_tasks: Set[asyncio.Task] = set()
+        self._result_forward_seen_offers: Set[str] = set()
+        self._result_forward_seen_order = deque()
 
     def set_upstream(self, upstream: object) -> None:
         self._upstream = upstream
@@ -177,6 +191,12 @@ class WorkerGateway:
         logger.info("Worker disconnected: %s (%d/%d)", worker_id, len(self._sessions), MAX_WORKERS)
         if len(self._sessions) == 0 and self._on_ready_change:
             self._on_ready_change(False)
+
+    async def stop(self) -> None:
+        if not self._result_forward_tasks:
+            return
+        await asyncio.gather(*list(self._result_forward_tasks), return_exceptions=True)
+        self._result_forward_tasks.clear()
 
     async def deliver_task_offer(
         self,
@@ -490,90 +510,174 @@ class WorkerGateway:
             force_info=failed,
         )
 
+    def _remember_result_offer(self, offer_id: str) -> bool:
+        if offer_id in self._result_forward_seen_offers:
+            return False
+        self._result_forward_seen_offers.add(offer_id)
+        self._result_forward_seen_order.append(offer_id)
+        while len(self._result_forward_seen_order) > RESULT_SEEN_CACHE_SIZE:
+            expired = self._result_forward_seen_order.popleft()
+            self._result_forward_seen_offers.discard(expired)
+        return True
+
+    def _schedule_result_forward(self, payload: dict) -> None:
+        task = asyncio.create_task(self._forward_task_result_limited(payload))
+        self._result_forward_tasks.add(task)
+
+        def _done(done_task: asyncio.Task) -> None:
+            self._result_forward_tasks.discard(done_task)
+            try:
+                exc = done_task.exception()
+            except asyncio.CancelledError:
+                return
+            if exc is not None:
+                logger.error("task_result forward crashed: %s", exc)
+
+        task.add_done_callback(_done)
+
+    async def _forward_task_result_limited(self, payload: dict) -> None:
+        async with self._result_forward_semaphore:
+            await self._forward_task_result_to_beamcore(payload)
+
+    async def _forward_task_result_to_beamcore(self, payload: dict) -> None:
+        task_id = payload.get("task_id")
+        offer_id = payload.get("offer_id") or task_id
+        worker_id = payload.get("worker_id")
+        last_error: Exception | None = None
+        for attempt in range(1, RESULT_FORWARD_MAX_ATTEMPTS + 1):
+            try:
+                if self._upstream is None:
+                    raise RuntimeError("beamcore_unavailable")
+                sender = getattr(
+                    self._upstream,
+                    "send_task_result_strict",
+                    self._upstream.send_task_result,
+                )
+                ack = await sender(payload)
+                received = bool(ack.get("received", True)) if isinstance(ack, dict) else False
+                completed = ack.get("completed") if isinstance(ack, dict) else None
+                reason = ack.get("reason") if isinstance(ack, dict) else "invalid_beamcore_ack"
+                if received and completed is not False:
+                    logger.info(
+                        "task_result forwarded: task=%s offer=%s worker=%s completed=%s",
+                        short_id(task_id),
+                        short_id(offer_id),
+                        short_id(worker_id),
+                        completed,
+                    )
+                    return
+                logger.warning(
+                    "task_result rejected by BeamCore: task=%s offer=%s worker=%s reason=%s",
+                    short_id(task_id),
+                    short_id(offer_id),
+                    short_id(worker_id),
+                    reason,
+                )
+                return
+            except Exception as exc:
+                last_error = exc
+                if attempt >= RESULT_FORWARD_MAX_ATTEMPTS:
+                    break
+                delay = min(
+                    RESULT_FORWARD_RETRY_MAX_SECONDS,
+                    RESULT_FORWARD_RETRY_BASE_SECONDS * (2 ** (attempt - 1)),
+                )
+                logger.info(
+                    "task_result forward retry: task=%s offer=%s worker=%s attempt=%s/%s delay_s=%.3f error=%s",
+                    short_id(task_id),
+                    short_id(offer_id),
+                    short_id(worker_id),
+                    attempt + 1,
+                    RESULT_FORWARD_MAX_ATTEMPTS,
+                    delay,
+                    type(exc).__name__,
+                )
+                if delay > 0:
+                    await asyncio.sleep(delay)
+        logger.error(
+            "task_result forward exhausted: task=%s offer=%s worker=%s error=%s",
+            short_id(task_id),
+            short_id(offer_id),
+            short_id(worker_id),
+            last_error,
+        )
+
     async def _relay_task_result(self, worker_id: str, msg: dict) -> None:
-        started = time.monotonic()
-        failed = False
-        if self._upstream is None:
+        task_id = msg.get("task_id")
+        offer_id = msg.get("offer_id") or task_id
+        if not task_id or not offer_id:
             logger.warning(
-                "worker relay blocked: no beamcore upstream worker=%s type=task_result task=%s offer=%s",
+                "dropping task_result missing task_id/offer_id from worker=%s",
                 short_id(worker_id),
-                short_id(msg.get("task_id")),
-                short_id(msg.get("offer_id") or msg.get("task_id")),
             )
             await self._send_to_worker(
                 worker_id,
                 {
                     "type": "task_result_ack",
-                    "task_id": msg.get("task_id"),
-                    "offer_id": msg.get("offer_id"),
+                    "task_id": task_id,
+                    "offer_id": offer_id,
+                    "received": False,
+                    "completed": False,
+                    "reason": "missing_task_or_offer_id",
+                },
+            )
+            return
+
+        if self._upstream is None:
+            logger.warning(
+                "worker relay blocked: no beamcore upstream worker=%s type=task_result task=%s offer=%s",
+                short_id(worker_id),
+                short_id(task_id),
+                short_id(offer_id),
+            )
+            await self._send_to_worker(
+                worker_id,
+                {
+                    "type": "task_result_ack",
+                    "task_id": task_id,
+                    "offer_id": offer_id,
                     "received": False,
                     "completed": False,
                     "reason": "beamcore_unavailable",
                 },
             )
             return
-        try:
-            task_id = msg.get("task_id")
-            offer_id = msg.get("offer_id") or task_id
-            if not task_id or not offer_id:
-                logger.warning("dropping task_result missing task_id/offer_id from worker=%s", worker_id)
-                await self._send_to_worker(
-                    worker_id,
-                    {
-                        "type": "task_result_ack",
-                        "task_id": task_id,
-                        "offer_id": offer_id,
-                        "received": False,
-                        "completed": False,
-                        "reason": "missing_task_or_offer_id",
-                    },
-                )
-                return
-            payload = {
-                "type": "task_result",
+
+        payload = {
+            "type": "task_result",
+            "task_id": task_id,
+            "offer_id": offer_id,
+            "worker_id": worker_id,
+            "success": bool(msg.get("success")),
+        }
+        for key in ("etag", "chunk_hash", "error"):
+            if msg.get(key) is not None:
+                payload[key] = msg[key]
+
+        first_seen = self._remember_result_offer(str(offer_id))
+        if first_seen:
+            self._schedule_result_forward(payload)
+            log_relay(
+                f"worker ws <- recv type=task_result worker={short_id(worker_id)} "
+                f"task={short_id(task_id)} offer={short_id(offer_id)} forwarding=1"
+            )
+        else:
+            logger.info(
+                "duplicate task_result received locally: task=%s offer=%s worker=%s",
+                short_id(task_id),
+                short_id(offer_id),
+                short_id(worker_id),
+            )
+
+        await self._send_to_worker(
+            worker_id,
+            {
+                "type": "task_result_ack",
                 "task_id": task_id,
                 "offer_id": offer_id,
-                "worker_id": worker_id,
-                "success": bool(msg.get("success")),
-            }
-            for key in ("etag", "chunk_hash", "error"):
-                if msg.get(key) is not None:
-                    payload[key] = msg[key]
-            ack = await self._upstream.send_task_result(payload)
-        except Exception as exc:
-            failed = True
-            elapsed_ms = (time.monotonic() - started) * 1000
-            logger.warning(
-                "worker relay -> beamcore failed type=task_result worker=%s task=%s offer=%s "
-                "latency_ms=%.1f err=%s",
-                short_id(worker_id),
-                short_id(msg.get("task_id")),
-                short_id(msg.get("offer_id") or msg.get("task_id")),
-                elapsed_ms,
-                exc,
-            )
-            ack = {
-                "type": "task_result_ack",
-                "task_id": msg.get("task_id"),
-                "offer_id": msg.get("offer_id") or msg.get("task_id"),
-                "received": False,
-                "completed": False,
-                "reason": "beamcore_result_forward_failed",
-            }
-        ack_payload = {
-            **(ack if isinstance(ack, dict) else {}),
-            "type": "task_result_ack",
-            "task_id": msg.get("task_id"),
-            "offer_id": msg.get("offer_id") or msg.get("task_id"),
-        }
-        summary = relay_summary(ack_payload)
-        failed = failed or is_failure_summary(summary)
-        await self._send_to_worker(worker_id, ack_payload)
-        elapsed_ms = (time.monotonic() - started) * 1000
-        defer_relay_log(
-            f"worker ws -> send type=task_result_ack worker={short_id(worker_id)} "
-            f"task={short_id(ack_payload.get('task_id'))} offer={short_id(ack_payload.get('offer_id'))} "
-            f"{summary}",
-            latency_ms=elapsed_ms,
-            force_info=failed,
+                "received": True,
+                "forwarding": first_seen,
+                **({"duplicate": True} if not first_seen else {}),
+            },
         )
+

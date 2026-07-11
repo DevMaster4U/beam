@@ -146,8 +146,8 @@ async def lifespan(app: FastAPI):
         )
     logger.info("=" * 60)
 
-    # WebSocket connection (registration + keepalive + transfer flow) is owned by
-    # SubnetCoreClient. It auto-registers via WS using the config set in
+    # WebSocket/NATS control registration, keepalive, and transfer flow are owned by
+    # SubnetCoreClient. It auto-registers via NATS using the config set in
     # _init_subnet_core_client and obtains an API key via /auth/challenge + /auth/verify.
     if orchestrator.subnet_core_client:
         api_key = orchestrator.subnet_core_client._api_key
@@ -155,14 +155,14 @@ async def lifespan(app: FastAPI):
             logger.info("SubnetCoreClient API key cached in memory (%s...)", api_key[:20])
         else:
             logger.info(
-                "SubnetCoreClient API key: not fetched yet — first orch-gateway websocket connect "
+                "SubnetCoreClient API key: not fetched yet — first NATS control connect "
                 "will run HTTP auth/challenge+verify in the background; set BEAMCORE_API_KEY to skip this step "
             )
     else:
         logger.warning("No subnet_core_client available")
-    logger.info("WebSocket connection handled by SubnetCoreClient")
+    logger.info("NATS control connection handled by SubnetCoreClient")
 
-    # Signal readiness to receive transfers through the orchestrator WS relay.
+    # Signal readiness to receive transfers through BeamCore NATS control.
     if not orchestrator.subnet_core_client:
         logger.warning(
             "SubnetCoreClient unavailable — cannot signal READY to BeamCore "
@@ -171,16 +171,18 @@ async def lifespan(app: FastAPI):
     elif settings.ready:
         try:
             applied = await orchestrator.subnet_core_client.set_ready(True)
+            if not applied and hasattr(orchestrator.subnet_core_client, "sync_ready_if_eligible"):
+                applied = await orchestrator.subnet_core_client.sync_ready_if_eligible()
             if applied:
                 logger.info(
-                    "Signalled ready=True through orch-gateway — orchestrator will receive transfers"
+                    "Signalled ready=True through NATS control — orchestrator will receive transfers"
                 )
             else:
                 logger.info(
-                    "Queued ready=True — it will be applied after orch-gateway registration completes"
+                    "Queued ready=True — it will be applied after NATS registration / workers connect"
                 )
         except Exception as e:
-            logger.warning(f"Failed to set ready=True through orch-gateway: {e}")
+            logger.warning(f"Failed to set ready=True through NATS control: {e}")
     else:
         logger.info(
             "READY is false — orchestrator will NOT receive transfers until READY=true is set"
@@ -200,12 +202,12 @@ async def lifespan(app: FastAPI):
             applied = await orchestrator.subnet_core_client.set_ready(False)
             if applied:
                 logger.info(
-                    "Signalled ready=False through orch-gateway — orchestrator removed from routing"
+                    "Signalled ready=False through NATS control — orchestrator removed from routing"
                 )
             else:
-                logger.info("Queued ready=False while websocket is offline during shutdown")
+                logger.info("Queued ready=False while NATS control is offline during shutdown")
         except Exception as e:
-            logger.warning(f"Failed to set ready=False through orch-gateway during shutdown: {e}")
+            logger.warning(f"Failed to set ready=False through NATS control during shutdown: {e}")
 
     await orchestrator.stop()
     await metrics_collector.stop()

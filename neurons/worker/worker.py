@@ -252,7 +252,7 @@ def resolve_worker_version() -> str:
     try:
         return package_version("beam")
     except PackageNotFoundError:
-        return "0.2.0"
+        return "0.2.1"
 
 
 def parse_strict_semver(value: str) -> Optional[tuple[int, int, int]]:
@@ -1275,9 +1275,6 @@ async def register_worker(client: httpx.AsyncClient, state: WorkerState) -> Dict
     ip = await get_public_ip()
     port = 9000
 
-    # Generate a payment pubkey
-    payment_pubkey = hashlib.sha256(f"payment:{hotkey}".encode()).hexdigest()
-
     # Sign the registration message: "{hotkey}:{ip}:{port}"
     message = f"{hotkey}:{ip}:{port}"
     try:
@@ -1292,7 +1289,6 @@ async def register_worker(client: httpx.AsyncClient, state: WorkerState) -> Dict
         "port": port,
         "claimed_bandwidth_mbps": 100,
         "coldkey": wallet.coldkeypub.ss58_address if wallet.coldkeypub else hotkey,
-        "payment_pubkey": payment_pubkey,
         "signature": signature,
     }
 

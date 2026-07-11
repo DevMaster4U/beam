@@ -657,6 +657,9 @@ class Orchestrator:
             await self.global_gateway_client.stop()
             self.global_gateway_client = None
 
+        if hasattr(self.worker_gateway, "stop"):
+            await self.worker_gateway.stop()
+
         if self.embedded_worker_pool is not None:
             await self.embedded_worker_pool.stop()
             self.embedded_worker_pool = None
@@ -1166,21 +1169,14 @@ class Orchestrator:
                 orchestrator_hotkey=self.hotkey or "unknown",
                 orchestrator_uid=self.our_uid or 0,
                 signer=signer,
-                ws_open_timeout=self.settings.orch_ws_open_timeout,
-                ws_close_timeout=self.settings.orch_ws_close_timeout,
-                ws_ping_interval=self.settings.orch_ws_ping_interval,
-                ws_ping_timeout=self.settings.orch_ws_ping_timeout,
-                ws_request_timeout=self.settings.orch_ws_request_timeout,
-                task_accept_timeout=self.settings.orch_task_accept_timeout,
-                task_result_timeout=self.settings.orch_task_result_timeout,
             )
             logger.info(
-                "SubnetCoreClient initialized: http=%s ws=%s",
+                "SubnetCoreClient initialized: http=%s nats=%s",
                 self.settings.core_server_url,
                 self.settings.orch_gateway_url,
             )
 
-            # WS push handlers. BeamCore task offer batches drive worker routing.
+            # NATS control task offer batches drive worker routing.
             self.subnet_core_client.set_worker_update_handler(self._worker_mgr.handle_worker_update)
 
             # Wire worker gateway upstream (BeamCore relay for accept/result).
@@ -1262,8 +1258,8 @@ class Orchestrator:
                         orchestrator_hotkey=self.hotkey or "unknown",
                         control_secret=control_secret,
                         api_key_provider=_control_api_key,
-                        ping_interval=self.settings.orch_ws_ping_interval,
-                        ping_timeout=self.settings.orch_ws_ping_timeout,
+                        ping_interval=30.0,
+                        ping_timeout=45.0,
                     )
                     pool_control_label = control_base
 
