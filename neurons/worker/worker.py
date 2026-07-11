@@ -1104,9 +1104,6 @@ def build_transfer_context(task: dict) -> tuple[Optional[dict], Optional[str]]:
     if minimum_worker_version and not worker_version_satisfies(minimum_worker_version):
         return None, "unsupported_worker_version"
     signed_url_flow = str(task.get("signed_url_flow") or "").strip()
-    if signed_url_flow == "signed_url_v1" and is_object_storage_presigned_url(dest_url):
-        if not (dest_headers.get("Content-MD5") or dest_headers.get("content-md5")):
-            return None, "missing_content_md5"
     try:
         parsed_range = parse_offer_range(source_headers)
     except ValueError as exc:
