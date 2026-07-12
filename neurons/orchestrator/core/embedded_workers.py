@@ -1,8 +1,10 @@
 """
-In-process embedded workers for WORKER_GATEWAY_MODE=embedded.
+In-process embedded workers for WORKER_GATEWAY_MODE=embedded|in_process.
 
 Workers register with BeamCore over HTTP at orchestrator startup. Task batches
-from BeamCore are executed locally (no worker WebSocket gateway hop).
+from BeamCore are executed locally. In in_process mode, a WorkerGateway may be
+attached for overflow: prefer a fresh-IP external worker before reusing an
+embedded worker IP within the same batch.
 """
 
 from __future__ import annotations
@@ -561,6 +563,78 @@ class EmbeddedWorkerPool:
             detail=f"reason={reason}",
         )
 
+    def _select_embedded_unused_ip(
+        self,
+        batch_used_ips: set[str],
+        batch_assigned_counts: dict[str, int],
+    ) -> Optional[EmbeddedWorker]:
+        """Pick embedded worker with capacity on an IP not yet used in this batch."""
+        workers_pool = self.workers
+        if not workers_pool:
+            return None
+        pool_size = len(workers_pool)
+        start = self._cursor % pool_size
+        for offset in range(pool_size):
+            idx = (start + offset) % pool_size
+            worker = workers_pool[idx]
+            if not worker.has_capacity:
+                continue
+            assigned = batch_assigned_counts.get(worker.worker_id, 0)
+            slots_left = worker.max_concurrent_tasks - worker.active_count - assigned
+            if slots_left <= 0 or assigned > 0:
+                continue
+            ip = worker.ip.strip()
+            if ip and ip in batch_used_ips:
+                continue
+            self._cursor = (idx + 1) % pool_size
+            return worker
+        return None
+
+    async def _dispatch_external(
+        self,
+        *,
+        offer: dict,
+        task_id: str,
+        offer_id: str,
+        batch_id: str,
+        batch_used_ips: set[str],
+        batch_gateway_assigned: set[str],
+        allow_used_ip: bool,
+    ) -> bool:
+        gateway = self._worker_gateway
+        if gateway is None:
+            return False
+        external_id = gateway.select_worker_round_robin(
+            batch_used_ips=batch_used_ips,
+            batch_assigned_workers=batch_gateway_assigned,
+            allow_used_ip=allow_used_ip,
+            exclude_worker_ids={w.worker_id for w in self.workers},
+        )
+        if not external_id:
+            return False
+        if await gateway.deliver_task_offer(external_id, offer):
+            batch_gateway_assigned.add(external_id)
+            profile = gateway._get_profile(external_id)
+            if profile.ip:
+                batch_used_ips.add(profile.ip)
+            logger.info(
+                "%s external_dispatch task=%s offer=%s worker=%s ip=%s",
+                _WORKERS_LOG,
+                short_id(task_id),
+                short_id(offer_id),
+                short_id(external_id),
+                profile.ip or "?",
+            )
+            return True
+        logger.warning(
+            "External worker dispatch failed: batch=%s task=%s offer=%s worker=%s",
+            short_id(batch_id, 12),
+            short_id(task_id),
+            short_id(offer_id),
+            short_id(external_id),
+        )
+        return False
+
     async def deliver_task_offer_batch(self, batch_id: str, offers: list[dict]) -> tuple[int, int]:
         delivered = 0
         failed = 0
@@ -568,6 +642,7 @@ class EmbeddedWorkerPool:
         batch_assigned_counts: dict[str, int] = defaultdict(int)
         batch_gateway_assigned: set[str] = set()
         transfer = get_transfer_module()
+        has_external = self._worker_gateway is not None
 
         for offer in offers:
             if not isinstance(offer, dict):
@@ -592,36 +667,43 @@ class EmbeddedWorkerPool:
             else:
                 path = "standard"
 
-            worker = self._select_worker(batch_used_ips, batch_assigned_counts)
-            if worker is None:
-                gateway = self._worker_gateway
-                if gateway is not None:
-                    external_id = gateway.select_worker_round_robin(
+            # in_process hybrid: spread across IPs — try fresh-IP external before
+            # reusing an embedded worker that shares the orch public IP.
+            worker: Optional[EmbeddedWorker] = None
+            if has_external:
+                worker = self._select_embedded_unused_ip(
+                    batch_used_ips, batch_assigned_counts
+                )
+                if worker is None:
+                    if await self._dispatch_external(
+                        offer=offer,
+                        task_id=task_id,
+                        offer_id=offer_id,
+                        batch_id=batch_id,
                         batch_used_ips=batch_used_ips,
-                        batch_assigned_workers=batch_gateway_assigned,
-                    )
-                    if external_id:
-                        if await gateway.deliver_task_offer(external_id, offer):
-                            delivered += 1
-                            batch_gateway_assigned.add(external_id)
-                            profile = gateway._get_profile(external_id)
-                            if profile.ip:
-                                batch_used_ips.add(profile.ip)
-                            logger.info(
-                                "%s external_dispatch task=%s offer=%s worker=%s",
-                                _WORKERS_LOG,
-                                short_id(task_id),
-                                short_id(offer_id),
-                                short_id(external_id),
-                            )
-                            continue
-                        logger.warning(
-                            "External worker dispatch failed: batch=%s task=%s offer=%s worker=%s",
-                            short_id(batch_id, 12),
-                            short_id(task_id),
-                            short_id(offer_id),
-                            short_id(external_id),
-                        )
+                        batch_gateway_assigned=batch_gateway_assigned,
+                        allow_used_ip=False,
+                    ):
+                        delivered += 1
+                        continue
+                if worker is None:
+                    worker = self._select_worker(batch_used_ips, batch_assigned_counts)
+                if worker is None:
+                    if await self._dispatch_external(
+                        offer=offer,
+                        task_id=task_id,
+                        offer_id=offer_id,
+                        batch_id=batch_id,
+                        batch_used_ips=batch_used_ips,
+                        batch_gateway_assigned=batch_gateway_assigned,
+                        allow_used_ip=True,
+                    ):
+                        delivered += 1
+                        continue
+            else:
+                worker = self._select_worker(batch_used_ips, batch_assigned_counts)
+
+            if worker is None:
                 reason = "no_worker_capacity"
                 logger.warning(
                     "No worker capacity for batch=%s task=%s offer=%s",

@@ -225,8 +225,16 @@ class WorkerGateway:
         self,
         batch_used_ips: Optional[set[str]] = None,
         batch_assigned_workers: Optional[set[str]] = None,
+        *,
+        allow_used_ip: bool = True,
+        exclude_worker_ids: Optional[set[str]] = None,
     ) -> Optional[str]:
-        """Pick the next worker with capacity, matching global-gateway batch IP spread."""
+        """Pick the next worker with capacity, matching global-gateway batch IP spread.
+
+        When ``allow_used_ip`` is False, never pick a worker whose IP is already in
+        ``batch_used_ips`` (used by in_process hybrid overflow).
+        ``exclude_worker_ids`` skips workers already represented by the embedded pool.
+        """
         connected = self._ordered_connected_worker_ids()
         if not connected:
             return None
@@ -234,8 +242,11 @@ class WorkerGateway:
         pool_size = len(connected)
         start = self._cursor % pool_size
         in_batch = batch_used_ips is not None or batch_assigned_workers is not None
+        excluded = exclude_worker_ids or set()
 
-        def _eligible(worker_id: str, *, allow_used_ip: bool) -> bool:
+        def _eligible(worker_id: str, *, allow_ip_reuse: bool) -> bool:
+            if worker_id in excluded:
+                return False
             profile = self._get_profile(worker_id)
             if not profile.has_capacity:
                 return False
@@ -243,7 +254,7 @@ class WorkerGateway:
                 return False
             ip = profile.ip.strip()
             if (
-                not allow_used_ip
+                not allow_ip_reuse
                 and batch_used_ips is not None
                 and ip
                 and ip in batch_used_ips
@@ -251,11 +262,11 @@ class WorkerGateway:
                 return False
             return True
 
-        def _pick(allow_used_ip: bool) -> Optional[str]:
+        def _pick(allow_ip_reuse: bool) -> Optional[str]:
             for offset in range(pool_size):
                 idx = (start + offset) % pool_size
                 worker_id = connected[idx]
-                if not _eligible(worker_id, allow_used_ip=allow_used_ip):
+                if not _eligible(worker_id, allow_ip_reuse=allow_ip_reuse):
                     continue
                 self._cursor = (idx + 1) % pool_size
                 profile = self._get_profile(worker_id)
@@ -274,12 +285,14 @@ class WorkerGateway:
             return None
 
         if in_batch:
-            worker_id = _pick(allow_used_ip=False)
+            worker_id = _pick(allow_ip_reuse=False)
             if worker_id:
                 return worker_id
-            return _pick(allow_used_ip=True)
+            if allow_used_ip:
+                return _pick(allow_ip_reuse=True)
+            return None
 
-        return _pick(allow_used_ip=True)
+        return _pick(allow_ip_reuse=True)
 
     def get_workers_round_robin(self, n: int = 1) -> list[str]:
         """Return up to n worker_ids with batch-aware round-robin (IP + capacity)."""
