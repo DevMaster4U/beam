@@ -348,6 +348,8 @@ class EmbeddedWorkerPool:
         self._side_pool: Optional[_CoroutinePool] = None
         self._task_handles: Set[asyncio.Task] = set()
         self._worker_gateway: Optional[Any] = None
+        # Cross-batch IP spread for in_process hybrid (BeamCore often sends offers=1).
+        self._hybrid_used_ips: set[str] = set()
 
     @property
     def worker_count(self) -> int:
@@ -356,6 +358,22 @@ class EmbeddedWorkerPool:
     def set_worker_gateway(self, gateway: Any) -> None:
         """Overflow task offers to external workers connected on orchestrator WS."""
         self._worker_gateway = gateway
+        if gateway is None:
+            self._hybrid_used_ips.clear()
+
+    def _spread_used_ips(self, batch_used_ips: set[str]) -> set[str]:
+        """IPs already used in this batch plus recent cross-batch hybrid assignments."""
+        if self._worker_gateway is None:
+            return batch_used_ips
+        return batch_used_ips | self._hybrid_used_ips
+
+    def _mark_spread_ip(self, ip: str) -> None:
+        clean = ip.strip()
+        if clean and self._worker_gateway is not None:
+            self._hybrid_used_ips.add(clean)
+
+    def _clear_hybrid_spread_ips(self) -> None:
+        self._hybrid_used_ips.clear()
 
     async def start(self) -> None:
         transfer = get_transfer_module()
@@ -617,6 +635,7 @@ class EmbeddedWorkerPool:
             profile = gateway._get_profile(external_id)
             if profile.ip:
                 batch_used_ips.add(profile.ip)
+                self._mark_spread_ip(profile.ip)
             logger.info(
                 "%s external_dispatch task=%s offer=%s worker=%s ip=%s",
                 _WORKERS_LOG,
@@ -667,12 +686,13 @@ class EmbeddedWorkerPool:
             else:
                 path = "standard"
 
-            # in_process hybrid: spread across IPs — try fresh-IP external before
-            # reusing an embedded worker that shares the orch public IP.
+            # in_process hybrid: spread across IPs across batches (BeamCore often sends
+            # offers=1). Prefer fresh-IP embedded, then fresh-IP external, then reuse.
             worker: Optional[EmbeddedWorker] = None
             if has_external:
+                spread_ips = self._spread_used_ips(batch_used_ips)
                 worker = self._select_embedded_unused_ip(
-                    batch_used_ips, batch_assigned_counts
+                    spread_ips, batch_assigned_counts
                 )
                 if worker is None:
                     if await self._dispatch_external(
@@ -680,13 +700,15 @@ class EmbeddedWorkerPool:
                         task_id=task_id,
                         offer_id=offer_id,
                         batch_id=batch_id,
-                        batch_used_ips=batch_used_ips,
+                        batch_used_ips=spread_ips,
                         batch_gateway_assigned=batch_gateway_assigned,
                         allow_used_ip=False,
                     ):
                         delivered += 1
                         continue
-                if worker is None:
+                    # All connected IPs seen recently — reset and allow reuse.
+                    self._clear_hybrid_spread_ips()
+                    spread_ips = batch_used_ips
                     worker = self._select_worker(batch_used_ips, batch_assigned_counts)
                 if worker is None:
                     if await self._dispatch_external(
@@ -725,6 +747,7 @@ class EmbeddedWorkerPool:
             batch_assigned_counts[worker.worker_id] += 1
             if worker.ip:
                 batch_used_ips.add(worker.ip)
+                self._mark_spread_ip(worker.ip)
 
             _log_embedded_task_offer(
                 task_id=str(task_id),
