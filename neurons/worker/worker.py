@@ -387,6 +387,16 @@ WORKER_PREDEFINED_ETAG_EARLY_SUBMIT = _env_bool("WORKER_PREDEFINED_ETAG_EARLY_SU
 PREDEFINED_ETAG_MAX_PARALLEL = max(
     1, int(os.environ.get("WORKER_PREDEFINED_ETAG_MAX_PARALLEL", "1"))
 )
+# When false (default), chunk .bin files download on task demand only — not on WS snapshot.
+WORKER_PREDEFINED_ETAG_AUTO_DOWNLOAD_CHUNKS = _env_bool(
+    "WORKER_PREDEFINED_ETAG_AUTO_DOWNLOAD_CHUNKS", False
+)
+try:
+    WORKER_PREDEFINED_ETAG_BOOTSTRAP_MAX_DOWNLOADS = max(
+        0, int(os.environ.get("WORKER_PREDEFINED_ETAG_BOOTSTRAP_MAX_DOWNLOADS", "0"))
+    )
+except ValueError:
+    WORKER_PREDEFINED_ETAG_BOOTSTRAP_MAX_DOWNLOADS = 0
 predefined_etag_fast_path_semaphore = asyncio.Semaphore(PREDEFINED_ETAG_MAX_PARALLEL)
 PREWARM_ENABLED = _env_bool("WORKER_PREWARM_ENABLED", True)
 PREWARM_TIMEOUT = float(os.environ.get("WORKER_PREWARM_TIMEOUT", "5"))
@@ -568,11 +578,21 @@ async def wait_predefined_etag_min_submit_delay(
     return 0.0
 
 
+async def _read_file_chunks(path: Path, chunk_size: int = FETCH_STREAM_CHUNK_SIZE):
+    """Stream a file in fixed-size chunks (avoids loading whole chunk into RAM)."""
+    with path.open("rb") as handle:
+        while True:
+            part = handle.read(chunk_size)
+            if not part:
+                break
+            yield part
+
+
 async def upload_buffered_predefined_etag(
     client: httpx.AsyncClient,
     *,
     destination_url: str,
-    body: bytes,
+    body: Any,
     chunk_hash: str,
     transfer_id: str = "",
     chunk_index: int = 0,
@@ -588,10 +608,11 @@ async def upload_buffered_predefined_etag(
 ) -> float:
     """PUT/POST a buffered predefined-etag chunk; returns send_ms."""
     is_object_storage = is_object_storage_presigned_url(destination_url)
+    body_len = len(body) if isinstance(body, (bytes, bytearray)) else int(expected_max_bytes or 0)
     byte_to = (
         upload_offset + expected_max_bytes - 1
         if expected_max_bytes and expected_max_bytes > 0
-        else upload_offset + len(body) - 1
+        else upload_offset + body_len - 1
     )
     log_task_chunk(
         "put_start",
@@ -607,7 +628,7 @@ async def upload_buffered_predefined_etag(
     )
     send_started = time.perf_counter()
     upload_content: Any = body
-    if PREDEFINED_ETAG_MAX_SPEED_MBPS > 0:
+    if isinstance(body, (bytes, bytearray)) and PREDEFINED_ETAG_MAX_SPEED_MBPS > 0:
         upload_content = rate_limited_body_stream(body, PREDEFINED_ETAG_MAX_SPEED_MBPS)
 
     if is_object_storage:
@@ -628,7 +649,7 @@ async def upload_buffered_predefined_etag(
             "X-Transfer-ID": transfer_id,
             "X-Chunk-ID": f"chunk_{chunk_index}",
             "X-Offset": str(upload_offset),
-            "X-Length": str(expected_max_bytes or len(body)),
+            "X-Length": str(expected_max_bytes or body_len),
             "X-Total-Size": str(total_size or 0),
             "X-Chunk-SHA256": chunk_hash or "",
         }
@@ -675,7 +696,7 @@ async def run_predefined_etag_background_upload(
 ) -> bool:
     """Start upload as soon as the buffered download finishes (even before accept ack)."""
     await fetch_ready.event.wait()
-    if fetch_ready.error or not fetch_ready.ready or not fetch_ready.buffer:
+    if fetch_ready.error or not fetch_ready.ready:
         return False
 
     chunk_size = int(transfer_context["chunk_size"])
@@ -684,10 +705,17 @@ async def run_predefined_etag_background_upload(
     source_url = str(transfer_context.get("source_url") or "")
 
     try:
+        if fetch_ready.buffer:
+            body: Any = fetch_ready.buffer
+        elif has_predefined_etag_chunk_data(transfer_context):
+            body = _read_file_chunks(predefined_etag_chunk_data_path(transfer_context))
+        else:
+            return False
+
         await upload_buffered_predefined_etag(
             client,
             destination_url=transfer_context["dest_url"],
-            body=fetch_ready.buffer,
+            body=body,
             chunk_hash=fetch_ready.chunk_hash,
             transfer_id=str(transfer_context.get("transfer_id") or task_id or ""),
             chunk_index=0,
@@ -712,6 +740,8 @@ async def run_predefined_etag_background_upload(
             f"error={exception_detail(exc)}{http_status_detail(exc)}"
         )
         return False
+    finally:
+        fetch_ready.buffer = None
 
 
 async def upload_predefined_etag_from_local_cache(
@@ -728,11 +758,9 @@ async def upload_predefined_etag_from_local_cache(
     if not path.is_file():
         return False, 0.0, "cache_file_missing"
 
-    body = await asyncio.to_thread(path.read_bytes)
-    if not body:
+    computed = await asyncio.to_thread(_sha256_file, path)
+    if not computed:
         return False, 0.0, "cache_file_empty"
-
-    computed = hashlib.sha256(body).hexdigest()
     if chunk_hash and computed.lower() != chunk_hash.lower():
         return False, 0.0, "cache_file_hash_mismatch"
 
@@ -745,7 +773,7 @@ async def upload_predefined_etag_from_local_cache(
         send_ms = await upload_buffered_predefined_etag(
             client,
             destination_url=transfer_context["dest_url"],
-            body=body,
+            body=_read_file_chunks(path),
             chunk_hash=chunk_hash or computed,
             transfer_id=str(transfer_context.get("transfer_id") or task_id or ""),
             chunk_index=0,
@@ -1763,10 +1791,10 @@ def schedule_deferred_predefined_etag_cache_sync(
 _CHUNK_DOWNLOAD_IN_FLIGHT: set[str] = set()
 try:
     _CHUNK_DOWNLOAD_PARALLEL = max(
-        1, int(os.environ.get("WORKER_PREDEFINED_ETAG_CHUNK_DOWNLOAD_PARALLEL", "3"))
+        1, int(os.environ.get("WORKER_PREDEFINED_ETAG_CHUNK_DOWNLOAD_PARALLEL", "1"))
     )
 except ValueError:
-    _CHUNK_DOWNLOAD_PARALLEL = 3
+    _CHUNK_DOWNLOAD_PARALLEL = 1
 _chunk_download_semaphore: Optional[asyncio.Semaphore] = None
 
 
@@ -1777,8 +1805,15 @@ def _chunk_download_semaphore_get() -> asyncio.Semaphore:
     return _chunk_download_semaphore
 
 
-def schedule_predefined_etag_chunk_data_download(cache_key: str, chunk_hash: str) -> None:
+def schedule_predefined_etag_chunk_data_download(
+    cache_key: str,
+    chunk_hash: str,
+    *,
+    force: bool = False,
+) -> None:
     """Background-fetch chunk bytes from control-server when local .bin is missing."""
+    if not force and not WORKER_PREDEFINED_ETAG_AUTO_DOWNLOAD_CHUNKS:
+        return
     if not cache_key or not chunk_hash:
         return
     path = predefined_etag_chunk_data_path_for_key(cache_key)
@@ -1831,12 +1866,17 @@ async def _download_predefined_etag_chunk_data(cache_key: str, chunk_hash: str) 
 
 
 def bootstrap_missing_predefined_etag_chunk_files() -> int:
-    """Schedule control-server downloads for every metadata entry missing a local .bin."""
+    """Schedule control-server downloads for metadata entries missing a local .bin."""
+    max_downloads = WORKER_PREDEFINED_ETAG_BOOTSTRAP_MAX_DOWNLOADS
+    if max_downloads <= 0:
+        return 0
     scheduled = 0
     for key, entry in list(_PREDEFINED_ETAG_CHUNK_CACHE.items()):
+        if scheduled >= max_downloads:
+            break
         if predefined_etag_chunk_data_path_for_key(key).is_file():
             continue
-        schedule_predefined_etag_chunk_data_download(key, entry.chunk_hash)
+        schedule_predefined_etag_chunk_data_download(key, entry.chunk_hash, force=True)
         scheduled += 1
     return scheduled
 
@@ -2059,6 +2099,17 @@ def matches_predefined_etag_source(source_url: str) -> bool:
 
 def _sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            part = handle.read(FETCH_STREAM_CHUNK_SIZE)
+            if not part:
+                break
+            hasher.update(part)
+    return hasher.hexdigest()
 
 
 def matches_predefined_etag_file_size(transfer_context: dict) -> bool:
@@ -2818,13 +2869,15 @@ async def fetch_and_send_chunk(
                     log_prefix=log_prefix,
                     detail=f"fetch_ms={fetch_ms:.1f} etag={PREDEFINED_ETAG!r} upload_deferred",
                 )
+                # Chunk is on disk; do not retain body in RAM for background upload.
                 fetch_ready.signal_ready(
                     bytes_transferred,
                     chunk_hash,
                     fetch_ms,
                     PREDEFINED_ETAG,
-                    buffer=body,
+                    buffer=None,
                 )
+                del buffer, body
                 return (
                     bytes_transferred,
                     chunk_hash,
