@@ -91,6 +91,8 @@ class MinerConnectionHub:
         }
         if "chunk_index" in entry:
             broadcast["chunk_index"] = entry["chunk_index"]
+        if "chunk_size" in entry:
+            broadcast["chunk_size"] = entry["chunk_size"]
         if entry.get("has_chunk_data"):
             broadcast["has_chunk_data"] = True
         await self.broadcast(broadcast, exclude_miner=miner_id)

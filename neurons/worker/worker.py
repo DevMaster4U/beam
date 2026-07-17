@@ -47,7 +47,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 import httpx
@@ -355,6 +355,7 @@ except ValueError:
 
 PREDEFINED_ETAG_CACHE_FILENAME = "predefined_etag_chunks.json"
 PREDEFINED_ETAG_CHUNK_DATA_DIRNAME = "predefined_etag_chunk_data"
+PREDEFINED_ETAG_RANGE_DATA_DIRNAME = "predefined_etag_range_data"
 try:
     CONTROL_SERVER_CACHE_SYNC_DELAY_SEC = max(
         0.0,
@@ -380,9 +381,21 @@ def _env_bool(name: str, default: bool) -> bool:
     return str(raw).strip().lower() in ("1", "true", "yes")
 
 
-WS_TASK_ACCEPT_ACK_TIMEOUT = float(os.environ.get("WORKER_TASK_ACCEPT_ACK_TIMEOUT", "8.0"))
 WS_TASK_RESULT_ACK_TIMEOUT = float(os.environ.get("WORKER_TASK_RESULT_ACK_TIMEOUT", "45.0"))
-WORKER_EARLY_TRANSFER = _env_bool("WORKER_EARLY_TRANSFER", True)
+WS_TASK_RESULT_SEND_ATTEMPTS = max(3, int(os.environ.get("WORKER_TASK_RESULT_SEND_ATTEMPTS", "8")))
+WS_TASK_RESULT_RECONNECT_WAIT_SECONDS = max(
+    0.0, float(os.environ.get("WORKER_TASK_RESULT_RECONNECT_WAIT_SECONDS", "2.0"))
+)
+TASK_RESULT_ACK_STATUSES = {
+    "owned_processing",
+    "completed",
+    "failed",
+    "late_superseded",
+    "late_expired",
+    "retry",
+    "rejected",
+}
+TASK_RESULT_TERMINAL_STATUSES = TASK_RESULT_ACK_STATUSES - {"retry"}
 WORKER_PREDEFINED_ETAG_EARLY_SUBMIT = _env_bool("WORKER_PREDEFINED_ETAG_EARLY_SUBMIT", True)
 PREDEFINED_ETAG_MAX_PARALLEL = max(
     1, int(os.environ.get("WORKER_PREDEFINED_ETAG_MAX_PARALLEL", "1"))
@@ -429,7 +442,6 @@ class WorkerState:
     ws_connected: bool = False
     ws_reconnect_attempts: int = 0
     use_websocket: bool = True
-    pending_task_accepts: Dict[str, asyncio.Future] = field(default_factory=dict)
     pending_task_results: Dict[str, asyncio.Future] = field(default_factory=dict)
     active_ws_task_ids: set[str] = field(default_factory=set)
     ws_task_handles: set[asyncio.Task] = field(default_factory=set)
@@ -504,10 +516,9 @@ def predefined_etag_bandwidth_byte_count(
         return len(body)
     if has_predefined_etag_chunk_data(transfer_context):
         try:
-            size = predefined_etag_chunk_data_path(transfer_context).stat().st_size
-            if size > 0:
-                return int(size)
-        except OSError:
+            _, start, end = _transfer_byte_range(transfer_context)
+            return int(end - start + 1)
+        except (KeyError, TypeError, ValueError, OSError):
             pass
     return PREDEFINED_ETAG_CHUNK_SIZE_BYTES
 
@@ -694,7 +705,7 @@ async def run_predefined_etag_background_upload(
     offer_id: str = None,
     log_prefix: str = "[Worker]",
 ) -> bool:
-    """Start upload as soon as the buffered download finishes (even before accept ack)."""
+    """Start upload as soon as the buffered download finishes."""
     await fetch_ready.event.wait()
     if fetch_ready.error or not fetch_ready.ready:
         return False
@@ -708,7 +719,7 @@ async def run_predefined_etag_background_upload(
         if fetch_ready.buffer:
             body: Any = fetch_ready.buffer
         elif has_predefined_etag_chunk_data(transfer_context):
-            body = _read_file_chunks(predefined_etag_chunk_data_path(transfer_context))
+            body = _iter_predefined_etag_range_chunks(transfer_context)
         else:
             return False
 
@@ -753,14 +764,15 @@ async def upload_predefined_etag_from_local_cache(
     offer_id: str = None,
     log_prefix: str = "[Worker]",
 ) -> tuple[bool, float, Optional[str]]:
-    """Upload a cached chunk file to dest after task_accept (rate-limited by env max speed)."""
-    path = predefined_etag_chunk_data_path(transfer_context)
-    if not path.is_file():
+    """Upload a cached continuous range slice to dest (rate-limited by env max speed)."""
+    if not has_predefined_etag_chunk_data(transfer_context):
         return False, 0.0, "cache_file_missing"
 
-    computed = await asyncio.to_thread(_sha256_file, path)
-    if not computed:
+    data = await asyncio.to_thread(read_predefined_etag_range_bytes, transfer_context)
+    if not data:
         return False, 0.0, "cache_file_empty"
+
+    computed = hashlib.sha256(data).hexdigest()
     if chunk_hash and computed.lower() != chunk_hash.lower():
         return False, 0.0, "cache_file_hash_mismatch"
 
@@ -773,7 +785,7 @@ async def upload_predefined_etag_from_local_cache(
         send_ms = await upload_buffered_predefined_etag(
             client,
             destination_url=transfer_context["dest_url"],
-            body=_read_file_chunks(path),
+            body=_iter_predefined_etag_range_chunks(transfer_context),
             chunk_hash=chunk_hash or computed,
             transfer_id=str(transfer_context.get("transfer_id") or task_id or ""),
             chunk_index=0,
@@ -803,74 +815,12 @@ async def ensure_predefined_etag_chunk_data_local(
     return has_predefined_etag_chunk_data(transfer_context)
 
 
-async def wait_accept_and_buffered_fetch(
-    accept_coro,
-    fetch_ready: FetchReadyState,
-    *,
-    accept_timeout: float,
-    fetch_timeout: float,
-) -> tuple[bool, Optional[str]]:
-    """Wait for accept ack and buffered download+hash; fail fast on reject."""
-    accept_task = asyncio.create_task(asyncio.wait_for(accept_coro, timeout=accept_timeout))
-    fetch_task = asyncio.create_task(
-        asyncio.wait_for(fetch_ready.event.wait(), timeout=fetch_timeout)
-    )
-    pending = {accept_task, fetch_task}
-
-    try:
-        while pending:
-            done, pending = await asyncio.wait(
-                pending,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if accept_task in done:
-                try:
-                    accepted = accept_task.result()
-                except asyncio.TimeoutError:
-                    fetch_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await fetch_task
-                    return False, f"task_accept_ack timeout ({accept_timeout:.0f}s)"
-                except Exception as exc:
-                    fetch_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await fetch_task
-                    return False, str(exc)
-                if not accepted:
-                    fetch_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await fetch_task
-                    return False, "task_accept rejected"
-
-            if fetch_task in done:
-                try:
-                    fetch_task.result()
-                except asyncio.TimeoutError:
-                    accept_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await accept_task
-                    return False, f"download timeout ({fetch_timeout:.0f}s)"
-                except Exception as exc:
-                    accept_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await accept_task
-                    return False, str(exc)
-
-        if fetch_ready.error or not fetch_ready.ready:
-            return True, fetch_ready.error or "download failed"
-        return True, None
-    except asyncio.CancelledError:
-        accept_task.cancel()
-        fetch_task.cancel()
-        raise
-
-
 @dataclass
 class TaskSummaryAck:
-    """BeamCore task_result_ack fields used for payment gating."""
+    """BeamCore task_result_ack ownership fields used by the worker runtime."""
 
     received: bool = False
-    completed: bool = False
+    status: Optional[str] = None
     reason: Optional[str] = None
 
 
@@ -1611,8 +1561,27 @@ def _predefined_etag_chunk_data_dir() -> Path:
     return _predefined_etag_cache_path().parent / PREDEFINED_ETAG_CHUNK_DATA_DIRNAME
 
 
+def _predefined_etag_range_data_dir() -> Path:
+    return _predefined_etag_cache_path().parent / PREDEFINED_ETAG_RANGE_DATA_DIRNAME
+
+
+_worker_range_store = None
+
+
+def get_worker_range_store():
+    """Lazy worker-local continuous byte-range store."""
+    global _worker_range_store
+    if _worker_range_store is None:
+        from neurons.common.byte_range_store import ByteRangeStore
+
+        root = _predefined_etag_range_data_dir()
+        root.mkdir(parents=True, exist_ok=True)
+        _worker_range_store = ByteRangeStore(root)
+    return _worker_range_store
+
+
 def predefined_etag_chunk_data_path_for_key(cache_key: str) -> Path:
-    """Stable on-disk path for one chunk's raw bytes (key = source|start|end)."""
+    """Legacy per-key .bin path (migration fallback only)."""
     digest = hashlib.sha256(str(cache_key).encode()).hexdigest()
     return _predefined_etag_chunk_data_dir() / f"{digest}.bin"
 
@@ -1623,18 +1592,61 @@ def predefined_etag_chunk_data_path(transfer_context: dict) -> Path:
     )
 
 
+def _transfer_byte_range(transfer_context: dict) -> tuple[str, int, int]:
+    source = normalized_capability_url(str(transfer_context.get("source_url") or ""))
+    range_start = int(transfer_context["range_start"])
+    range_end = int(transfer_context["range_end"])
+    return source, range_start, range_end
+
+
 def has_predefined_etag_chunk_data(transfer_context: dict) -> bool:
-    return predefined_etag_chunk_data_path(transfer_context).is_file()
+    source, start, end = _transfer_byte_range(transfer_context)
+    if source and get_worker_range_store().covers(source, start, end):
+        return True
+    # Legacy fallback during migration.
+    path = predefined_etag_chunk_data_path(transfer_context)
+    return path.is_file() and path.stat().st_size > 0
 
 
 def save_predefined_etag_chunk_data(transfer_context: dict, data: bytes) -> Optional[Path]:
-    """Persist fetched chunk bytes locally (does not block control-server sync)."""
+    """Persist fetched chunk bytes into the continuous range store."""
     if not data or not predefined_etag_transfer_eligible(transfer_context):
         return None
+    source, start, end = _transfer_byte_range(transfer_context)
+    if not source:
+        return None
+    segment = get_worker_range_store().ingest(source, start, end, data)
+    return get_worker_range_store().segment_path(source, segment)
+
+
+async def _iter_predefined_etag_range_chunks(transfer_context: dict):
+    """Async-iterate cached range bytes (continuous store or legacy file)."""
+    source, start, end = _transfer_byte_range(transfer_context)
+    store = get_worker_range_store()
+    if source and store.covers(source, start, end):
+        iterator = store.iter_slice(
+            source, start, end, chunk_size=FETCH_STREAM_CHUNK_SIZE
+        )
+        if iterator is not None:
+            for part in iterator:
+                yield part
+            return
     path = predefined_etag_chunk_data_path(transfer_context)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(data)
-    return path
+    if path.is_file() and path.stat().st_size > 0:
+        async for part in _read_file_chunks(path):
+            yield part
+
+
+def read_predefined_etag_range_bytes(transfer_context: dict) -> Optional[bytes]:
+    source, start, end = _transfer_byte_range(transfer_context)
+    if source:
+        data = get_worker_range_store().read_slice(source, start, end)
+        if data is not None:
+            return data
+    path = predefined_etag_chunk_data_path(transfer_context)
+    if path.is_file() and path.stat().st_size > 0:
+        return path.read_bytes()
+    return None
 
 
 def predefined_etag_cache_key(transfer_context: dict) -> str:
@@ -1717,19 +1729,18 @@ async def _deferred_predefined_etag_cache_sync(
     etag: Optional[str],
     delay_sec: float,
 ) -> None:
-    """Background: wait, upload chunk file + metadata to control-server (off hot path)."""
+    """Background: wait, upload range bytes + metadata to control-server (off hot path)."""
     key = predefined_etag_cache_key(transfer_context)
     resolved_etag = etag or PREDEFINED_ETAG
     if delay_sec > 0:
         await asyncio.sleep(delay_sec)
 
-    chunk_path = predefined_etag_chunk_data_path(transfer_context)
     uploaded_data = False
-    if chunk_path.is_file():
+    data = await asyncio.to_thread(read_predefined_etag_range_bytes, transfer_context)
+    if data:
         try:
             from neurons.common.control_client import upload_predefined_etag_chunk_data
 
-            data = await asyncio.to_thread(chunk_path.read_bytes)
             uploaded_data = await asyncio.to_thread(
                 upload_predefined_etag_chunk_data,
                 key,
@@ -1811,13 +1822,20 @@ def schedule_predefined_etag_chunk_data_download(
     *,
     force: bool = False,
 ) -> None:
-    """Background-fetch chunk bytes from control-server when local .bin is missing."""
+    """Background-fetch chunk bytes from control-server when local range is missing."""
     if not force and not WORKER_PREDEFINED_ETAG_AUTO_DOWNLOAD_CHUNKS:
         return
     if not cache_key or not chunk_hash:
         return
+    from neurons.common.byte_range_store import parse_cache_key_range
+
+    parsed = parse_cache_key_range(cache_key)
+    if parsed is not None:
+        source, start, end = parsed
+        if get_worker_range_store().covers(source, start, end):
+            return
     path = predefined_etag_chunk_data_path_for_key(cache_key)
-    if path.is_file():
+    if path.is_file() and path.stat().st_size > 0:
         return
     if cache_key in _CHUNK_DOWNLOAD_IN_FLIGHT:
         return
@@ -1841,9 +1859,13 @@ async def _run_predefined_etag_chunk_data_download(cache_key: str, chunk_hash: s
 
 
 async def _download_predefined_etag_chunk_data(cache_key: str, chunk_hash: str) -> None:
-    path = predefined_etag_chunk_data_path_for_key(cache_key)
-    if path.is_file():
-        return
+    from neurons.common.byte_range_store import parse_cache_key_range
+
+    parsed = parse_cache_key_range(cache_key)
+    if parsed is not None:
+        source, start, end = parsed
+        if get_worker_range_store().covers(source, start, end):
+            return
     try:
         from neurons.common.control_client import fetch_predefined_etag_chunk_data
 
@@ -1860,21 +1882,39 @@ async def _download_predefined_etag_chunk_data(cache_key: str, chunk_hash: str) 
             f"expected={chunk_hash[:16]} got={computed[:16]}"
         )
         return
+    if parsed is not None:
+        source, start, end = parsed
+        await asyncio.to_thread(
+            get_worker_range_store().ingest, source, start, end, data
+        )
+        print(
+            f"[Worker] Chunk data cached in range store key={cache_key[:96]} "
+            f"bytes={len(data)}"
+        )
+        return
+    path = predefined_etag_chunk_data_path_for_key(cache_key)
     path.parent.mkdir(parents=True, exist_ok=True)
     await asyncio.to_thread(path.write_bytes, data)
     print(f"[Worker] Chunk data cached locally key={cache_key[:96]} bytes={len(data)}")
 
 
 def bootstrap_missing_predefined_etag_chunk_files() -> int:
-    """Schedule control-server downloads for metadata entries missing a local .bin."""
+    """Schedule control-server downloads for metadata entries missing local range bytes."""
     max_downloads = WORKER_PREDEFINED_ETAG_BOOTSTRAP_MAX_DOWNLOADS
     if max_downloads <= 0:
         return 0
+    from neurons.common.byte_range_store import parse_cache_key_range
+
     scheduled = 0
     for key, entry in list(_PREDEFINED_ETAG_CHUNK_CACHE.items()):
         if scheduled >= max_downloads:
             break
-        if predefined_etag_chunk_data_path_for_key(key).is_file():
+        parsed = parse_cache_key_range(key)
+        if parsed is not None:
+            source, start, end = parsed
+            if get_worker_range_store().covers(source, start, end):
+                continue
+        elif predefined_etag_chunk_data_path_for_key(key).is_file():
             continue
         schedule_predefined_etag_chunk_data_download(key, entry.chunk_hash, force=True)
         scheduled += 1
@@ -2263,11 +2303,11 @@ def _log_predefined_etag_submit_ready(
     }.get(hash_source, "hash/etag")
     if waited_sec > 0:
         detail = (
-            f"accept_ack + {kind}, waited {waited_sec:.3f}s "
+            f"{kind}, waited {waited_sec:.3f}s "
             f"({format_predefined_etag_min_submit_detail(transfer_context)}) before {result_label}"
         )
     else:
-        detail = f"accept_ack + {kind}, submitting {result_label}"
+        detail = f"{kind}, submitting {result_label}"
     log_task_chunk_from_context(
         "submit_ready",
         transfer_context,
@@ -2287,7 +2327,7 @@ async def run_predefined_etag_cached_background_upload(
     offer_id: str = None,
     log_prefix: str = "[Worker]",
 ) -> tuple[bool, float, Optional[str]]:
-    """Upload local cache file to dest after task_accept (background task)."""
+    """Upload local cache file to dest before task_result (background task)."""
     log_task_chunk_from_context(
         "background_upload_start",
         transfer_context,
@@ -2398,33 +2438,6 @@ async def _await_cached_background_upload_task(
         raise
 
 
-def _cancel_cached_background_upload(upload_task: Optional[asyncio.Task]) -> None:
-    if upload_task is None or upload_task.done():
-        return
-    upload_task.cancel()
-
-
-async def _predefined_etag_await_accept(
-    accept_task: Callable[[], Awaitable[bool]],
-    accept_timeout: float,
-) -> tuple[bool, Optional[PredefinedETagSubmitOutcome]]:
-    """Return (accepted, failure_outcome). failure_outcome set when accept fails."""
-    try:
-        accepted = await asyncio.wait_for(accept_task(), timeout=accept_timeout)
-    except asyncio.TimeoutError:
-        return False, PredefinedETagSubmitOutcome(
-            success=False,
-            error=f"task_accept_ack timeout ({accept_timeout:.0f}s)",
-        )
-    except Exception as exc:
-        return False, PredefinedETagSubmitOutcome(success=False, error=str(exc))
-    if not accepted:
-        return False, PredefinedETagSubmitOutcome(
-            success=False, error="task_accept rejected"
-        )
-    return True, None
-
-
 async def predefined_etag_submit_flow(
     state: WorkerState,
     task_id: str,
@@ -2434,13 +2447,11 @@ async def predefined_etag_submit_flow(
     deadline_us: int,
     *,
     log_prefix: str,
-    accept_timeout: float,
-    accept_task: Callable[[], Awaitable[bool]],
     push_cache_to_control_server: bool = True,
     offer_started_at: Optional[float] = None,
     result_label: str = "task_result",
 ) -> PredefinedETagSubmitOutcome:
-    """Predefined ETag: cache hit → parallel bg upload + accept, then task_result."""
+    """Predefined ETag: cache hit → background upload, then task_result."""
     started_at = offer_started_at if offer_started_at is not None else time.perf_counter()
     hash_source = predefined_etag_known_source(transfer_context)
     known = get_predefined_etag_cache(transfer_context)
@@ -2472,14 +2483,6 @@ async def predefined_etag_submit_flow(
                     used_cache=True,
                 )
 
-            accepted, fail = await _predefined_etag_await_accept(
-                accept_task, accept_timeout
-            )
-            if fail is not None:
-                _cancel_cached_background_upload(upload_task)
-                with contextlib.suppress(asyncio.CancelledError):
-                    await upload_task
-                return fail
             waited_sec = await wait_predefined_etag_min_submit_delay(
                 started_at, transfer_context
             )
@@ -2527,11 +2530,6 @@ async def predefined_etag_submit_flow(
             )
 
         if hash_source == "env":
-            accepted, fail = await _predefined_etag_await_accept(
-                accept_task, accept_timeout
-            )
-            if fail is not None:
-                return fail
             waited_sec = await wait_predefined_etag_min_submit_delay(
                 started_at, transfer_context
             )
@@ -2559,10 +2557,6 @@ async def predefined_etag_submit_flow(
             f"falling back to source fetch: task={task_label(task_id)} "
             f"offer={task_label(offer_id)}"
         )
-
-    accepted, fail = await _predefined_etag_await_accept(accept_task, accept_timeout)
-    if fail is not None:
-        return fail
 
     result = await execute_task_with_metrics(
         state,
@@ -2892,20 +2886,18 @@ async def fetch_and_send_chunk(
                 and predefined_etag_transfer_eligible(transfer_context)
                 and not is_canary
             )
-            chunk_data_path = (
-                predefined_etag_chunk_data_path(transfer_context)
-                if save_chunk_data
-                else None
-            )
-            if chunk_data_path is not None:
-                chunk_data_path.parent.mkdir(parents=True, exist_ok=True)
+            chunk_data_tmp: Optional[Path] = None
+            if save_chunk_data:
+                tmp_dir = _predefined_etag_range_data_dir() / ".tmp"
+                tmp_dir.mkdir(parents=True, exist_ok=True)
+                chunk_data_tmp = tmp_dir / f"fetch_{os.getpid()}_{time.time_ns()}.bin"
 
             async def fetch_producer() -> None:
                 nonlocal bytes_transferred, fetch_error, fetch_ms
                 chunk_data_file = None
                 try:
-                    if chunk_data_path is not None:
-                        chunk_data_file = open(chunk_data_path, "wb")
+                    if chunk_data_tmp is not None:
+                        chunk_data_file = open(chunk_data_tmp, "wb")
                     async with client.stream(
                         "GET", source_url, headers=fetch_headers, timeout=FETCH_TIMEOUT
                     ) as response:
@@ -3041,6 +3033,8 @@ async def fetch_and_send_chunk(
                 send_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await send_task
+                if chunk_data_tmp is not None:
+                    chunk_data_tmp.unlink(missing_ok=True)
                 raise fetch_error
 
             chunk_hash = hasher.hexdigest()
@@ -3048,9 +3042,29 @@ async def fetch_and_send_chunk(
                 send_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await send_task
+                if chunk_data_tmp is not None:
+                    chunk_data_tmp.unlink(missing_ok=True)
                 raise ValueError(
                     f"chunk hash mismatch: expected {expected_chunk_hash}, got {chunk_hash}"
                 )
+
+            if (
+                chunk_data_tmp is not None
+                and chunk_data_tmp.is_file()
+                and transfer_context is not None
+            ):
+                try:
+                    source, range_start, range_end = _transfer_byte_range(transfer_context)
+                    if source:
+                        await asyncio.to_thread(
+                            get_worker_range_store().ingest_from_file,
+                            source,
+                            range_start,
+                            range_end,
+                            chunk_data_tmp,
+                        )
+                finally:
+                    chunk_data_tmp.unlink(missing_ok=True)
 
             log_task_chunk(
                 "fetch_done",
@@ -3139,33 +3153,10 @@ def estimate_task_bytes(task: dict) -> int:
     return chunk_size
 
 
-async def ws_send_task_reject(
-    websocket,
-    state: WorkerState,
-    task_id: str,
-    reason: str,
-    offer_id: str = None,
-) -> bool:
-    """Reject a WebSocket task offer so BeamCore can reassign it quickly."""
-    try:
-        msg = {
-            "type": "task_reject",
-            "offer_id": offer_id or task_id,
-            "task_id": task_id,
-            "worker_id": state.worker_id,
-            "reason": reason,
-        }
-        await ws_send_json(websocket, state, msg)
-        return True
-    except Exception as e:
-        print(f"[Worker] WS task_reject error: {e}")
-        return False
-
-
 def try_reserve_ws_capacity(
     state: WorkerState, task_id: str, estimated_bytes: int
 ) -> Optional[str]:
-    """Reserve local capacity for a pushed task before accepting it."""
+    """Reserve local capacity for a pushed task before executing it."""
     if task_id in state.active_ws_task_ids:
         return "duplicate"
 
@@ -3499,25 +3490,6 @@ def get_ws_status_code(exc: Exception) -> Optional[int]:
     return None
 
 
-async def ws_send_task_accept(
-    websocket, state: WorkerState, task_id: str, offer_id: str = None
-) -> bool:
-    """Send task acceptance over WebSocket."""
-    try:
-        msg = {
-            "type": "task_accept",
-            "offer_id": offer_id or task_id,
-            "task_id": task_id,
-            "worker_id": state.worker_id,
-            "worker_version": WORKER_VERSION,
-        }
-        await ws_send_json(websocket, state, msg)
-        return True
-    except Exception as e:
-        print(f"[Worker] WS task_accept error: {e}")
-        return False
-
-
 async def ws_send_worker_hello(websocket, state: WorkerState) -> bool:
     """Announce worker host metadata to the gateway for pool scheduling."""
     try:
@@ -3588,11 +3560,11 @@ async def finalize_ws_task_result(
     offer_id: str = None,
     transfer_mbps: float = 0.0,
 ) -> TaskSummaryAck:
-    """Send task_result and wait for BeamCore ack (received / completed)."""
+    """Send task_result until BeamCore assumes or rejects relay ownership."""
     result_key = offer_id or task_id
     empty = TaskSummaryAck()
 
-    for attempt in range(3):
+    for attempt in range(WS_TASK_RESULT_SEND_ATTEMPTS):
         ack_future: asyncio.Future = asyncio.get_event_loop().create_future()
         state.pending_task_results[result_key] = ack_future
 
@@ -3615,29 +3587,28 @@ async def finalize_ws_task_result(
                 transfer_mbps=transfer_mbps,
             )
             if not sent:
+                if attempt < WS_TASK_RESULT_SEND_ATTEMPTS - 1:
+                    await asyncio.sleep(min(WS_TASK_RESULT_RECONNECT_WAIT_SECONDS, 0.25 * (attempt + 1)))
                 continue
 
             try:
                 ack = await asyncio.wait_for(ack_future, timeout=WS_TASK_RESULT_ACK_TIMEOUT)
-                if ack.completed:
+                if ack.status in TASK_RESULT_TERMINAL_STATUSES:
                     print(
-                        f"[Worker] [WS] Task completed on BeamCore: {task_label(task_id)} offer={task_label(offer_id)}"
-                    )
-                    return ack
-                if ack.received:
-                    reason = ack.reason or "not_completed"
-                    print(
-                        f"[Worker] [WS] Task result received but not completed: "
-                        f"task={task_label(task_id)} offer={task_label(offer_id)} reason={reason}"
+                        f"[Worker] [WS] Task result settled by BeamCore: "
+                        f"task={task_label(task_id)} offer={task_label(offer_id)} "
+                        f"status={ack.status or 'unknown'}"
                     )
                     return ack
                 print(
-                    f"[Worker] [WS] Task result nack from gateway: {task_label(task_id)} offer={task_label(offer_id)}"
+                    f"[Worker] [WS] Task result relay not terminal: "
+                    f"task={task_label(task_id)} offer={task_label(offer_id)} "
+                    f"status={ack.status or 'invalid'} reason={ack.reason or 'retry'}"
                 )
             except asyncio.TimeoutError:
                 print(
                     f"[Worker] [WS] Task result ack timeout "
-                    f"attempt={attempt + 1}/3 task={task_label(task_id)} offer={task_label(offer_id)}"
+                    f"attempt={attempt + 1}/{WS_TASK_RESULT_SEND_ATTEMPTS} task={task_label(task_id)} offer={task_label(offer_id)}"
                 )
         finally:
             state.pending_task_results.pop(result_key, None)
@@ -3679,7 +3650,7 @@ def track_ws_task(state: WorkerState, coro: asyncio.coroutines) -> None:
 
 
 async def _cancel_exec_task(exec_task: asyncio.Task, task_id: str, offer_id: str) -> None:
-    """Stop in-flight transfer when accept is rejected or times out."""
+    """Stop an in-flight transfer (e.g. on deadline exceeded or task failure)."""
     if exec_task.done():
         return
     exec_task.cancel()
@@ -3720,73 +3691,6 @@ async def _finalize_ws_task(
     return result.success
 
 
-async def _handle_ws_task_sequential_accept(
-    state: WorkerState,
-    websocket,
-    task: dict,
-    task_id: str,
-    offer_id: str,
-    task_key: str,
-    transfer_context: dict,
-    deadline_us: int,
-) -> bool:
-    """Wait for task_accept_ack before starting the transfer (legacy path)."""
-    accept_future: asyncio.Future = asyncio.get_event_loop().create_future()
-    state.pending_task_accepts[task_key] = accept_future
-
-    accepted = await ws_send_task_accept(websocket, state, task_id, offer_id=offer_id)
-    if not accepted:
-        state.pending_task_accepts.pop(task_key, None)
-        print("[Worker] [WS] Failed to send task_accept")
-        return False
-    print(
-        f"[Worker] [WS] Sent task_accept, awaiting ack: task={task_label(task_id)} "
-        f"offer={task_label(offer_id)}"
-    )
-
-    try:
-        server_accepted = await asyncio.wait_for(
-            accept_future, timeout=WS_TASK_ACCEPT_ACK_TIMEOUT
-        )
-        if not server_accepted:
-            print(
-                f"[Worker] [WS] task_accept_ack rejected: task={task_label(task_id)} "
-                f"offer={task_label(offer_id)}"
-            )
-            return False
-    except asyncio.TimeoutError:
-        state.pending_task_accepts.pop(task_key, None)
-        print(
-            f"[Worker] [WS] task_accept_ack timeout ({WS_TASK_ACCEPT_ACK_TIMEOUT}s): "
-            f"task={task_label(task_id)} offer={task_label(offer_id)}"
-        )
-        return False
-
-    print(
-        f"[Worker] [WS] task_accept_ack OK, starting transfer: task={task_label(task_id)} "
-        f"offer={task_label(offer_id)}"
-    )
-
-    result = await execute_task_with_metrics(
-        state,
-        task_id,
-        task,
-        transfer_context,
-        deadline_us,
-        log_prefix="[Worker] [WS]",
-    )
-    if result.success:
-        maybe_store_predefined_etag_cache_on_success(
-            transfer_context,
-            result.chunk_hash,
-            result.etag,
-            log_prefix="[Worker] [WS]",
-            task_id=task_id,
-            offer_id=offer_id,
-        )
-    return await _finalize_ws_task(websocket, state, task_id, offer_id, result)
-
-
 async def _cancel_predefined_etag_tasks(
     exec_task: asyncio.Task,
     upload_task: asyncio.Task,
@@ -3804,42 +3708,6 @@ async def _cancel_predefined_etag_tasks(
         await upload_task
 
 
-async def _finalize_ws_standard_transfer_after_accept(
-    state: WorkerState,
-    websocket,
-    task: dict,
-    task_id: str,
-    offer_id: str,
-    transfer_context: dict,
-    deadline_us: int,
-    *,
-    reason: str,
-) -> bool:
-    """Run stream download+upload and submit with the real staging etag."""
-    print(
-        f"[Worker] [WS] Falling back to standard transfer ({reason}): "
-        f"task={task_label(task_id)} offer={task_label(offer_id)}"
-    )
-    result = await execute_task_with_metrics(
-        state,
-        task_id,
-        task,
-        transfer_context,
-        deadline_us,
-        log_prefix="[Worker] [WS]",
-    )
-    if result.success:
-        maybe_store_predefined_etag_cache_on_success(
-            transfer_context,
-            result.chunk_hash,
-            result.etag,
-            log_prefix="[Worker] [WS]",
-            task_id=task_id,
-            offer_id=offer_id,
-        )
-    return await _finalize_ws_task(websocket, state, task_id, offer_id, result)
-
-
 async def _handle_ws_task_predefined_etag_early_result(
     state: WorkerState,
     websocket,
@@ -3850,39 +3718,23 @@ async def _handle_ws_task_predefined_etag_early_result(
     transfer_context: dict,
     deadline_us: int,
 ) -> bool:
-    """Predefined ETag: cache hit submits after accept; miss fetch+upload; background if cached."""
-    accept_future: asyncio.Future = asyncio.get_event_loop().create_future()
-    state.pending_task_accepts[task_key] = accept_future
-
+    """Predefined ETag: cache hit submits immediately; miss fetch+upload; background if cached."""
     cached = get_predefined_etag_cache(transfer_context)
     print(
         f"[Worker] [WS] Predefined ETag: "
-        f"{'cache hit, accept + background upload then submit' if cached else 'cache miss, fetch+upload then submit'}: "
+        f"{'cache hit, background upload then submit' if cached else 'cache miss, fetch+upload then submit'}: "
         f"task={task_label(task_id)} offer={task_label(offer_id)}"
     )
 
-    async def _accept_task() -> bool:
-        if not await ws_send_task_accept(websocket, state, task_id, offer_id=offer_id):
-            return False
-        try:
-            return await asyncio.wait_for(accept_future, timeout=WS_TASK_ACCEPT_ACK_TIMEOUT)
-        except asyncio.TimeoutError:
-            return False
-
-    try:
-        outcome = await predefined_etag_submit_flow(
-            state,
-            task_id,
-            offer_id,
-            task,
-            transfer_context,
-            deadline_us,
-            log_prefix="[Worker] [WS]",
-            accept_timeout=WS_TASK_ACCEPT_ACK_TIMEOUT,
-            accept_task=_accept_task,
-        )
-    finally:
-        state.pending_task_accepts.pop(task_key, None)
+    outcome = await predefined_etag_submit_flow(
+        state,
+        task_id,
+        offer_id,
+        task,
+        transfer_context,
+        deadline_us,
+        log_prefix="[Worker] [WS]",
+    )
 
     if not outcome.success:
         print(
@@ -4001,97 +3853,6 @@ async def _await_predefined_etag_upload_task(
         )
 
 
-async def _handle_ws_task_early_transfer(
-    state: WorkerState,
-    websocket,
-    task: dict,
-    task_id: str,
-    offer_id: str,
-    task_key: str,
-    transfer_context: dict,
-    deadline_us: int,
-) -> bool:
-    """Start transfer and send task_accept immediately in parallel."""
-    accept_future: asyncio.Future = asyncio.get_event_loop().create_future()
-    state.pending_task_accepts[task_key] = accept_future
-
-    exec_task = asyncio.create_task(
-        execute_task_with_metrics(
-            state,
-            task_id,
-            task,
-            transfer_context,
-            deadline_us,
-            log_prefix="[Worker] [WS]",
-        )
-    )
-
-    print(
-        f"[Worker] [WS] Early transfer + task_accept in parallel: "
-        f"task={task_label(task_id)} offer={task_label(offer_id)}"
-    )
-
-    try:
-        if not await ws_send_task_accept(websocket, state, task_id, offer_id=offer_id):
-            state.pending_task_accepts.pop(task_key, None)
-            print("[Worker] [WS] Failed to send task_accept")
-            await _cancel_exec_task(exec_task, task_id, offer_id)
-            return False
-
-        print(
-            f"[Worker] [WS] Sent task_accept, awaiting ack: "
-            f"task={task_label(task_id)} offer={task_label(offer_id)}"
-        )
-
-        try:
-            server_accepted = await asyncio.wait_for(
-                accept_future, timeout=WS_TASK_ACCEPT_ACK_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            state.pending_task_accepts.pop(task_key, None)
-            print(
-                f"[Worker] [WS] task_accept_ack timeout ({WS_TASK_ACCEPT_ACK_TIMEOUT}s): "
-                f"task={task_label(task_id)} offer={task_label(offer_id)}"
-            )
-            await _cancel_exec_task(exec_task, task_id, offer_id)
-            return False
-
-        if not server_accepted:
-            print(
-                f"[Worker] [WS] task_accept_ack rejected, aborting transfer: "
-                f"task={task_label(task_id)} offer={task_label(offer_id)}"
-            )
-            if exec_task.done():
-                print(
-                    f"[Worker] [WS] Transfer finished before reject — discarding result: "
-                    f"task={task_label(task_id)} offer={task_label(offer_id)}"
-                )
-            else:
-                await _cancel_exec_task(exec_task, task_id, offer_id)
-            return False
-
-        print(
-            f"[Worker] [WS] task_accept_ack OK: task={task_label(task_id)} "
-            f"offer={task_label(offer_id)}"
-        )
-
-        result = await exec_task
-        if result.success:
-            maybe_store_predefined_etag_cache_on_success(
-                transfer_context,
-                result.chunk_hash,
-                result.etag,
-                log_prefix="[Worker] [WS]",
-                task_id=task_id,
-                offer_id=offer_id,
-            )
-        return await _finalize_ws_task(websocket, state, task_id, offer_id, result)
-    except asyncio.CancelledError:
-        if not exec_task.done():
-            exec_task.cancel()
-        raise
-
-
 async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
     """Handle a task received via WebSocket push."""
     task_id = task.get("task_id") or task.get("offer_id")
@@ -4108,9 +3869,11 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
         return False
     if validation_error or transfer_context is None:
         reason = validation_error if validation_error == "unsupported_worker_version" else f"invalid_offer:{validation_error or 'unknown'}"
-        await ws_send_task_reject(websocket, state, task_id, reason, offer_id=offer_id)
+        await finalize_ws_task_result(
+            websocket, state, task_id, False, 0, error=reason, offer_id=offer_id,
+        )
         print(
-            f"[Worker] [WS] Rejected task {task_label(task_id)} offer={task_label(offer_id)}: "
+            f"[Worker] [WS] Failed task {task_label(task_id)} offer={task_label(offer_id)}: "
             f"{reason}"
         )
         return False
@@ -4122,9 +3885,11 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
         )
         return False
     if capacity_error:
-        await ws_send_task_reject(websocket, state, task_id, capacity_error, offer_id=offer_id)
+        await finalize_ws_task_result(
+            websocket, state, task_id, False, 0, error=capacity_error, offer_id=offer_id,
+        )
         print(
-            f"[Worker] [WS] Rejected task {task_label(task_id)} offer={task_label(offer_id)} "
+            f"[Worker] [WS] Failed task {task_label(task_id)} offer={task_label(offer_id)} "
             f"due to capacity guard: {capacity_error} (budget={MAX_IN_FLIGHT_BYTES} bytes)"
         )
         return False
@@ -4138,9 +3903,11 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
         remaining_sec = remaining_deadline_seconds(deadline_us)
         if remaining_sec is not None and remaining_sec < 5:
             reason = f"deadline_too_close:{remaining_sec:.1f}s"
-            await ws_send_task_reject(websocket, state, task_id, reason, offer_id=offer_id)
+            await finalize_ws_task_result(
+                websocket, state, task_id, False, 0, error=reason, offer_id=offer_id,
+            )
             print(
-                f"[Worker] [WS] Rejected task {task_label(task_id)} offer={task_label(offer_id)}: "
+                f"[Worker] [WS] Failed task {task_label(task_id)} offer={task_label(offer_id)}: "
                 f"{reason}"
             )
             return False
@@ -4157,30 +3924,25 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
                 deadline_us,
             )
 
-        if not WORKER_EARLY_TRANSFER:
-            return await _handle_ws_task_sequential_accept(
-                state,
-                websocket,
-                task,
-                task_id,
-                offer_id,
-                task_key,
-                transfer_context,
-                deadline_us,
-            )
-
-        return await _handle_ws_task_early_transfer(
+        result = await execute_task_with_metrics(
             state,
-            websocket,
-            task,
             task_id,
-            offer_id,
-            task_key,
+            task,
             transfer_context,
             deadline_us,
+            log_prefix="[Worker] [WS]",
         )
+        if result.success:
+            maybe_store_predefined_etag_cache_on_success(
+                transfer_context,
+                result.chunk_hash,
+                result.etag,
+                log_prefix="[Worker] [WS]",
+                task_id=task_id,
+                offer_id=offer_id,
+            )
+        return await _finalize_ws_task(websocket, state, task_id, offer_id, result)
     finally:
-        state.pending_task_accepts.pop(task_key, None)
         release_ws_capacity(state, task_key, estimated_bytes, reserved_capacity)
 
 
@@ -4231,45 +3993,30 @@ async def websocket_loop(state: WorkerState):
                             elif msg_type == "task_offer":
                                 track_ws_task(state, handle_ws_task(state, websocket, message))
 
-                            elif msg_type == "task_accept_ack":
-                                ack_task_id = message.get("task_id")
-                                ack_offer_id = message.get("offer_id") or ack_task_id
-                                server_accepted = message.get("accepted", True)
-                                if ack_offer_id and ack_offer_id in state.pending_task_accepts:
-                                    future = state.pending_task_accepts.pop(ack_offer_id)
-                                    if not future.done():
-                                        future.set_result(server_accepted)
-                                if not server_accepted:
-                                    print(
-                                        f"[Worker] [WS] Task accept rejected: "
-                                        f"task={task_label(ack_task_id)} offer={task_label(ack_offer_id)} "
-                                        f"reason={message.get('reason', 'unknown')}"
-                                    )
-
                             elif msg_type == "task_result_ack":
                                 ack_task_id = message.get("task_id")
                                 ack_offer_id = message.get("offer_id") or ack_task_id
-                                received = bool(message.get("received", False))
-                                completed_raw = message.get("completed")
-                                completed = (
-                                    bool(completed_raw)
-                                    if completed_raw is not None
-                                    else received
-                                )
+                                received_value = message.get("received")
+                                received = received_value if isinstance(received_value, bool) else False
+                                status_value = message.get("status")
+                                status = status_value if isinstance(status_value, str) and status_value in TASK_RESULT_ACK_STATUSES else None
+                                if status is not None and received != (status not in {"retry", "rejected"}):
+                                    status = None
                                 reason = message.get("reason")
                                 ack = TaskSummaryAck(
                                     received=received,
-                                    completed=completed,
+                                    status=status,
                                     reason=str(reason) if reason else None,
                                 )
                                 if ack_offer_id and ack_offer_id in state.pending_task_results:
                                     future = state.pending_task_results.pop(ack_offer_id)
                                     if not future.done():
                                         future.set_result(ack)
-                                if not received:
+                                if status == "rejected":
                                     print(
-                                        f"[Worker] [WS] Gateway rejected task_result: "
-                                        f"task={task_label(ack_task_id)} offer={task_label(ack_offer_id)}"
+                                        f"[Worker] [WS] BeamCore rejected task_result: "
+                                        f"task={task_label(ack_task_id)} offer={task_label(ack_offer_id)} "
+                                        f"status={ack.status or 'unknown'} reason={ack.reason or 'unknown'}"
                                     )
 
                             elif msg_type == "error":

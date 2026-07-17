@@ -808,7 +808,7 @@ class EmbeddedWorkerPool:
             capacity_error = self._reserve_capacity(worker, estimated_bytes)
             if capacity_error:
                 logger.warning(
-                    "Embedded rejecting offer: task=%s offer=%s worker_slot=%s reason=%s",
+                    "Embedded failing offer: task=%s offer=%s worker_slot=%s reason=%s",
                     short_id(task_id),
                     short_id(offer_id),
                     worker.slot,
@@ -821,7 +821,14 @@ class EmbeddedWorkerPool:
                     offer_id=str(offer_id),
                     reason=capacity_error,
                 )
-                await self._send_reject(worker, task_id, offer_id, capacity_error)
+                await self._send_result(
+                    worker,
+                    task_id,
+                    offer_id,
+                    success=False,
+                    error=capacity_error,
+                    transfer_context=transfer_context,
+                )
                 return
 
             worker.active_offer_ids.add(str(offer_id or ""))
@@ -873,27 +880,6 @@ class EmbeddedWorkerPool:
             return f"queue_full:{worker.active_count}"
         return None
 
-    async def _send_accept(
-        self, worker: EmbeddedWorker, task_id: str, offer_id: str
-    ) -> dict:
-        transfer = get_transfer_module()
-        return await self.upstream.send_task_accept(
-            task_id=str(task_id),
-            worker_id=worker.worker_id,
-            offer_id=str(offer_id),
-            worker_version=transfer.WORKER_VERSION,
-        )
-
-    async def _send_reject(
-        self, worker: EmbeddedWorker, task_id: str, offer_id: str, reason: str
-    ) -> None:
-        await self.upstream.send_task_reject(
-            task_id=str(task_id),
-            worker_id=worker.worker_id,
-            offer_id=str(offer_id),
-            reason=reason,
-        )
-
     async def _send_result(
         self,
         worker: EmbeddedWorker,
@@ -922,7 +908,8 @@ class EmbeddedWorkerPool:
         started = time.perf_counter()
         ack = await self.upstream.send_task_result(payload)
         latency_ms = (time.perf_counter() - started) * 1000
-        if ack.get("completed"):
+        status = ack.get("status")
+        if status == "completed":
             _log_embedded_task_completed(
                 task_id=str(task_id),
                 offer_id=str(offer_id),
@@ -944,12 +931,12 @@ class EmbeddedWorkerPool:
         else:
             logger.warning(
                 "Embedded task result not completed: task=%s offer=%s worker=%s "
-                "received=%s completed=%s reason=%s",
+                "received=%s status=%s reason=%s",
                 short_id(task_id),
                 short_id(offer_id),
                 short_id(worker.worker_id),
                 ack.get("received"),
-                ack.get("completed"),
+                status,
                 ack.get("reason") or ack.get("error") or ack.get("message"),
             )
         return ack
@@ -988,10 +975,6 @@ class EmbeddedWorkerPool:
 
         offer_started_at = time.perf_counter()
 
-        async def _accept_task() -> bool:
-            resp = await self._send_accept(worker, task_id, offer_id)
-            return bool(resp.get("accepted"))
-
         outcome = await transfer.predefined_etag_submit_flow(
             worker.state,
             str(task_id),
@@ -1000,10 +983,6 @@ class EmbeddedWorkerPool:
             transfer_context,
             deadline_us,
             log_prefix="[Embedded]",
-            accept_timeout=float(
-                os.environ.get("WORKER_TASK_ACCEPT_ACK_TIMEOUT", "8.0")
-            ),
-            accept_task=_accept_task,
             push_cache_to_control_server=False,
             offer_started_at=offer_started_at,
         )
@@ -1144,25 +1123,6 @@ class EmbeddedWorkerPool:
         deadline_us: int,
     ) -> None:
         transfer = get_transfer_module()
-        accept_resp = await self._send_accept(worker, task_id, offer_id)
-        if not accept_resp.get("accepted"):
-            reason = accept_resp.get("reason") or "task_accept_rejected"
-            logger.warning(
-                "Embedded accept rejected: task=%s offer=%s worker=%s reason=%s",
-                short_id(task_id),
-                short_id(offer_id),
-                short_id(worker.worker_id),
-                reason,
-            )
-            self._log_task_failed(
-                transfer,
-                transfer_context,
-                task_id=str(task_id),
-                offer_id=str(offer_id),
-                reason=str(reason),
-            )
-            return
-
         result = await transfer.execute_task_with_metrics(
             worker.state,
             str(task_id),

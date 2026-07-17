@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import hashlib
 from dataclasses import dataclass
 from typing import Any, Optional
 from urllib.parse import quote, urlparse, urlunparse
@@ -146,10 +147,28 @@ def upload_predefined_etag_chunk_data(
     etag: str = "",
     config: Optional[ControlServerConfig] = None,
 ) -> bool:
-    """Upload raw chunk bytes; control-server stores file and broadcasts metadata."""
+    """Upload raw chunk bytes; control-server stores into continuous range store."""
     cfg = config or get_control_server_config()
     if not cfg.http_url or not cfg.secret or not cache_key or not data or not chunk_hash:
         return False
+    # Prefer range API when key parses as source|start|end.
+    parts = str(cache_key).rsplit("|", 2)
+    if len(parts) == 3:
+        try:
+            start = int(parts[1])
+            end = int(parts[2])
+        except ValueError:
+            start = end = -1
+        if end >= start >= 0:
+            return upload_predefined_etag_range_data(
+                parts[0],
+                start,
+                end,
+                data,
+                chunk_hash=chunk_hash,
+                etag=etag,
+                config=cfg,
+            )
     url = (
         f"{cfg.http_url}/cache/predefined-etag/entries/"
         f"{quote(cache_key, safe='')}/data"
@@ -176,14 +195,71 @@ def upload_predefined_etag_chunk_data(
         return False
 
 
+def upload_predefined_etag_range_data(
+    source_url: str,
+    start: int,
+    end: int,
+    data: bytes,
+    *,
+    chunk_hash: str = "",
+    etag: str = "",
+    config: Optional[ControlServerConfig] = None,
+) -> bool:
+    """Upload a byte range into the control-server continuous range store."""
+    cfg = config or get_control_server_config()
+    if not cfg.http_url or not cfg.secret or not source_url or not data:
+        return False
+    if end < start or len(data) != (end - start + 1):
+        return False
+    url = f"{cfg.http_url}/cache/predefined-etag/ranges"
+    headers = {
+        **_headers(cfg.secret),
+        "X-Source-Url": source_url,
+        "X-Range-Start": str(start),
+        "X-Range-End": str(end),
+        "X-Chunk-Hash": chunk_hash or hashlib.sha256(data).hexdigest(),
+        "X-ETag": etag or "",
+        "Content-Type": "application/octet-stream",
+    }
+    if cfg.miner_id:
+        headers["X-Miner-Id"] = cfg.miner_id
+    try:
+        with httpx.Client(timeout=CHUNK_DATA_TIMEOUT) as client:
+            resp = client.put(url, content=data, headers=headers)
+            resp.raise_for_status()
+        return True
+    except Exception as exc:
+        logger.warning(
+            "Control server range upload failed src=%s range=%s-%s err=%s",
+            source_url[:96],
+            start,
+            end,
+            exc,
+        )
+        return False
+
+
 def fetch_predefined_etag_chunk_data(
     cache_key: str,
     config: Optional[ControlServerConfig] = None,
 ) -> Optional[bytes]:
-    """Download raw chunk bytes from control-server."""
+    """Download raw chunk bytes from control-server (range store or legacy)."""
     cfg = config or get_control_server_config()
     if not cfg.http_url or not cfg.secret or not cache_key:
         return None
+    parts = str(cache_key).rsplit("|", 2)
+    if len(parts) == 3:
+        try:
+            start = int(parts[1])
+            end = int(parts[2])
+        except ValueError:
+            start = end = -1
+        if end >= start >= 0:
+            data = fetch_predefined_etag_range_data(
+                parts[0], start, end, config=cfg
+            )
+            if data is not None:
+                return data
     url = (
         f"{cfg.http_url}/cache/predefined-etag/entries/"
         f"{quote(cache_key, safe='')}/data"
@@ -199,6 +275,39 @@ def fetch_predefined_etag_chunk_data(
         logger.warning(
             "Control server chunk data fetch failed key=%s err=%s",
             cache_key[:96],
+            exc,
+        )
+        return None
+
+
+def fetch_predefined_etag_range_data(
+    source_url: str,
+    start: int,
+    end: int,
+    config: Optional[ControlServerConfig] = None,
+) -> Optional[bytes]:
+    """Download a byte-range slice from the control-server continuous store."""
+    cfg = config or get_control_server_config()
+    if not cfg.http_url or not cfg.secret or not source_url or end < start:
+        return None
+    url = f"{cfg.http_url}/cache/predefined-etag/ranges/data"
+    try:
+        with httpx.Client(timeout=CHUNK_DATA_TIMEOUT) as client:
+            resp = client.get(
+                url,
+                headers=_headers(cfg.secret),
+                params={"source_url": source_url, "start": start, "end": end},
+            )
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            return resp.content
+    except Exception as exc:
+        logger.warning(
+            "Control server range fetch failed src=%s range=%s-%s err=%s",
+            source_url[:96],
+            start,
+            end,
             exc,
         )
         return None

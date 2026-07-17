@@ -51,9 +51,8 @@ The worker uses BeamCore HTTP for registration and signed bootstrap calls. Trans
 ### Task flow (per offer)
 
 1. Gateway delivers `task_offer` to the worker WebSocket.
-2. Worker starts the GET/PUT transfer and sends `task_accept` immediately in parallel.
-3. Worker waits for `task_accept_ack` — if rejected, cancels the in-flight transfer; if accepted, continues and sends `task_result`.
-4. Worker waits for `task_result_ack` (`completed=true` counts toward epoch stats).
+2. Worker executes the offer immediately (no accept/reject step) and starts the GET/PUT transfer.
+3. Worker sends `task_result` and waits for `task_result_ack`, retrying until the ack carries a terminal `status` (e.g. `completed`, `failed`, `rejected`).
 
 With a **global gateway**, workers connect to the shared gateway URL; routing back to the correct orchestrator is handled by `offer_id` / `task_id` on the gateway.
 

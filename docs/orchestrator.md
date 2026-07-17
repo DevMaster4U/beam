@@ -11,7 +11,7 @@ The orchestrator process:
 3. Maintains an in-process worker gateway at `/ws/<worker_id>` (auth via `api_key` or `worker_secret`).
 4. Receives `worker_task_offer_batch` messages from BeamCore through `ORCH_GATEWAY_URL`.
 5. Selects connected local workers and sends `task_offer` messages.
-6. Relays `task_accept`, `task_reject`, and `task_result` messages upstream.
+6. Relays `task_result` messages upstream (offers execute immediately; no accept/reject step).
 7. Stays `READY=true` when it should receive routed production work.
 
 Workers use BeamCore HTTP for registration, but runtime task delivery uses the worker gateway.

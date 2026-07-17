@@ -9,8 +9,11 @@ import uvicorn
 from fastapi import FastAPI
 
 _ROOT = Path(__file__).resolve().parent
+_REPO_ROOT = _ROOT.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from config import get_settings
 from logging_config import configure_logging

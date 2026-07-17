@@ -6,16 +6,37 @@ import copy
 import hashlib
 import io
 import json
+import sys
 import tarfile
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 from config import get_settings
+
+# Shared range store lives in neurons/common (repo root on sys.path).
+from neurons.common.byte_range_store import (  # noqa: E402
+    ByteRangeStore,
+    parse_cache_key_range,
+)
 
 _cache_lock = threading.Lock()
 _cache_memory: dict[str, Any] | None = None
+_range_store: ByteRangeStore | None = None
+
+
+def get_range_store() -> ByteRangeStore:
+    global _range_store
+    if _range_store is None:
+        root = get_settings().cache_dir / "range_data"
+        root.mkdir(parents=True, exist_ok=True)
+        _range_store = ByteRangeStore(root)
+    return _range_store
 
 
 def _utc_now() -> str:
@@ -30,6 +51,12 @@ def chunk_index_from_cache_key(key: str) -> Optional[int]:
     """Derive chunk index from cache key ``source_url|range_start|range_end``.
 
     chunk_index = range_start // (range_end - range_start)
+
+    Note: this index is derived purely from byte offsets and is NOT unique
+    across different chunk sizes for the same source URL — e.g. index 1 for
+    a 256KB chunking scheme covers different bytes than index 1 for a 1MB
+    scheme. Callers that need an unambiguous identity must also key on
+    chunk_size (see ``chunk_size_from_cache_key``).
     """
     parsed = parse_cache_key(key)
     if parsed is None:
@@ -39,6 +66,18 @@ def chunk_index_from_cache_key(key: str) -> Optional[int]:
     if span <= 0:
         return None
     return range_start // span
+
+
+def chunk_size_from_cache_key(key: str) -> Optional[int]:
+    """Derive chunk size (inclusive byte range span) from a cache key."""
+    parsed = parse_cache_key(key)
+    if parsed is None:
+        return None
+    range_start, range_end = parsed[1], parsed[2]
+    size = range_end - range_start + 1
+    if size <= 0:
+        return None
+    return size
 
 
 def parse_cache_key(key: str) -> Optional[tuple[str, int, int]]:
@@ -68,8 +107,11 @@ def _build_cache_entry(
     chunk_index = chunk_index_from_cache_key(key)
     if chunk_index is not None:
         entry["chunk_index"] = chunk_index
+    chunk_size = chunk_size_from_cache_key(key)
+    if chunk_size is not None:
+        entry["chunk_size"] = chunk_size
     if has_chunk_data is None:
-        has_chunk_data = predefined_etag_chunk_data_path(key).is_file()
+        has_chunk_data = has_predefined_etag_chunk_data(key)
     if has_chunk_data:
         entry["has_chunk_data"] = True
     return entry
@@ -84,22 +126,55 @@ def predefined_etag_chunk_data_path(key: str) -> Path:
     return predefined_etag_chunk_data_dir() / f"{digest}.bin"
 
 
+def store_predefined_etag_range_data(
+    source_url: str, start: int, end: int, data: bytes
+) -> dict[str, Any]:
+    """Ingest bytes into the continuous range store."""
+    segment = get_range_store().ingest(source_url, start, end, data)
+    return segment.to_dict()
+
+
 def store_predefined_etag_chunk_data(key: str, data: bytes) -> Path:
-    path = predefined_etag_chunk_data_path(key)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(data)
-    return path
+    """Store chunk bytes into the continuous range store (legacy key API)."""
+    parsed = parse_cache_key_range(key)
+    if parsed is None:
+        raise ValueError(f"invalid cache key: {key[:96]}")
+    source_url, start, end = parsed
+    store_predefined_etag_range_data(source_url, start, end, data)
+    return predefined_etag_chunk_data_path(key)
+
+def load_predefined_etag_range_data(
+    source_url: str, start: int, end: int
+) -> Optional[bytes]:
+    return get_range_store().read_slice(source_url, start, end)
 
 
 def load_predefined_etag_chunk_data(key: str) -> Optional[bytes]:
+    parsed = parse_cache_key_range(key)
+    if parsed is not None:
+        source_url, start, end = parsed
+        data = load_predefined_etag_range_data(source_url, start, end)
+        if data is not None:
+            return data
+    # Legacy per-key .bin fallback during migration.
     path = predefined_etag_chunk_data_path(key)
-    if not path.is_file():
-        return None
-    return path.read_bytes()
+    if path.is_file() and path.stat().st_size > 0:
+        return path.read_bytes()
+    return None
+
+
+def has_predefined_etag_range_data(source_url: str, start: int, end: int) -> bool:
+    return get_range_store().covers(source_url, start, end)
 
 
 def has_predefined_etag_chunk_data(key: str) -> bool:
-    return predefined_etag_chunk_data_path(key).is_file()
+    parsed = parse_cache_key_range(key)
+    if parsed is not None:
+        source_url, start, end = parsed
+        if has_predefined_etag_range_data(source_url, start, end):
+            return True
+    path = predefined_etag_chunk_data_path(key)
+    return path.is_file() and path.stat().st_size > 0
 
 
 def delete_predefined_etag_chunk_data(key: str) -> bool:
@@ -155,7 +230,7 @@ def prune_orphan_chunk_data_files() -> dict[str, int]:
         for key, item in list(entries.items()):
             if not isinstance(item, dict):
                 continue
-            if item.get("has_chunk_data") and not predefined_etag_chunk_data_path(str(key)).is_file():
+            if item.get("has_chunk_data") and not has_predefined_etag_chunk_data(str(key)):
                 item.pop("has_chunk_data", None)
                 cleared_flags += 1
         if cleared_flags:
@@ -200,10 +275,71 @@ def _enrich_cache_entries(payload: dict[str, Any]) -> bool:
         if item.get("chunk_index") != chunk_index:
             item["chunk_index"] = chunk_index
             changed = True
+        chunk_size = chunk_size_from_cache_key(str(key))
+        if chunk_size is not None and item.get("chunk_size") != chunk_size:
+            item["chunk_size"] = chunk_size
+            changed = True
         if has_predefined_etag_chunk_data(str(key)) and not item.get("has_chunk_data"):
             item["has_chunk_data"] = True
             changed = True
     return changed
+
+
+def range_store_status(*, src_url: Optional[str] = None) -> dict[str, Any]:
+    """Report continuous range-store coverage per source."""
+    store = get_range_store()
+    payload = load_predefined_etag_cache()
+    entries = payload.get("entries") or {}
+    filter_url = str(src_url or "").strip()
+
+    sources_seen: set[str] = set()
+    for key in entries:
+        parsed = parse_cache_key(str(key))
+        if parsed is None:
+            continue
+        source_url = parsed[0]
+        if filter_url and source_url != filter_url:
+            continue
+        sources_seen.add(source_url)
+
+    # Also include sources that only exist in range_data.
+    range_root = get_settings().cache_dir / "range_data"
+    if range_root.is_dir() and not filter_url:
+        for child in range_root.iterdir():
+            if not child.is_dir():
+                continue
+            index = child / "segments.json"
+            if not index.is_file():
+                continue
+            try:
+                data = json.loads(index.read_text(encoding="utf-8"))
+                src = str(data.get("source_url") or "").strip()
+                if src:
+                    sources_seen.add(src)
+            except (OSError, json.JSONDecodeError):
+                continue
+
+    sources: dict[str, Any] = {}
+    for source_url in sorted(sources_seen):
+        segs = store.list_segments(source_url)
+        if not segs and filter_url:
+            continue
+        span_start = segs[0].start if segs else None
+        span_end = segs[-1].end if segs else None
+        report = store.coverage_report(
+            source_url, span_start=span_start, span_end=span_end
+        )
+        sources[source_url] = report
+
+    result: dict[str, Any] = {
+        "status": "ok",
+        "source_count": len(sources),
+        "sources": sources,
+    }
+    if filter_url:
+        result["src_url"] = filter_url
+        result["coverage"] = sources.get(filter_url)
+    return result
 
 
 def _normalize_cache_payload(data: Any) -> dict[str, Any]:
@@ -303,12 +439,17 @@ def preload_predefined_etag_cache() -> int:
 
 
 def predefined_etag_cache_status(*, src_url: Optional[str] = None) -> dict[str, Any]:
-    """Group cached chunk_index values by normalized source URL."""
+    """Group cached chunk_index values by normalized source URL and chunk_size.
+
+    chunk_index alone is not unique across chunk sizes (see
+    ``chunk_index_from_cache_key``), so entries are grouped by
+    (source_url, chunk_size) to avoid reporting ambiguous chunk_indices.
+    """
     payload = load_predefined_etag_cache()
     entries = payload.get("entries") or {}
     filter_url = str(src_url or "").strip()
 
-    by_source: dict[str, set[int]] = {}
+    by_source: dict[str, dict[int, set[int]]] = {}
     for key, item in entries.items():
         if not isinstance(item, dict):
             continue
@@ -323,14 +464,30 @@ def predefined_etag_cache_status(*, src_url: Optional[str] = None) -> dict[str, 
             chunk_index = chunk_index_from_cache_key(str(key))
         if chunk_index is None:
             continue
-        by_source.setdefault(source_url, set()).add(int(chunk_index))
+        chunk_size = item.get("chunk_size")
+        if chunk_size is None:
+            chunk_size = chunk_size_from_cache_key(str(key))
+        if chunk_size is None:
+            continue
+        by_source.setdefault(source_url, {}).setdefault(int(chunk_size), set()).add(
+            int(chunk_index)
+        )
 
     sources: dict[str, dict[str, Any]] = {}
     for source_url in sorted(by_source.keys()):
-        indices = sorted(by_source[source_url])
+        by_size = by_source[source_url]
+        chunk_sizes: dict[str, Any] = {}
+        total_count = 0
+        for chunk_size in sorted(by_size.keys()):
+            indices = sorted(by_size[chunk_size])
+            chunk_sizes[str(chunk_size)] = {
+                "chunk_indices": indices,
+                "count": len(indices),
+            }
+            total_count += len(indices)
         sources[source_url] = {
-            "chunk_indices": indices,
-            "count": len(indices),
+            "chunk_sizes": chunk_sizes,
+            "count": total_count,
         }
 
     result: dict[str, Any] = {
@@ -342,7 +499,7 @@ def predefined_etag_cache_status(*, src_url: Optional[str] = None) -> dict[str, 
     if filter_url:
         match = sources.get(filter_url)
         result["src_url"] = filter_url
-        result["chunk_indices"] = match["chunk_indices"] if match else []
+        result["chunk_sizes"] = match["chunk_sizes"] if match else {}
         result["count"] = match["count"] if match else 0
     return result
 

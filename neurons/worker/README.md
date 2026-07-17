@@ -73,8 +73,8 @@ export WORKER_GATEWAY_SECRET=your-long-random-worker-secret
 
 1. Registers with the network using your Bittensor wallet (signed authentication)
 2. Connects to the worker gateway via WebSocket to receive `task_offer` messages
-3. For each offer: starts the transfer and sends `task_accept` immediately in parallel, waits for `task_accept_ack`, then submits `task_result` if accepted (aborts transfer if rejected)
-4. Sends `task_result` after the transfer and waits for `task_result_ack` (`completed=true` for scoring)
+3. For each offer: executes the transfer immediately (no accept/reject step)
+4. Sends `task_result` after the transfer and waits for `task_result_ack`, retrying until the ack carries a terminal `status` (e.g. `completed`, `failed`, `rejected`) for scoring
 5. Sends periodic heartbeats to stay registered
 
 ## Environment Variables
@@ -84,9 +84,9 @@ export WORKER_GATEWAY_SECRET=your-long-random-worker-secret
 | `CORE_SERVER_URL`   | no       | BeamCore HTTP base. |
 | `WORKER_GATEWAY_URL`        | **yes**  | Worker-gateway base URL (`http(s)://host:port` — orchestrator or global gateway). |
 | `WORKER_GATEWAY_SECRET`     | **yes**  | Sent as `worker_secret` on the gateway WebSocket query string. |
-| `WORKER_TASK_ACCEPT_ACK_TIMEOUT` | no | Seconds to wait for `task_accept_ack` after `task_accept` is sent (default `8`). |
 | `WORKER_TASK_RESULT_ACK_TIMEOUT` | no | Seconds to wait for `task_result_ack` (default `45`; must exceed orchestrator `ORCH_TASK_RESULT_TIMEOUT`). |
-| `WORKER_EARLY_TRANSFER` | no | Start transfer on `task_offer` before accept ack (default `true`). Set `false` for legacy sequential accept. |
+| `WORKER_TASK_RESULT_SEND_ATTEMPTS` | no | Max attempts to send `task_result` / await a terminal ack status (default `8`). |
+| `WORKER_TASK_RESULT_RECONNECT_WAIT_SECONDS` | no | Wait between `task_result` retries when a send fails (default `2`). |
 | `WORKER_PREWARM_ENABLED` | no | `HEAD` origins on startup and before each transfer to warm DNS/TLS (default `true`). |
 | `WORKER_PREWARM_TIMEOUT` | no | Seconds per origin prewarm request (default `5`). |
 | `WORKER_PREWARM_MAX_ORIGINS` | no | Max persisted origins in `config/workers/<instance>.prewarm-hosts.json` (default `32`). |
