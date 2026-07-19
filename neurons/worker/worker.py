@@ -3863,7 +3863,6 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
     estimated_bytes = estimate_task_bytes(task)
     reserved_capacity = False
 
-    print(f"[Worker] [WS] Task: {task_label(task_id)} offer={task_label(offer_id)}...")
     if not task_id:
         print("[Worker] [WS] Skipping task: missing task_id")
         return False
@@ -3877,6 +3876,12 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
             f"{reason}"
         )
         return False
+
+    print(
+        f"[Worker] [WS] Task: {task_label(task_id)} offer={task_label(offer_id)} "
+        f"src={redact_url(str(transfer_context.get('source_url') or ''))} "
+        f"dest={redact_url(str(transfer_context.get('dest_url') or ''))}"
+    )
 
     capacity_error = try_reserve_ws_capacity(state, task_key, estimated_bytes)
     if capacity_error == "duplicate":

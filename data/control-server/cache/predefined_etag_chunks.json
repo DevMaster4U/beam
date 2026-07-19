@@ -1,5 +1,299 @@
 {
   "entries": {
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_10p1.bin|4750825974|4793626207": {
+      "chunk_hash": "5b64d53e5322a87aba25e8b8ef0d1c46fe45e5a5542c2edc360599f0fba53c46",
+      "etag": "\"11a21a8bc705ef7077b47d5418b230f0\"",
+      "chunk_index": 111,
+      "has_chunk_data": true,
+      "chunk_size": 42800234
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_10p1.bin|7704042120|7746842353": {
+      "chunk_hash": "292a049742df007d5f91761ff396a3d9bd5b503e335a22e35c29d5904c271222",
+      "etag": "\"43ca439296a67cbaee3cd7274d6d190b\"",
+      "chunk_index": 180,
+      "has_chunk_data": true,
+      "chunk_size": 42800234
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_10p1.bin|6933637908|6976438141": {
+      "chunk_hash": "6435a18006c38af9630fe8118cef8e006414e430892dad94347a7ab2064bdd8f",
+      "etag": "\"703fe9e3c970623a9a5c3856f8f61369\"",
+      "chunk_index": 162,
+      "has_chunk_data": true,
+      "chunk_size": 42800234
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_10p1.bin|9330451012|9373251245": {
+      "chunk_hash": "0e6a4b063476b68951c62a813577dc0849d7d7125027cbc31f456b0bf06bd130",
+      "etag": "\"ee6b65c8c33bdb0df02c0240f9ff3c4c\"",
+      "chunk_index": 218,
+      "has_chunk_data": true,
+      "chunk_size": 42800234
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_10p1.bin|3424018720|3466818953": {
+      "chunk_hash": "ac9edeb5342b98b62c0809cf156c04b461c1165b4b29098ff019c69673bec45c",
+      "etag": "\"71c14b7361009e2ae7a2e1224f60b399\"",
+      "chunk_index": 80,
+      "has_chunk_data": true,
+      "chunk_size": 42800234
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_10p1.bin|9715653118|9758453351": {
+      "chunk_hash": "95cf908c502912290279a6cc94c1d278fb22ac19c8e02d1351ab4812dda8d2dd",
+      "etag": "\"f61b5dc089bec323956d3c24e865f545\"",
+      "chunk_index": 227,
+      "has_chunk_data": true,
+      "chunk_size": 42800234
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_10p1.bin|5778031590|5820831823": {
+      "chunk_hash": "a2867796cb265c809f3e8e14b53026ec52629d995437f403e70c6cf39067447a",
+      "etag": "\"a578cdb83c40a0f77af75d58fe06e0c3\"",
+      "chunk_index": 135,
+      "has_chunk_data": true,
+      "chunk_size": 42800234
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_10p1.bin|42800234|85600467": {
+      "chunk_hash": "15104159d398e600279fc6570de87e282907cea93a5a2f646f1652c2fc85c17c",
+      "etag": "\"2d25b4f2347185a0cdcf58d713733808\"",
+      "chunk_index": 1,
+      "has_chunk_data": true,
+      "chunk_size": 42800234
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_10p1.bin|5718765436|5761442789": {
+      "chunk_hash": "302a21b61e1f2ba5e3c467cdf36d29427bf522b4bfb3a9872cc1a703bb504ea3",
+      "etag": "\"d9ff025be6c712c26bac60f26e7e15a9\"",
+      "chunk_index": 134,
+      "has_chunk_data": true,
+      "chunk_size": 42677354
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_10p1.bin|6785699286|6828376639": {
+      "chunk_hash": "e447f66aaa02d9f0c4787823cbf0c8e70449d5fc69574ed40ae108f124fb22e2",
+      "etag": "\"ad391f46395b9e8460139ea98f468538\"",
+      "chunk_index": 159,
+      "has_chunk_data": true,
+      "chunk_size": 42677354
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_10p1.bin|1322997974|1365675327": {
+      "chunk_hash": "7976729bd53b2454fdb299f1ef4d2b0fcf5a69ee697886075e92a65f151ba83d",
+      "etag": "\"33f466c8f8686da3455ab5b9784f9b92\"",
+      "chunk_index": 31,
+      "has_chunk_data": true,
+      "chunk_size": 42677354
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_10p1.bin|10754693208|10797370561": {
+      "chunk_hash": "fd3ac80ed75639d7c1863e3c89af490341d0aef3a87154bdadbdada76dff54b2",
+      "etag": "\"733177c4ed03bd6b7a0a60a002856adb\"",
+      "chunk_index": 252,
+      "has_chunk_data": true,
+      "chunk_size": 42677354
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_10p1.bin|725515018|768192371": {
+      "chunk_hash": "7a325714d9b635889908a35a7cd9b7d6c4578f03e1889deab9d7577abcf5494e",
+      "etag": "\"46c938f11d8d14644a2b6122f340ad97\"",
+      "chunk_index": 17,
+      "has_chunk_data": true,
+      "chunk_size": 42677354
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_10p1.bin|6956408702|6999086055": {
+      "chunk_hash": "425201de3c7ec4c736953121366f1246a48975a1e398359b349544f16550b763",
+      "etag": "\"d9ab159f9fbe6348faf4ece0901072d0\"",
+      "chunk_index": 163,
+      "has_chunk_data": true,
+      "chunk_size": 42677354
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_10p1.bin|5500581120|5543554409": {
+      "chunk_hash": "5b46967dac9a55528b8576e45c3512f98d19f207d08fd624a1c71d5cd052eb96",
+      "etag": "\"8202118c1fe13e6509b89d486d69c801\"",
+      "chunk_index": 128,
+      "has_chunk_data": true,
+      "chunk_size": 42973290
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_10p1.bin|1590011730|1632985019": {
+      "chunk_hash": "57645f8f96651f7c2eba0f7aad3f563d0fccb2ddf358938e23dc0cd37f9720fe",
+      "etag": "\"426b96909e78bbbfd770aebc03d2d6bb\"",
+      "chunk_index": 37,
+      "has_chunk_data": true,
+      "chunk_size": 42973290
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_50_p_gb.bin|15011098500|15071142893": {
+      "chunk_hash": "3285cdd1fc140f93596d3adf248109aba7d4ad0335cab7402e71933cea993ee2",
+      "etag": "\"2205a0e21eab07f5dcb9516e5c73cded\"",
+      "chunk_index": 250,
+      "has_chunk_data": true,
+      "chunk_size": 60044394
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_50_p_gb.bin|33384683064|33444727457": {
+      "chunk_hash": "30ecb62164dc3774307a8f15101b375b79eb7e198a2f58d9fc34fd1f89b905a3",
+      "etag": "\"bd1ee98eaef97657998e29b36b8f7a19\"",
+      "chunk_index": 556,
+      "has_chunk_data": true,
+      "chunk_size": 60044394
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_50_p_gb.bin|46054050198|46114094591": {
+      "chunk_hash": "7c2806a3925451c1c04aadb1b581b3b29486ee2c6104965d0c1ecf98a241cdc5",
+      "etag": "\"1fceafec161edf9a8001e41939e46e23\"",
+      "chunk_index": 767,
+      "has_chunk_data": true,
+      "chunk_size": 60044394
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_50_p_gb.bin|50617424142|50677468535": {
+      "chunk_hash": "ecd19821cd8575a2028e8b7d78628ac4bc98f89a32ff7dee8c5f9576126ac347",
+      "etag": "\"51c3c2344cf113c35090b62a74eff689\"",
+      "chunk_index": 843,
+      "has_chunk_data": true,
+      "chunk_size": 60044394
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_50_p_gb.bin|3122308488|3182352881": {
+      "chunk_hash": "1401e4de1bf29c9b4d12c1949bc216c2f31361c1fb727ef253499427cb5622d0",
+      "etag": "\"2faa9a4ee1d37975ff6d8e8435ec2779\"",
+      "chunk_index": 52,
+      "has_chunk_data": true,
+      "chunk_size": 60044394
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_50_p_gb.bin|40169699586|40229743979": {
+      "chunk_hash": "5557272479ff077f1036ac60c94bf06967b2ec3e7db700d6962a2a65ae53ef3a",
+      "etag": "\"cc834e54d64db192b5f7381e4d5852c3\"",
+      "chunk_index": 669,
+      "has_chunk_data": true,
+      "chunk_size": 60044394
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_50_p_gb.bin|19634516838|19694561231": {
+      "chunk_hash": "fff609288399f9fdc1edd24d925f19b461ef27b9f6eb1b722288dcebcf6b01eb",
+      "etag": "\"7fd706a4b357c1018d398b9973ac9ef0\"",
+      "chunk_index": 327,
+      "has_chunk_data": true,
+      "chunk_size": 60044394
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_50_p_gb.bin|29541841848|29601886241": {
+      "chunk_hash": "04b582e8beb226e5ebadef05618a550cc72511cab57dd40b357c5d38881f0b59",
+      "etag": "\"ebf164ec5caa4ee9e2ff84250900651c\"",
+      "chunk_index": 492,
+      "has_chunk_data": true,
+      "chunk_size": 60044394
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_50_p_gb.bin|40890232314|40950276707": {
+      "chunk_hash": "200cd56928f3ee69ddc28873c291bcc0c1f3da43641f65a72044072a2a88f9f3",
+      "etag": "\"08f04b3c8c1a8cada45d52a7b0e8afc2\"",
+      "chunk_index": 681,
+      "has_chunk_data": true,
+      "chunk_size": 60044394
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_50_p_gb.bin|41250498678|41310543071": {
+      "chunk_hash": "d1c7caff9a90643da27284ccec639d08a2e03a00e462068838ffa0e802e1bb78",
+      "etag": "\"3a759ef8e6d962292bb304cf64e65487\"",
+      "chunk_index": 687,
+      "has_chunk_data": true,
+      "chunk_size": 60044394
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_50_p_gb.bin|14712381810|14772432347": {
+      "chunk_hash": "d005db77940f9ef2f8dace582b9163ebebec6307fe0696815fd990efe02ea7c3",
+      "etag": "\"c2b268ffb9f712fa54a67c51a81d42b9\"",
+      "chunk_index": 245,
+      "has_chunk_data": true,
+      "chunk_size": 60050538
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_50_p_gb.bin|5224396806|5284447343": {
+      "chunk_hash": "0a11bdc05d5a5a0ce429270cb1ee073873acf0edaa3cb32eb7588d07ab8104e7",
+      "etag": "\"b85eb928c91b98a540632b970691cbb5\"",
+      "chunk_index": 87,
+      "has_chunk_data": true,
+      "chunk_size": 60050538
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_50_p_gb.bin|23659911972|23719962509": {
+      "chunk_hash": "18452b1221941f1c709f3f9adc92c23a44a0010d1bf2880f69b33403d2757a47",
+      "etag": "\"84c637595755fe387de7ca1b9fb5aa1e\"",
+      "chunk_index": 394,
+      "has_chunk_data": true,
+      "chunk_size": 60050538
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_50_p_gb.bin|34048655046|34108705583": {
+      "chunk_hash": "d63ece2db165cc4af0ca41c51f1357b179d99dfb5417c2ac9960283f2a3bbee8",
+      "etag": "\"79c01816ade99835507e6fb2dfdd5ae6\"",
+      "chunk_index": 567,
+      "has_chunk_data": true,
+      "chunk_size": 60050538
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_50_p_gb.bin|47079621792|47139672329": {
+      "chunk_hash": "b883548342b18a5e2db63993b3467ba1d57867492826876840f804bf03291d8a",
+      "etag": "\"955ad8966821b650560076c4ea399c3d\"",
+      "chunk_index": 784,
+      "has_chunk_data": true,
+      "chunk_size": 60050538
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_50_p_gb.bin|44977852962|45037903499": {
+      "chunk_hash": "7646c5533bd0c5a987ed5d332c7c50516e797e4bc27e5751d4dc034b226f09f1",
+      "etag": "\"48027d03177f0d87d9f51ed4d7be465f\"",
+      "chunk_index": 749,
+      "has_chunk_data": true,
+      "chunk_size": 60050538
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_50_p_gb.bin|21197839914|21257890451": {
+      "chunk_hash": "d95dd7e71fdc44831bf8651edc6b3eb20f17c589affe64eb1b4fed60a5fae4f1",
+      "etag": "\"3b255b7bd0161732f1bfe003e4d296d7\"",
+      "chunk_index": 353,
+      "has_chunk_data": true,
+      "chunk_size": 60050538
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_50_p_gb.bin|23059406592|23119457129": {
+      "chunk_hash": "31fd55b8942090f1e44ed422db32eba510a4d1cb6de8db3a251be71b1cb0ca97",
+      "etag": "\"aa47b53559de06fb4ec572f53a76d043\"",
+      "chunk_index": 384,
+      "has_chunk_data": true,
+      "chunk_size": 60050538
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_50_p_gb.bin|17114403330|17174453867": {
+      "chunk_hash": "6db52fe3ee0bd4b18f1d62f6f71f6bcb6733184f1827bf8b618feae7c79eed11",
+      "etag": "\"eaeec37c098d233c00d4b9f2778ccd91\"",
+      "chunk_index": 285,
+      "has_chunk_data": true,
+      "chunk_size": 60050538
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_50_p_gb.bin|15673190418|15733240955": {
+      "chunk_hash": "a387972304718038e4ca63a04337f5ecca48719839527ecdaf1d52c07162045f",
+      "etag": "\"c23f96fff31a193885231f4a719d31e9\"",
+      "chunk_index": 261,
+      "has_chunk_data": true,
+      "chunk_size": 60050538
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_50_p_gb.bin|46178863722|46238914259": {
+      "chunk_hash": "ac302f8aad911aed7ae5a397612b868e77275cbbae80eb3a099044e515a7090e",
+      "etag": "\"fc1bceed38a51703569645f1ea06904d\"",
+      "chunk_index": 769,
+      "has_chunk_data": true,
+      "chunk_size": 60050538
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_50_p_gb.bin|38492394858|38552445395": {
+      "chunk_hash": "b777f8eb11ab774d41c2ad23391caa14b022e25b149cdaa43bfff6474d369ab3",
+      "etag": "\"7cfc6207146c596112460acd1991a9b5\"",
+      "chunk_index": 641,
+      "has_chunk_data": true,
+      "chunk_size": 60050538
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_10p1.bin|2264931270|2315263075": {
+      "chunk_hash": "950ccc3572a09e863a43587ab2c260703bdbd2e17f944c724622563aa0fca40d",
+      "etag": "\"e3e8263685a939370c7bb3f4eac82f57\"",
+      "chunk_index": 45,
+      "has_chunk_data": true,
+      "chunk_size": 50331806
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_10p1.bin|5083512406|5133844211": {
+      "chunk_hash": "257ce81b370c441a2289965595b188b0d84763b113593352bf8931731b09c8a3",
+      "etag": "\"844b528da058e5c2b026a71acbc4131c\"",
+      "chunk_index": 101,
+      "has_chunk_data": true,
+      "chunk_size": 50331806
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_10p1.bin|6845125616|6895457421": {
+      "chunk_hash": "d4181496b393e820d5dc1051452d8367ebcff288ce9231fa0f090a5273f4c201",
+      "etag": "\"3aebc1dae1f4df387540183a3fdb51b6\"",
+      "chunk_index": 136,
+      "has_chunk_data": true,
+      "chunk_size": 50331806
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_10p1.bin|11475651768|11525983573": {
+      "chunk_hash": "15eb9e9642382b1f4fc0557d2a4c33609a3b5d67825c4008fa7d25469d7fe1d4",
+      "etag": "\"6e86a0ead841e03fff04279705eebabb\"",
+      "chunk_index": 228,
+      "has_chunk_data": true,
+      "chunk_size": 50331806
+    },
     "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|2415926688|2466258493": {
       "chunk_hash": "648ebcf29e0e4d293a3d9f3a05e4ae0ee9dbe04af37dec6e6a031c61cbabe200",
       "etag": "\"2a3c45ca2091be91c23e98204566cfaf\"",
@@ -67,6 +361,13 @@
       "chunk_hash": "f324801bf052f445723eefc64b17f2f2a7e62c15590022ea5696627502764929",
       "etag": "\"471be88051d897cc1d1a1b1a14718b84\"",
       "chunk_index": 177,
+      "has_chunk_data": true,
+      "chunk_size": 50331806
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_10p1.bin|10016029394|10066361199": {
+      "chunk_hash": "dfb5d0fffecf8b5fc29fca5a6a4d5bbacf93218252f64641561e8e092fa6d1e4",
+      "etag": "\"b551c042a7a67979c0273b9ee708020d\"",
+      "chunk_index": 199,
       "has_chunk_data": true,
       "chunk_size": 50331806
     },
@@ -7657,7 +7958,1888 @@
       "chunk_index": 92,
       "has_chunk_data": true,
       "chunk_size": 43385944
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|5872025600|5913968639": {
+      "chunk_hash": "d23dc8168115592b16d5ca3197de0d566fc1bb679f447cb8966bc2f8143d33cc",
+      "etag": "\"f0d089719e5cd417143dbdfaccd76693\"",
+      "chunk_index": 140,
+      "has_chunk_data": true,
+      "chunk_size": 41943040
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|8136949760|8178892799": {
+      "chunk_hash": "74496c73e267104c195b297a098c9a30a89ea6b3ce476d94411bfb5ce00b9d6c",
+      "etag": "\"29186ba55445bb3bcb1f847f0c452879\"",
+      "chunk_index": 194,
+      "has_chunk_data": true,
+      "chunk_size": 41943040
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|12121538560|12163481599": {
+      "chunk_hash": "edda1bba00233c7525acaa43e026eef718a652d9220365bb75993c84f077008c",
+      "etag": "\"cfcf6ea785992a2b9e61b72ecd2873ba\"",
+      "chunk_index": 289,
+      "has_chunk_data": true,
+      "chunk_size": 41943040
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|16693329920|16735272959": {
+      "chunk_hash": "f0845ff8c1f476b6caf6764342bd711bc0d9ddc028fba93c2528e0c319bc5c6a",
+      "etag": "\"ce68c030f350a6474d57ce6ba4e3d178\"",
+      "chunk_index": 398,
+      "has_chunk_data": true,
+      "chunk_size": 41943040
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|12666798080|12708741119": {
+      "chunk_hash": "2d452958dbbaa6127ea0deae1e5d79b88c74f8c2e807eab35c142688018a6c39",
+      "etag": "\"884ef4ec2a61d50793e4462032034478\"",
+      "chunk_index": 302,
+      "has_chunk_data": true,
+      "chunk_size": 41943040
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|20006830080|20048773119": {
+      "chunk_hash": "a117ef88b9a6d92857a6b1859a90cf04ee999291a57c7db2f62ed6313c5fa757",
+      "etag": "\"67c40fac21277e8ee11e7f1b3a490374\"",
+      "chunk_index": 477,
+      "has_chunk_data": true,
+      "chunk_size": 41943040
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|20761804800|20803747839": {
+      "chunk_hash": "95e6ed80bd69793cc1da876a3873ac3d79144a2489d5bdf2b1b0eebf940a72d2",
+      "etag": "\"0428a1aa6755902410c18ccbf9fa0fe1\"",
+      "chunk_index": 495,
+      "has_chunk_data": true,
+      "chunk_size": 41943040
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|18748538880|18790481919": {
+      "chunk_hash": "0165a58351f92dd83cd55af858a95ddd1c140937524100337be181104eae8ded",
+      "etag": "\"68563b41b021bf22c0443d1bb875c19c\"",
+      "chunk_index": 447,
+      "has_chunk_data": true,
+      "chunk_size": 41943040
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|3565158400|3607101439": {
+      "chunk_hash": "f077f261fb659d3143f620e77419864d9e6fcbbddced5666c1aac0b232b8b39b",
+      "etag": "\"295f91eec8afd621b8494e14cbfd761a\"",
+      "chunk_index": 85,
+      "has_chunk_data": true,
+      "chunk_size": 41943040
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|8766095360|8808038399": {
+      "chunk_hash": "fb7d1f6f4348268ff24cbe62c3f16d22b512c9d27564eb7addff88834a114e57",
+      "etag": "\"51d2c884560d990c7cdf80d45e35008f\"",
+      "chunk_index": 209,
+      "has_chunk_data": true,
+      "chunk_size": 41943040
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|9898557440|9940500479": {
+      "chunk_hash": "dd5370e206f159a60166eeed5c992a57ddb5bc58ab1c61fec88fc944909784da",
+      "etag": "\"3f6e0feec893af080e4ee60986d4d36c\"",
+      "chunk_index": 236,
+      "has_chunk_data": true,
+      "chunk_size": 41943040
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|19000197120|19042140159": {
+      "chunk_hash": "57bcc1cc0c16ce46f7321333d89726d43d9d1ea43aea976ccd231ce975590764",
+      "etag": "\"8699997c648a8ce8805aa16dbe584246\"",
+      "chunk_index": 453,
+      "has_chunk_data": true,
+      "chunk_size": 41943040
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|10234101760|10276044799": {
+      "chunk_hash": "6bd6c5f042469cc4ea17e35bc80fd23120361f75035b904ab5aebd8237bc1604",
+      "etag": "\"dbe197a505a788352d0dc0f0f63fa488\"",
+      "chunk_index": 244,
+      "has_chunk_data": true,
+      "chunk_size": 41943040
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|900825912|943722383": {
+      "chunk_hash": "60f05fb974fd1df843d0bf6d265fcf3e1dab3251cc2e2b8471925db90b16fed1",
+      "etag": "\"2533ccc6390d2c75e70a259256196e6c\"",
+      "chunk_index": 21,
+      "chunk_size": 42896472,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|8579294400|8622190871": {
+      "chunk_hash": "d109fac388f081eff0324a7a99a754c07b17baf0fb05908cc1298869892a97b0",
+      "etag": "\"b017862d3d0971cc0dcfc1a143dc1c43\"",
+      "chunk_index": 200,
+      "chunk_size": 42896472,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|986618856|1029515327": {
+      "chunk_hash": "0840b90cff0104c6dd92a0fcbfc04b76327c5ec67851c890741167c0548f604a",
+      "etag": "\"51e843b4fe17a009274834496d4426e2\"",
+      "chunk_index": 23,
+      "chunk_size": 42896472,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|1930341240|1973237711": {
+      "chunk_hash": "3ab30fad25801a5a3750f68be442ed3febe9ebca1eab31267a04fe6e90dc8718",
+      "etag": "\"e85b2da593120dfad142632faeac9807\"",
+      "chunk_index": 45,
+      "chunk_size": 42896472,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|1544272992|1587169463": {
+      "chunk_hash": "f7c4ed39c2fb95d5c6ed90aaef83f8ff765b6abe1b6b75e5172c378aafeb2993",
+      "etag": "\"0751f9bb87146186d5ccc88e4ae765ca\"",
+      "chunk_index": 36,
+      "chunk_size": 42896472,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|3088545984|3131442455": {
+      "chunk_hash": "88b46bf28dba0017a172a2fe7d0c3f7f9bb965884db8ec11b6cf107f4d99489b",
+      "etag": "\"2354368d87686ccbd75233045d590ed6\"",
+      "chunk_index": 72,
+      "chunk_size": 42896472,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|10809910944|10852807415": {
+      "chunk_hash": "9067d97ad2561d2434c5d18add030adcbb2f45332b6a99a4a78108af8f4c10f9",
+      "etag": "\"943cb62572f1803c832d887daea4d90b\"",
+      "chunk_index": 252,
+      "chunk_size": 42896472,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|13040527488|13083423959": {
+      "chunk_hash": "05757784f427934b0c2ece28836f0f26470dfccc1fcab51bfab7bfa9512c8613",
+      "etag": "\"bcfa178bbb3c42ad8adbe954075fefac\"",
+      "chunk_index": 304,
+      "chunk_size": 42896472,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|12654459240|12697355711": {
+      "chunk_hash": "4001e56498d2df725443edf11756027b204887901732e0014346f8ab66cd3556",
+      "etag": "\"bd7896a70b85cdaeb2411fea27b7e9f5\"",
+      "chunk_index": 295,
+      "chunk_size": 42896472,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|14584800480|14627696951": {
+      "chunk_hash": "10492035ab0c79461cd88663d433693ce43ccf7759fe9980f8dd09078596f92e",
+      "etag": "\"49bc613aa648e2e8c1b951c75f790445\"",
+      "chunk_index": 340,
+      "chunk_size": 42896472,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|13769767512|13812663983": {
+      "chunk_hash": "860f4bd5dc2420707c5cad7817f68e30af5d7c39a892f40314a8c854dfc545e3",
+      "etag": "\"45c1ebf7272feaa3cfbc0bd58fd1ad7e\"",
+      "chunk_index": 321,
+      "chunk_size": 42896472,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|18831551208|18874447679": {
+      "chunk_hash": "d29e3afc41dd834a8ac7f73cb92d818a480e5842422a04d2ead01af000fe97bb",
+      "etag": "\"56077d9e0d44b1114989370bcc2433d4\"",
+      "chunk_index": 439,
+      "chunk_size": 42896472,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|19046033568|19088930039": {
+      "chunk_hash": "f73fd85f7d14458f64dc75602a036021c0adb0d419aba9c9993a20b872d1640e",
+      "etag": "\"f0f58adf1d7d3550319e2b6371ee69cd\"",
+      "chunk_index": 444,
+      "chunk_size": 42896472,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|20590306560|20633203031": {
+      "chunk_hash": "e056ff71f819e2c1ce141fcac61d504ee7eb5fdeaeaa28a8a0abc49d57f930c7",
+      "etag": "\"0e204cc6854be42120832409e1c50942\"",
+      "chunk_index": 480,
+      "chunk_size": 42896472,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|21147960696|21190857167": {
+      "chunk_hash": "f52366d97ee7828a3c2015236ba7c39565961ad47b6b1971fdd3a77e5beed2bc",
+      "etag": "\"fb0350a0b4ea01f9c1ecdf5f39ffc4af\"",
+      "chunk_index": 493,
+      "chunk_size": 42896472,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|19217619456|19260515927": {
+      "chunk_hash": "f60ebe4a8b5326fd9690100313c74211e1c861befebfedb9bd8cf760fea76102",
+      "etag": "\"2a28b75ea1240a6ae939defa36fcc2a1\"",
+      "chunk_index": 448,
+      "chunk_size": 42896472,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|5367540384|5410826999": {
+      "chunk_hash": "5be875967630ceaa8ffea9446b37b4db57ea543c4b584f9598db2a244e6f4fd3",
+      "etag": "\"03311fbc877b0c15dc484d8e12f9e3c0\"",
+      "chunk_index": 124,
+      "chunk_size": 43286616,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|3289782816|3333069431": {
+      "chunk_hash": "256fa223be0b579d442217aab988144420525ae29f7d21bbf75a623c05e5fe57",
+      "etag": "\"5ffcd2d44634bae9127ae96a096b7684\"",
+      "chunk_index": 76,
+      "chunk_size": 43286616,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|5713833312|5757119927": {
+      "chunk_hash": "9630759009b855a867d20519367b1e183d03df3b288ce2d65062585abf2f112c",
+      "etag": "\"76d8386e867bf974925c5914c2e6fcf6\"",
+      "chunk_index": 132,
+      "chunk_size": 43286616,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|1818037872|1861324487": {
+      "chunk_hash": "03056cf56262d0d12c21585606189ae5f508391c40a54dcd8498390102eb158c",
+      "etag": "\"ff387ff10e9a328e26d04ed5d41e76df\"",
+      "chunk_index": 42,
+      "chunk_size": 43286616,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|7185578256|7228864871": {
+      "chunk_hash": "41bdf02f77af20288df4effd2bb489cd938c9001d5812190da3d249261e9782b",
+      "etag": "\"a5e21f7b75a1b0c769b02e0dc3711527\"",
+      "chunk_index": 166,
+      "chunk_size": 43286616,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|6579565632|6622852247": {
+      "chunk_hash": "6478342adea22d27a1e44bda56749401157d8ab86b955b379c9cbf89433ac1ca",
+      "etag": "\"858aeca3ec4b6a4f8bf7359d870ac492\"",
+      "chunk_index": 152,
+      "chunk_size": 43286616,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|13635284040|13678570655": {
+      "chunk_hash": "073129583ba2ab6faed3d5a3054aa3f67bb86db317d87d693628792725975539",
+      "etag": "\"e631bf0090210955d681519b1c27f481\"",
+      "chunk_index": 315,
+      "chunk_size": 43286616,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|9349909056|9393195671": {
+      "chunk_hash": "d1212566175d869cb16792ab8b7209728c098d4e63fa35a3e54d946e3778f932",
+      "etag": "\"295ae57cccb66c3a51123f352b217009\"",
+      "chunk_index": 216,
+      "chunk_size": 43286616,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|12163539096|12206825711": {
+      "chunk_hash": "6d3d089208e55c90257998e40b4d9c47ffc824ad9e672b785658312015f6e0c4",
+      "etag": "\"306ae135d1f6dd4fbab56a66e784f9eb\"",
+      "chunk_index": 281,
+      "chunk_size": 43286616,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|10345501224|10388787839": {
+      "chunk_hash": "88cc6884d801147aad3fa89b708c7aca65e8f62c1e98edc282d60b8da9040e5e",
+      "etag": "\"ae24dfc108f7c7b13cd32e0db72c621e\"",
+      "chunk_index": 239,
+      "chunk_size": 43286616,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|9133475976|9176762591": {
+      "chunk_hash": "190a3e096f64431920762ad18444c52d30d3877e8fe9e09fa85cecc7786e005e",
+      "etag": "\"5eef7e164b069683fb25236d719079a2\"",
+      "chunk_index": 211,
+      "chunk_size": 43286616,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|16578773928|16622060543": {
+      "chunk_hash": "789595b0c93cdf2466d1027d78bddc72884cf94ba2670cdf0e15792f09ce6594",
+      "etag": "\"b53f3c1ec5221659564e87b77c2a456e\"",
+      "chunk_index": 383,
+      "chunk_size": 43286616,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|21210441840|21253728455": {
+      "chunk_hash": "0ec5cfe9f9741bcf5f52a95c21ad24900c1adca33ad69a50489cac42953164dc",
+      "etag": "\"5f618d3ac382c170efcc4212a8bd9d1b\"",
+      "chunk_index": 490,
+      "chunk_size": 43286616,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|17790799176|17834085791": {
+      "chunk_hash": "9974faf0206612b0421cebce3dd620ad0793d4ade362663f60b3a0e7a9c676d5",
+      "etag": "\"6e75cddc22b417025efd8df9ad5d3944\"",
+      "chunk_index": 411,
+      "chunk_size": 43286616,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|19219257504|19262544119": {
+      "chunk_hash": "cdf68b41bde7173f1f78881aa83773be1c81a97c28a0ae95c96feb251ad53e5b",
+      "etag": "\"0a32f40e230e62059bb890fc118560af\"",
+      "chunk_index": 444,
+      "chunk_size": 43286616,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|909018936|952305551": {
+      "chunk_hash": "5b933e881d8652cf2997b14b7910d2fda2d474130a3bac36f5ce8e30511b8e63",
+      "etag": "\"213ffea183ea63fbfe9fd190e988d8a2\"",
+      "chunk_index": 21,
+      "chunk_size": 43286616,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|4744406480|4787537447": {
+      "chunk_hash": "ee9179f3efa65bc149dd553ddd8569caecccd52d5e634c6037d2c203f45640e2",
+      "etag": "\"56bd97410c12d0b5bfb41e8aef2cb4bd\"",
+      "chunk_index": 110,
+      "chunk_size": 43130968,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|5434501968|5477632935": {
+      "chunk_hash": "2cc086cae3e21797412591a8ea6ca4c927eba626c74290dba12338e7342fb729",
+      "etag": "\"63152930d956ef31a1e34f3623302d55\"",
+      "chunk_index": 126,
+      "chunk_size": 43130968,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|7936098112|7979229079": {
+      "chunk_hash": "5e30755716b5b8bd206bf0b452a12145ede658111e412647c9e6ee1bd6013c6a",
+      "etag": "\"c247aa2795545165bd9ebbbff2c5ebf0\"",
+      "chunk_index": 184,
+      "chunk_size": 43130968,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|6038335520|6081466487": {
+      "chunk_hash": "59ceba1dd767712fb69635992fecbcc4ea700332479a63779a4aa18386644f3d",
+      "etag": "\"d74b8343f6386502cacdf20661596d2d\"",
+      "chunk_index": 140,
+      "chunk_size": 43130968,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|5693287776|5736418743": {
+      "chunk_hash": "c24a8cbaf283d40ed038fc3521ddddfa4be6015589ced27ece3b7f8c287dcd13",
+      "etag": "\"1c404ac207a8926204d5c3e48a1be9fa\"",
+      "chunk_index": 132,
+      "chunk_size": 43130968,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|17338649136|17381780103": {
+      "chunk_hash": "3b8dd932577e4348a29ef1b843df2f9a51107e6465eb7199c471956a2d7e9103",
+      "etag": "\"2d6aee879df5f4618641a8ba6d578645\"",
+      "chunk_index": 402,
+      "chunk_size": 43130968,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|10653349096|10696480063": {
+      "chunk_hash": "69739270bcdb37db046b067b8f29d88aa64e4e0f42865ea0d8d9125b266faa79",
+      "etag": "\"d924e527822fe430178ec5210416c6d1\"",
+      "chunk_index": 247,
+      "chunk_size": 43130968,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|9661336832|9704467799": {
+      "chunk_hash": "f8a6d5446e0f4e4c3433c558ba01cc3ba42926124ecacc54a406440dd361620d",
+      "etag": "\"41622c4d5b4cc6b0b426ca4dad275553\"",
+      "chunk_index": 224,
+      "chunk_size": 43130968,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|17166125264|17209256231": {
+      "chunk_hash": "18f1ef56c3ace9a53488a8795b4672b5a9c437b004f37442d4c6926ce7fbb09c",
+      "etag": "\"8ac4241e9379eb5e68291c3f0beb9889\"",
+      "chunk_index": 398,
+      "chunk_size": 43130968,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|20099031088|20142162055": {
+      "chunk_hash": "a95fca93a2af7c85618a45ff9c9bc358491bbcabaed4a41b90e0259377bf51ea",
+      "etag": "\"29fc0820872a93e2699a46f25fe963c3\"",
+      "chunk_index": 466,
+      "chunk_size": 43130968,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|18028744624|18071875591": {
+      "chunk_hash": "8bead32e5c87953c51f10f532e81641025cc62617e64cfb98d1eb4770329a575",
+      "etag": "\"83245c0ca9c34c749765f037507951a4\"",
+      "chunk_index": 418,
+      "chunk_size": 43130968,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|9014372312|9057503279": {
+      "chunk_hash": "beca89f133bfa9921986209c01a2f12d58cb0ba3e29932c472e15f30da314290",
+      "etag": "\"9cca62d23db6a703d9c915d4da15ac34\"",
+      "chunk_index": 209,
+      "chunk_size": 43130968,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|12637373624|12680504591": {
+      "chunk_hash": "5314b367aa76c4e2a445dfc25796a955aebb8e692ee892cf0ca017938e85aff7",
+      "etag": "\"e2439cc77f3b9002d63971e050c25002\"",
+      "chunk_index": 293,
+      "chunk_size": 43130968,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|5865811648|5908942615": {
+      "chunk_hash": "21bce8b4b365c755589740c6e7827bb007cc44f711cba800f0728493af79cbf3",
+      "etag": "\"55f9a6c5902b62efdfae551e5d810e70\"",
+      "chunk_index": 136,
+      "chunk_size": 43130968,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|20961650448|21004781415": {
+      "chunk_hash": "6a702fd5bf16e7d19c88444d797deaa68e324f70a94f5166c8414071d54b86ea",
+      "etag": "\"03fbb83bad7153ea48be12842aa1bb5e\"",
+      "chunk_index": 486,
+      "chunk_size": 43130968,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|20745995608|20789126575": {
+      "chunk_hash": "83254a3f316ce24aacb21466f5d37343176fd7f35ce1fbfd24d82d9cd61568ca",
+      "etag": "\"48f4ecdfdaf0ecc7446ee5af55ad3d94\"",
+      "chunk_index": 481,
+      "chunk_size": 43130968,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|1961650128|2004294695": {
+      "chunk_hash": "b832cdc967f0269b47638221d8a4c6bf2a34c69ea5df3ab22729b98adda64c51",
+      "etag": "\"e74492448f531b163c6f54160ff321b9\"",
+      "chunk_index": 46,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|2729252352|2771896919": {
+      "chunk_hash": "7733e0409fedbc84090751b6727840e87b630ce80aac756c0a7131d7e06021b9",
+      "etag": "\"9959f786957b1661b3f7f9cfae66e62a\"",
+      "chunk_index": 64,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|1108758768|1151403335": {
+      "chunk_hash": "aa6e01bc2579889d7cee6fd3bffaef77553c493ba5a69e45e985ced9fc8d2ceb",
+      "etag": "\"8e0996c247012789ca9296cbe8727f2c\"",
+      "chunk_index": 26,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|810246792|852891359": {
+      "chunk_hash": "72c8d2f3880606eee4990463d553feed08aa22e42ad466cadcc75546fd744571",
+      "etag": "\"542e5d3baacb89f7324056af973dfa4e\"",
+      "chunk_index": 19,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|980825064|1023469631": {
+      "chunk_hash": "66dcd95856d6c6f889c5064a5045ebfe2fb25760c8a101e86f0ecd29c812c6ff",
+      "etag": "\"2a247947a2ed7c038a50f4b83d101f7a\"",
+      "chunk_index": 23,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|4051233960|4093878527": {
+      "chunk_hash": "83b79982ae91a0b73054a11226b126f1f85e64e5b5a2419279dafa70e025963e",
+      "etag": "\"4aac49da6e5a5fb167979b5301f5c05f\"",
+      "chunk_index": 95,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|5714372112|5757016679": {
+      "chunk_hash": "705137da8fd5ccf9a1d56c0867588fa0db29e027376e310041c73641d3e3d618",
+      "etag": "\"84a7b49142ad42bdf4691163ed85af85\"",
+      "chunk_index": 134,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|4264456800|4307101367": {
+      "chunk_hash": "6a32e61c7a6462ca06d22f536f59481f944a69073cc1bbca0cd7d7c4da410291",
+      "etag": "\"89c8668ed4291353b201f5e8ce885a9e\"",
+      "chunk_index": 100,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|3667432848|3710077415": {
+      "chunk_hash": "81c4e298e30f3278d502c13ca75c741fdba2d8023d70e2e5e45ac239242f60ec",
+      "etag": "\"5e2fd8d7cc07d4c0f4388f43078bc560\"",
+      "chunk_index": 86,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|4818836184|4861480751": {
+      "chunk_hash": "cc2d70e901a321868a3c577b98b9f19eb280b621cbff96d8442d9e52edeafd43",
+      "etag": "\"92877002ffa4a8f2e6e7537b5b0a8043\"",
+      "chunk_index": 113,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|7377510264|7420154831": {
+      "chunk_hash": "dbb83de5f7571d47fa1279026fc08f07d5255da7de585fa3c61c010ecf2b4c29",
+      "etag": "\"6697bcae755af09c30966c9ec65eadcb\"",
+      "chunk_index": 173,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|9467094096|9509738663": {
+      "chunk_hash": "430931113d03bf95d06a3a98fd07d2470a819d2752d6d6ba3dfe4f9f7daf3130",
+      "etag": "\"cd3f24b74cc7457ff033634295b3748b\"",
+      "chunk_index": 222,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|7078998288|7121642855": {
+      "chunk_hash": "1e946f2933517d19db9fe102602631d5e430c2e88c9c30abb042af6766867cc3",
+      "etag": "\"f8aff8b67a487566d94c2d7fcb4f23fb\"",
+      "chunk_index": 166,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|8187757056|8230401623": {
+      "chunk_hash": "82a67cca589dbd3cf909f686c7693d57ded292da5360b4c5c8dab2dbd8d4000f",
+      "etag": "\"152fef86e23353248392547af1b92e4f\"",
+      "chunk_index": 192,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|11897834472|11940479039": {
+      "chunk_hash": "9804a851b7aa9fa4b7b64846e4d446f2285893608e9df0ad5c3dcc3f58461613",
+      "etag": "\"c2f00a8538d769830559716c8d59a94e\"",
+      "chunk_index": 279,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|10575852864|10618497431": {
+      "chunk_hash": "9326fda188024f9e9c360754ad388d496b3f3b626fc61afdcc9d7e1a56b09143",
+      "etag": "\"afac5b24a7db1cc53f0b2cffc4a11a54\"",
+      "chunk_index": 248,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|12153701880|12196346447": {
+      "chunk_hash": "acfa45a5573f8525e11c3497006d1acd90594eafef74390f7eb440ccbfe54809",
+      "etag": "\"ed1108fc56b39c6df17e447bf4dac936\"",
+      "chunk_index": 285,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|11855189904|11897834471": {
+      "chunk_hash": "8c320a5d95f56d7a22fd8bd9f58094daf725d6564bf93833bf9551d440fe7c73",
+      "etag": "\"0d5a6eb03fba8f47d0dbc23f84a2aead\"",
+      "chunk_index": 278,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|11599322496|11641967063": {
+      "chunk_hash": "80aa1a0c6ea884474f7a5ad33c8a692f90c8e3e2b483e7f0ae47f6556e7658c6",
+      "etag": "\"f432ec9433b3f266c9865c2ac0af4f4d\"",
+      "chunk_index": 272,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|14371219416|14413863983": {
+      "chunk_hash": "d8f22d8f4320cd7ad6ccdba2d0ad3409d0287de75ca3f8df082d9d41680d1ef0",
+      "etag": "\"0a8418de8e571b6131a1a763eec1691f\"",
+      "chunk_index": 337,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|14115352008|14157996575": {
+      "chunk_hash": "3c1f5a7daf9a6e437372d35ca39c9aa2220017661191e4492d2d94f07c232112",
+      "etag": "\"dbcb775ae66f6de9e979f79e6aee57bd\"",
+      "chunk_index": 331,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|17228405472|17271050039": {
+      "chunk_hash": "91b78ce511db888e4d448854e73c814a602d6c0b7d41460b0bb5df516bf93b61",
+      "etag": "\"3c596e0552516813ff47d89e88d42fa9\"",
+      "chunk_index": 404,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|15479978184|15522622751": {
+      "chunk_hash": "4af1369af32369cdb7c1959c127a44764fcad061cff9ed059f986618ae05525a",
+      "etag": "\"65c4a9de2f8a29f0ba7dfc66259da009\"",
+      "chunk_index": 363,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|20938482888|20981127455": {
+      "chunk_hash": "270541bc8b6f0d537dc2e12d61d1397e0c1c548b8199583b6e7eb8dceb2af6f7",
+      "etag": "\"faf4b03cc1098e8e723d15296e2048a3\"",
+      "chunk_index": 491,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|21407573136|21450217703": {
+      "chunk_hash": "98c30db10f40e1ef382ad68b6d696ab448470155e53850842ec6fe898878885a",
+      "etag": "\"130558e77f0649fad7e6d56543639a24\"",
+      "chunk_index": 502,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|17697495720|17740140287": {
+      "chunk_hash": "2f43dc10392810a6615ee50f8cc24ca9bd2ce135f20adba621d0cb341e8300dc",
+      "etag": "\"a9c07c1112fe11ba8892d6a23ce46559\"",
+      "chunk_index": 415,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|18976832760|19019477327": {
+      "chunk_hash": "3d8ddd2cdb8a154bcc3270fa5af83f0df54af5eb785fd51f9ee4c129adcbbb0b",
+      "etag": "\"215aba76522a46a6bc6d4b5f6e520a11\"",
+      "chunk_index": 445,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|20895838320|20938482887": {
+      "chunk_hash": "49bfcc35532fa20f3f0f8589159ee0203ab4219472226353b78901884f7b23e3",
+      "etag": "\"0ad9db85390894f402a070ef2cdd1586\"",
+      "chunk_index": 490,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|18123941400|18166585967": {
+      "chunk_hash": "d1d73844c4ff2d270a818c6aef9beeea404d379450c4ef240267acdbc1857262",
+      "etag": "\"107bd96856efe166c7bd530bba344ca6\"",
+      "chunk_index": 425,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|18337164240|18379808807": {
+      "chunk_hash": "4bd029458437289fc1fbdb08ca115f8836224e1969b86ae6a0f747d71793a8cd",
+      "etag": "\"e6e5b27584bba45a7dd9c2fe1f67982f\"",
+      "chunk_index": 430,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|2601318648|2643963215": {
+      "chunk_hash": "0e4d469800b7ba87c315a7a8de2520da227cbaccb6437ab2b3bf19168c3b0969",
+      "etag": "\"2253e6be9a129b34e58f0bbcf01277e7\"",
+      "chunk_index": 61,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|16247580408|16290224975": {
+      "chunk_hash": "58c02020b219cf8eaa424aeda89fcb3455a60b3df3a2dcf172a7b9cd133b263d",
+      "etag": "\"5850070c4570188471bab138f048facd\"",
+      "chunk_index": 381,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|17868073992|17910718559": {
+      "chunk_hash": "4f25cdb4cc2af452f10f6e0f51f87418cbc1e3953ca9a0fc0ad134dc60fac230",
+      "etag": "\"6c1b9c7d1f08d6e86dbe419a2e4047f5\"",
+      "chunk_index": 419,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|3454210008|3496854575": {
+      "chunk_hash": "bb7d87828ed654e72b22d1ce82c2ff9612015554440da9f5d91c274fb92ed0f3",
+      "etag": "\"0007a21afb923320372daa4f27750592\"",
+      "chunk_index": 81,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|8059823352|8102467919": {
+      "chunk_hash": "acee97f458bc495d393dae7a3ff89c67175ae1a4c9f591860618cbdc98732580",
+      "etag": "\"e5c5b0e056b80fe79b5cdef0fb3ef9d9\"",
+      "chunk_index": 189,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|16887248928|16929893495": {
+      "chunk_hash": "58170bea4a638bd27787d29b8ee6a5802ee44ced390adf0db1d494bd77af5f49",
+      "etag": "\"683c7408ccdbe75397f3b3262ef4a598\"",
+      "chunk_index": 396,
+      "chunk_size": 42644568,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|714391000|756413999": {
+      "chunk_hash": "4117f28dcdcf5ad85669a0d2b74759788ec7fd59b06f2c44452294e27a540d38",
+      "etag": "\"570aae3e5df05cb075d63bd532033efe\"",
+      "chunk_index": 17,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|1092598000|1134620999": {
+      "chunk_hash": "1d2040cf0009818e10bedf426bc17a0964317e814d81077be1fcef0d10308d5f",
+      "etag": "\"7b1360c2d159a3adc52ec642c2db6d75\"",
+      "chunk_index": 26,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|1596874000|1638896999": {
+      "chunk_hash": "11bdd1e1e3ce8a90225cc398c5447b47ee1019f80e6094ec6ca6037200f9262d",
+      "etag": "\"54089a9adfeefeae9a9d065c15149ef2\"",
+      "chunk_index": 38,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|1008552000|1050574999": {
+      "chunk_hash": "d03ae518940f1ba1180f681778f987389e17f75b3a18f2fb91f6e88a3784e506",
+      "etag": "\"6a4e7d8c406eadc38a0f761c6d0731ef\"",
+      "chunk_index": 24,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|126069000|168091999": {
+      "chunk_hash": "acd6c5a0ef5c6cbdc18f9186523b5205c2299846272a4500bfca07f7acac650d",
+      "etag": "\"10a00f24c58ee4fe3033975e6e6c62ba\"",
+      "chunk_index": 3,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|2437334000|2479356999": {
+      "chunk_hash": "29d9604f45ac20c74f845931f1b97763038024609a1820b3e346aa795d5446d6",
+      "etag": "\"23aced8e74399f27b715ffe5704c6dd1\"",
+      "chunk_index": 58,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|2983633000|3025655999": {
+      "chunk_hash": "9813aa594b1360cdf2115bc8b5b6303ea879671240762ad35adeb2fcb615f9a3",
+      "etag": "\"5038ae4610ac62d02ba4ce8e13adecd6\"",
+      "chunk_index": 71,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|2815541000|2857563999": {
+      "chunk_hash": "b69a7ae7e581f674c2f4b27a1491738444446eae087f3b121ddf74f68081a553",
+      "etag": "\"3f7c01fa087cbfde6b895b6e5067c32f\"",
+      "chunk_index": 67,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|3025656000|3067678999": {
+      "chunk_hash": "17e05e1a15777259d531ecc37204fd78eeca707cdd5b15b36acbe4a23cc8ec0c",
+      "etag": "\"ae6969e772bce1acd606a47f377c2cbb\"",
+      "chunk_index": 72,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|3445886000|3487908999": {
+      "chunk_hash": "3534ae460c093d188bfdeee9f8cb4434271ce107eb3d235e96fad587b9fa876b",
+      "etag": "\"7aa2cee2b1f7980a5769a9ea9bca860e\"",
+      "chunk_index": 82,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|4706576000|4748598999": {
+      "chunk_hash": "436f61b40fa1c2730b7eec04bcd74ba197c94afc9ac7ae05c6ba2c33f258a4a3",
+      "etag": "\"7fbd963d8c1b6fe1e726872c3de03bc7\"",
+      "chunk_index": 112,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|4328369000|4370391999": {
+      "chunk_hash": "389804cee2ce0c455231366f9d382b676df9913d4c6ea51a2a8d25700f781c31",
+      "etag": "\"6dc01000e27212dc8e52039e7b5f5114\"",
+      "chunk_index": 103,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|6555588000|6597610999": {
+      "chunk_hash": "1d018782d403e127f3e8e2296e2870c74f5e08a0f926152d2e440c85f37f1c70",
+      "etag": "\"e188375f09b3338a8e6f777d702d5aaa\"",
+      "chunk_index": 156,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|6093335000|6135357999": {
+      "chunk_hash": "c2b29d5a8a0316938d2407f18ba1b3ef355ee6836120a8b2d224c54f3a8c3656",
+      "etag": "\"84bf118b55a5deca1fabf4bc7bd508c1\"",
+      "chunk_index": 145,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|5000737000|5042759999": {
+      "chunk_hash": "146f1538e4038a2b1c38c60719a81a29dc12aa283e926a98e3fd54c3b0216efa",
+      "etag": "\"f0f0fe198a8e7f7e8417fb2154df2100\"",
+      "chunk_index": 119,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|5841197000|5883219999": {
+      "chunk_hash": "814d8b00c0eb38d61cd24dcd29e318693148c34326ab754aa7a2b68c6ae99e9e",
+      "etag": "\"08d1e5996d3d8951394be0999cce6a2c\"",
+      "chunk_index": 139,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|5462990000|5505012999": {
+      "chunk_hash": "b8f50167f94055d015eed18fce0ab008ea6046692639464d59eaf89355dfad31",
+      "etag": "\"d7c9708372c5c1ed2c5d91ceb7f15321\"",
+      "chunk_index": 130,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|7564140000|7606162999": {
+      "chunk_hash": "bb511e3ba87f7c5c8f7aa605f4751b0861ce3ba6eab26b5cb65598a838ff5e4a",
+      "etag": "\"62220cfb46fa0f62c983f1fdb9656452\"",
+      "chunk_index": 180,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|6933795000|6975817999": {
+      "chunk_hash": "c4867906c057d67cc8c07e8320908b2690268db1a0813e7e6ff38cbc2afb2cfe",
+      "etag": "\"9a5135f960346f8ca987c3e6fa9ff0a6\"",
+      "chunk_index": 165,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|8110439000|8152461999": {
+      "chunk_hash": "00da35a73385335a0b5db3b3c2d421db0c5498803d78d34cb6ae94eb8cf284a8",
+      "etag": "\"528407ecc87aedb8991fa7eedbf1eacc\"",
+      "chunk_index": 193,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|7101887000|7143909999": {
+      "chunk_hash": "dfe62ad6dd4421c4642e5c41236506717676766770140c88f1074f46377384aa",
+      "etag": "\"ae379a164576eda6bf8492b4b2c9a6e1\"",
+      "chunk_index": 169,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|9245060000|9287082999": {
+      "chunk_hash": "d45343d9e6758cb1641aa57c2631c03f46f95e2d5999b818e0a280d2b040ef73",
+      "etag": "\"0a1def394287810152aba65f3245df42\"",
+      "chunk_index": 220,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|9118991000|9161013999": {
+      "chunk_hash": "af7ed5d793d09979ad8cf7e9f22797905da73aaf2adf90d9050aba63d9933265",
+      "etag": "\"6ed1ec9c6ba58e42e658d1265676f017\"",
+      "chunk_index": 217,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|9076968000|9118990999": {
+      "chunk_hash": "5501c9391c2fe90c6975b3813d0eea83c7d6cab2454c1da415502201ff2eb3f9",
+      "etag": "\"398d008b355d36b5b511593fba89ed23\"",
+      "chunk_index": 216,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|9034945000|9076967999": {
+      "chunk_hash": "b10296a8b314e1bd84e9042680c2b037ff28c94e71e8d637f00e72a468a5c8a4",
+      "etag": "\"b4368e813dd2cca1abab5a4628d25db2\"",
+      "chunk_index": 215,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|10589796000|10631818999": {
+      "chunk_hash": "831cde4109a7d58ee8561f2db7df87a53a2faf246febde7cbbbbcadda7de02e6",
+      "etag": "\"4f647bd0159d2270d191497d113f6e37\"",
+      "chunk_index": 252,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|10799911000|10841933999": {
+      "chunk_hash": "09ea950d97ff7daef36cba907fe435567a50de8e542ae2b72cf00f2e8146d5e0",
+      "etag": "\"d8184e24ca7fc6cda164a36ee58edd78\"",
+      "chunk_index": 257,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|10968003000|11010025999": {
+      "chunk_hash": "2d924d313e6753df228956ad248988aab765d8d4e88687e096605228be237b5e",
+      "etag": "\"f823e81110b3e0b84c9b9b593faf0c96\"",
+      "chunk_index": 261,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|11052049000|11094071999": {
+      "chunk_hash": "bf1f04e9e0168bd5a7ac2846b15cd6a52c7adf1d976447396703ef1ec447139f",
+      "etag": "\"a2c6128ae12b60d4b7fc7a726433e74e\"",
+      "chunk_index": 263,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|10211589000|10253611999": {
+      "chunk_hash": "4460087f8ad86e539c14d73fa0372084810df19070463a182491513c87b72e68",
+      "etag": "\"9d1c5e4d606d138c906bd288fbd3b01b\"",
+      "chunk_index": 243,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|11682394000|11724416999": {
+      "chunk_hash": "51c20e9101613912914772c6018b60ff2590afb101be2e979944b1124f5d2136",
+      "etag": "\"d928797f8e532c9d756f9d6dcc90bedc\"",
+      "chunk_index": 278,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|11934532000|11976554999": {
+      "chunk_hash": "deaaf3f6b514c0082f928377ba0e7007520d9d3a54ee40e10cdc1971426cbb9f",
+      "etag": "\"ff01e4f47a3e59c4ebf7a12126fd2326\"",
+      "chunk_index": 284,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|12228693000|12270715999": {
+      "chunk_hash": "c9c1c61d9ff3b02e337cbc3a4ab0cf28ce5e37e2effe5d13d471c4f597a0a3f1",
+      "etag": "\"7eee58083b9e55a2b12972296517dcb6\"",
+      "chunk_index": 291,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|12943084000|12985106999": {
+      "chunk_hash": "ac7bfb31b31b78c30fabbfcd44d0889d184c43650f86a10fa6b421a0c2af90d2",
+      "etag": "\"15d1f3eb9e5788313a343f3310937693\"",
+      "chunk_index": 308,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|13153199000|13195221999": {
+      "chunk_hash": "bac704576b4395edae80e947c9cb8b54182810c545a1b78b2e4e852620f5ff65",
+      "etag": "\"91fd764ce2681ed1b4c37f709a604835\"",
+      "chunk_index": 313,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|14413889000|14455911999": {
+      "chunk_hash": "4e7e45a72594fc5285cca4d0158da2df031b6c5eea98bb6b901e8b5048df0680",
+      "etag": "\"998698b7ee488e24148a68fddaf7887e\"",
+      "chunk_index": 343,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|14329843000|14371865999": {
+      "chunk_hash": "99a8ce37afb6136829c83a0b516a2403d658fcb65e4fd4c027a41e8b048140ba",
+      "etag": "\"e7ce3778f12bad0f101c15e39effa3e6\"",
+      "chunk_index": 341,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|14792096000|14834118999": {
+      "chunk_hash": "439df1b9c5b7b874dcc79e43ad1b1d562f5cf180363a6c024b332faf520c01f0",
+      "etag": "\"71a1e58cd8e61f04f18ddd5130ca268d\"",
+      "chunk_index": 352,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|14455912000|14497934999": {
+      "chunk_hash": "c5c5cbac5d54824179f808d8a3a0c18625b457072c49a59a35e90bbe5e11ad30",
+      "etag": "\"1625f031b576efa84ba8dc6523b6defc\"",
+      "chunk_index": 344,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|16262901000|16304923999": {
+      "chunk_hash": "a1e1985342d0b965f2cdc4a7a2efb0e9438c1488d4104b41b3dc398a976a5a8b",
+      "etag": "\"f4e8e0ba27077f9fbf1f61407002872b\"",
+      "chunk_index": 387,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|15842671000|15884693999": {
+      "chunk_hash": "e3e49eed50bc33a35393231c4285a0510aa0d030089429a62ffabe8fee0ae1de",
+      "etag": "\"bad88d8bb0f541f80a0092048ee392d3\"",
+      "chunk_index": 377,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|15506487000|15548509999": {
+      "chunk_hash": "ab6f66b834452f68620663f65392e741d60dd7a560ba4bfccedaa59d28e1e517",
+      "etag": "\"228f24f66a0eecb5343ffc9e1754cccc\"",
+      "chunk_index": 369,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|15548510000|15590532999": {
+      "chunk_hash": "9078b399ee8dea1602c8d43439674636550cd5bbda938fab85708b148aa537f8",
+      "etag": "\"fe291a189f3cf8bcdcfc4f57446bef05\"",
+      "chunk_index": 370,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|17439545000|17481567999": {
+      "chunk_hash": "652a25705e43713b729fcc196cdbf3af89a7f8f577ceedc1efc143252be8d93a",
+      "etag": "\"2bd36685541fac319ee238637b096b97\"",
+      "chunk_index": 415,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|17733706000|17775728999": {
+      "chunk_hash": "42c1f0717deeadb43a7e03a614b0f9c91a14bac91c31d476cd1de43d50493e93",
+      "etag": "\"54e7b2ed3589b6dffbc10880e4193f90\"",
+      "chunk_index": 422,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|18111913000|18153935999": {
+      "chunk_hash": "1961cf93abccfb961d736dd5b1078b4a2d2aaf53c5c7160e0db63c8643765482",
+      "etag": "\"06c6b624c84ffac2b0efe1423637ab83\"",
+      "chunk_index": 431,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|17859775000|17901797999": {
+      "chunk_hash": "e29ad1ed9f0c0f6d138c0d1c83b3bc5319342e430baf00f9da072c1d035937f1",
+      "etag": "\"814f70595f3c7a66318c36a2eb08a954\"",
+      "chunk_index": 425,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|17019315000|17061337999": {
+      "chunk_hash": "b74fca1ab9d47269f842ea5a56ad05a0660271ae83c8126469392db27920f7a7",
+      "etag": "\"d1924008f92a17ea91a6abffa84bc1bd\"",
+      "chunk_index": 405,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|18490120000|18532142999": {
+      "chunk_hash": "028bd17a1fdb798e9383e41d73d100c8a76c343881a1b1e13a6a4872207709e8",
+      "etag": "\"4267630d521b71f69142c7148fdc06f6\"",
+      "chunk_index": 440,
+      "chunk_size": 42023000
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|19666764000|19708786999": {
+      "chunk_hash": "d40522e1119cf7c169bea3f4cf83a7dcf7f504c6e370044523527002810b7186",
+      "etag": "\"dfe0934f0ddb779bb064cf111be209b4\"",
+      "chunk_index": 468,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|19162488000|19204510999": {
+      "chunk_hash": "b21e2c280b2090bec8668ab1b1006004e72abaaa1b323e708acf57205f03aed2",
+      "etag": "\"1f3977aac81faea94f3ad318de7558be\"",
+      "chunk_index": 456,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|18784281000|18826303999": {
+      "chunk_hash": "947d4be4a437dbbba9268948cf8ee48894a8e58955348a5a6b2e9cbc8a715cb6",
+      "etag": "\"51a11c347524aae50ca702e32f7619dc\"",
+      "chunk_index": 447,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|19960925000|20002947999": {
+      "chunk_hash": "c834be265b558f2ddea7652625bb3095fd4b142d6481bc9b6420424b99bedb8b",
+      "etag": "\"11e27e74fe19429815039106bb556422\"",
+      "chunk_index": 475,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|20171040000|20213062999": {
+      "chunk_hash": "b9455b7b4a15f3e80ac2dfe6d5ade646e4203684e3da0b507105f6a9aa84d2b1",
+      "etag": "\"553aa0dcbe415c1826bb24e0c19391ca\"",
+      "chunk_index": 480,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|20969477000|21011499999": {
+      "chunk_hash": "94a3626465a7da9a6f75f90997aef5d5be4b2e9f853dcaf12692a47436bbb420",
+      "etag": "\"10cf6b53b7d0fa53efc706d91678e1dc\"",
+      "chunk_index": 499,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|21389707000|21431729999": {
+      "chunk_hash": "6491b7efe7bfa3af0eef737ba4cc78ee29173e94d3ab0f8fd487f07a9b4ad17c",
+      "etag": "\"459558d7fb9fc4bc4afb864ed6451b9e\"",
+      "chunk_index": 509,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|20801385000|20843407999": {
+      "chunk_hash": "8207fcbf0bc70017a5a3e2611bb2b917f30dea12b0cd71ac9d6f17d46984a7fc",
+      "etag": "\"a8ebf4a2344debd53c3fb3343bbebca8\"",
+      "chunk_index": 495,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|17481568000|17523590999": {
+      "chunk_hash": "ba01e6e04010e40a36d774ee541d196b5b4b5f5624ea223f69e4cdd470488814",
+      "etag": "\"78c60bfe5fc1a1564906dec39b2d0864\"",
+      "chunk_index": 416,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|17187407000|17229429999": {
+      "chunk_hash": "87ea4f3bbe6c52f8ec3ac99025d168930c604ade2c1b787a1231f8000c4859e8",
+      "etag": "\"bc2c9b8273364b5f01ffa89ecbecdbbe\"",
+      "chunk_index": 409,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|19834856000|19876878999": {
+      "chunk_hash": "d79487027323ecf734595c3b46aa715464ad16a50108746025e4041dd24b13f8",
+      "etag": "\"3eed6c8e7181feb28060d75454ced341\"",
+      "chunk_index": 472,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|8236508000|8278530999": {
+      "chunk_hash": "cb675eb492b6ad8bb67203e5554c4b80e8a2062195b8bf64e70ce9f1db4143b6",
+      "etag": "\"e444d2bcc10ffd1e816417816096063f\"",
+      "chunk_index": 196,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|2647449000|2689471999": {
+      "chunk_hash": "90fafab2bdaea616ba2cabc9ccd9ab859350274eb9c535852ffeed08879e2dc6",
+      "etag": "\"da7f6537dc130b6440ed27d971073a30\"",
+      "chunk_index": 63,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|11808463000|11850485999": {
+      "chunk_hash": "94758b298906c55f6be8159ad8babe7e75d201df2b7cfe65fab1f5c1c31d7556",
+      "etag": "\"e16b39450d4d0c0fd29b141e3a72cf03\"",
+      "chunk_index": 281,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|11304187000|11346209999": {
+      "chunk_hash": "b68a6f338bcfcfcd81fc4efe8fe0c1a43194b8618934eef93b9c2198b1613954",
+      "etag": "\"6b9038e7845b8b891de0bbac071d7f35\"",
+      "chunk_index": 269,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|14918165000|14960187999": {
+      "chunk_hash": "1a884b67bb100e564ae63a1d810b591744d311903274b114986e96ca9b811e1d",
+      "etag": "\"6b445980c04fe31cc3002c9ff8dbdeed\"",
+      "chunk_index": 355,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|11724417000|11766439999": {
+      "chunk_hash": "f5265500e7c2a2491780891462fca8eb4ab521140af6752740c33d147a114c91",
+      "etag": "\"c242a66a1463394d16d580433a24fd40\"",
+      "chunk_index": 279,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|20633293000|20675315999": {
+      "chunk_hash": "836992e9cb88a09a8abcba04193e9865a3208aa4ff562e373d7febeaffa4fea4",
+      "etag": "\"3c40c5d799fe77f6f25c3c57cd2a7e57\"",
+      "chunk_index": 491,
+      "chunk_size": 42023000,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_50_p_gb.bin|15446744640|15491910559": {
+      "chunk_hash": "b4ba149c5e45e4ab289054cd45b137be8a84f18e5c84c5f5431b046b0c6c4d37",
+      "etag": "\"7ad8ee306b746a161afc72a75dc01cd6\"",
+      "chunk_index": 342,
+      "chunk_size": 45165920,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_50_p_gb.bin|42817292160|42862458079": {
+      "chunk_hash": "7b0e34dd1b2595530749385b984ddb6d152e65b79617dac53fdd4af93bb10d51",
+      "etag": "\"88bdc4c28f61b844262cd4195f7a9eef\"",
+      "chunk_index": 948,
+      "chunk_size": 45165920,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_50_p_gb.bin|13640107840|13685273759": {
+      "chunk_hash": "76e9eac7016577e76bd28707a581ee31cf8794dbac2073d96dd8976e81a53c89",
+      "etag": "\"ec052b75ebf5c87574cf7dac94ebbf96\"",
+      "chunk_index": 302,
+      "chunk_size": 45165920,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_50_p_gb.bin|51714978400|51760144319": {
+      "chunk_hash": "f1300c66b2fffc364f9c2b2cb5be0f64039899490d3baf66ebc1595dad0496b1",
+      "etag": "\"6c964f3676b07556a1cbf204d7c744ed\"",
+      "chunk_index": 1145,
+      "chunk_size": 45165920,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_50_p_gb.bin|46204736160|46249902079": {
+      "chunk_hash": "45c1ed58d2aadd8cfe7a7e84851cd60bab5cac61cdc669c40740ddcb11d3abb2",
+      "etag": "\"189819100914d0a101b6db1de1180122\"",
+      "chunk_index": 1023,
+      "chunk_size": 45165920,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_50_p_gb.bin|23079785120|23124951039": {
+      "chunk_hash": "172cdacf91f0af0c36eae5fcbbd63915d65e177a151c9915be37f5d2e1cc119e",
+      "etag": "\"49908fbe90e9dcad8b4590da8b227f9c\"",
+      "chunk_index": 511,
+      "chunk_size": 45165920,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_50_p_gb.bin|40965489440|41010655359": {
+      "chunk_hash": "178205b3c87cdf7e866ad5a2973cd1c3949419d1944b2b49c1b84ed5ba9d8971",
+      "etag": "\"31d71f601f062628d1fec89e86c91abe\"",
+      "chunk_index": 907,
+      "chunk_size": 45165920,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/rx_50_p_gb.bin|36539229280|36584395199": {
+      "chunk_hash": "7011f65824487f4cdc92325b775f87386bfdb543af64a32562fa85293604977a",
+      "etag": "\"9855ea5fa19a0a5e39454c408dbe04bb\"",
+      "chunk_index": 809,
+      "chunk_size": 45165920,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|10957903872|11000708183": {
+      "chunk_hash": "c894db03dddfe1abdc2a45d155bca33765a40dcaa4227c8f87667fc0330e2f40",
+      "etag": "\"a1342568328365acb6364c785059cec3\"",
+      "chunk_index": 256,
+      "chunk_size": 42804312,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|8946101208|8988905519": {
+      "chunk_hash": "3c65abb5603a4fef2aa66d60246316e91ff1dfd6d9383a781bfc1d019934da22",
+      "etag": "\"1d6d985e50819fdf72464b49ab306790\"",
+      "chunk_index": 209,
+      "chunk_size": 42804312,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|4323235512|4366039823": {
+      "chunk_hash": "d0132e1e10d7694923f016da7512614bebffce36a31e43ae89f6b163014a1bbf",
+      "etag": "\"d1a43e42028233b5422690c7d5456288\"",
+      "chunk_index": 101,
+      "chunk_size": 42804312,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|18320245536|18363049847": {
+      "chunk_hash": "b15d67b991f7892c3c3065443bdaa70ea52563c8e143b8621f3066b8b6f15eff",
+      "etag": "\"14765febc05acee683963d937e640493\"",
+      "chunk_index": 428,
+      "chunk_size": 42804312,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|9887796072|9930600383": {
+      "chunk_hash": "8cb43e4812a6d10f6e204343e06e07940e57b81d170942ad7cf5acbb023aaa93",
+      "etag": "\"4aa2551459cbe362aede416956e709c4\"",
+      "chunk_index": 231,
+      "chunk_size": 42804312,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|16094421312|16137225623": {
+      "chunk_hash": "35261f85bc92cb671a162db92ea016dfca3f9c83e272a979476b5c1e51bc2821",
+      "etag": "\"a69cdedd0395df742c275423588abca9\"",
+      "chunk_index": 376,
+      "chunk_size": 42804312,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|18448658472|18491462783": {
+      "chunk_hash": "6c9413c3cfbe42119498c037b9d7cc2bfe80b7348bf9fc2e6a6557c03132df37",
+      "etag": "\"0712937c1bd107966bc22e7e0e05cbb5\"",
+      "chunk_index": 431,
+      "chunk_size": 42804312,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|10829490936|10872295247": {
+      "chunk_hash": "837836849f78db7b41a62f05d5c4d9f8b204b3373547d4f0990e9e409e9dc42d",
+      "etag": "\"9e466233fe55a4387f72a1d7f701fcc6\"",
+      "chunk_index": 253,
+      "chunk_size": 42804312,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|17566395104|17609876279": {
+      "chunk_hash": "c8aeac1e32863a2b06f1fcaa285815376dee1576b010eaa9f42c02f015b2c56e",
+      "etag": "\"e5f9047790eced1bc99091b61aee0748\"",
+      "chunk_index": 404,
+      "chunk_size": 43481176,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|20870964480|20914445655": {
+      "chunk_hash": "3ffb094c10cbeaa2592646f38458fa0828661773b3929b3a2e8737616fded082",
+      "etag": "\"e75163026a5092acac9a2d019ac1fd82\"",
+      "chunk_index": 480,
+      "chunk_size": 43481176,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|9261490488|9304971663": {
+      "chunk_hash": "78437b28f6d9e817eac9d49079c87c74109accb664cf0019d11c1b5d377775b2",
+      "etag": "\"519f0d122e6bd9cef437aaca0e95b9fd\"",
+      "chunk_index": 213,
+      "chunk_size": 43481176,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|3695899960|3739381135": {
+      "chunk_hash": "fe2e9ecc101ba5347da94733823e6b502a95fac2dc469faba106d3fb9a56a1bf",
+      "etag": "\"27cabc9d5ddf1a6cf5c0129540d4bded\"",
+      "chunk_index": 85,
+      "chunk_size": 43481176,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|9304971664|9348452839": {
+      "chunk_hash": "d88775fcf3911b65aa991037200cbbba5486c755ea7f1b48646372e58ff0e5da",
+      "etag": "\"2fa7fcb59da515e3b887951be39b6573\"",
+      "chunk_index": 214,
+      "chunk_size": 43481176,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|3565456432|3608937607": {
+      "chunk_hash": "8b28203d3fb92f9b2e56ec9e9a02ea67c8787ac2e09be94304b8c6de18b39556",
+      "etag": "\"fc575d80c230632448e1ea58eae49253\"",
+      "chunk_index": 82,
+      "chunk_size": 43481176,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|7261356392|7304837567": {
+      "chunk_hash": "a10f69020e94cd5436c48cbb17bea1cefe5b904aea66fb2c92a8617569d67421",
+      "etag": "\"899df728aeda9fa77f1d9a874a5638ac\"",
+      "chunk_index": 167,
+      "chunk_size": 43481176,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|14305306904|14348788079": {
+      "chunk_hash": "78a49185a3671781443b91efb96df04154e1adfbe0d48c3f1fe38f24c6e1b966",
+      "etag": "\"9add6b7874aae9a858995e35ec7e72a7\"",
+      "chunk_index": 329,
+      "chunk_size": 43481176,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|841299680|883364663": {
+      "chunk_hash": "4ccac58458f170d72474ce1065cadb26ba79c1e6692c49b21fee9729725c7fc8",
+      "etag": "\"ea398eb0fcaa266fc65507267403fa63\"",
+      "chunk_index": 20,
+      "chunk_size": 42064984,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|12787755136|12829820119": {
+      "chunk_hash": "9784c5a370ee025e89319beeaaea9afec7e4f15adfb7c7152789b6c43b3c0579",
+      "etag": "\"ca851118b1573bef85d15358f8ee7b08\"",
+      "chunk_index": 304,
+      "chunk_size": 42064984,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|1682599360|1724664343": {
+      "chunk_hash": "d58b4b29a97281466a59b6ec93fa0ba2d9f651ec29fcb935ed8259567b9107bc",
+      "etag": "\"7cd2e2e6f91886dc0db3aa214840517d\"",
+      "chunk_index": 40,
+      "chunk_size": 42064984,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|3239003768|3281068751": {
+      "chunk_hash": "64b4e9246e5d1562a91e0ea03563fc4fee4107c408776cd5afc7bf4ed917ce65",
+      "etag": "\"340e4c047db46b33adbc910b8d42b672\"",
+      "chunk_index": 77,
+      "chunk_size": 42064984,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|252389904|294454887": {
+      "chunk_hash": "6d4bb4c59ccebdd887ee7a910eac530f65ad2803d5c0e579cd7883d950fc2290",
+      "etag": "\"f4746fc1c150fc7c6a86306bd5458bb7\"",
+      "chunk_index": 6,
+      "chunk_size": 42064984,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|18214138072|18256203055": {
+      "chunk_hash": "85e7589c9a0f4200c1ab19d52153ebf7f51d65ef2aa93744d76dd4accdf2c478",
+      "etag": "\"7f6ce2d1bb8a6773bb34dc33b0c940ee\"",
+      "chunk_index": 433,
+      "chunk_size": 42064984,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|15227524208|15269589191": {
+      "chunk_hash": "d25a77ccbcc4f74d403b86d189e8e4d108538ca77db245c0c976e4d676bd939d",
+      "etag": "\"55bf3ff2eedba885c60caefcae2f7315\"",
+      "chunk_index": 362,
+      "chunk_size": 42064984,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|4521409648|4564064455": {
+      "chunk_hash": "86a1f6998d4363273c0448df5265e8e6d81074ed7497095785351a6b900f12ec",
+      "etag": "\"70349a03ef800bae6287727b7dab8608\"",
+      "chunk_index": 106,
+      "chunk_size": 42654808,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|5246541384|5289196191": {
+      "chunk_hash": "f661f7d2f9e54c6d19adbaf22d50833aabe90a244c4658aab1d7deb0b6cb2b0c",
+      "etag": "\"0afa0bf8f49b41e61de988594c3b8131\"",
+      "chunk_index": 123,
+      "chunk_size": 42654808,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|15569004920|15611659727": {
+      "chunk_hash": "91756ab1528d6f5081c4cac4511d6d6097ec3bbe383f7af6eeb4245406510964",
+      "etag": "\"90fd680a2c0de7e2a340abeaa388d7d1\"",
+      "chunk_index": 365,
+      "chunk_size": 42654808,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|14076086640|14118741447": {
+      "chunk_hash": "ad582efb431e05dbef4582bd67ca99b8a112cbcb47e3525ed93748ad44569b91",
+      "etag": "\"0cac7d1a11886c5435e67160543bf904\"",
+      "chunk_index": 330,
+      "chunk_size": 42654808,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|4308135608|4350790415": {
+      "chunk_hash": "ea8ebb068a49bccf1dc7b3af81a419ac0a981cc8e6eb5689b5d4aed28658d99a",
+      "etag": "\"4c355b339f3d1c855d61d576abeb7e59\"",
+      "chunk_index": 101,
+      "chunk_size": 42654808,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|20815546304|20858201111": {
+      "chunk_hash": "76f87793390b6b7beff6c134601ddaacef75c15c34c05bc6740912ccfd1e52ea",
+      "etag": "\"03dc2f4ab9c740a9d6fa0053650d1ecc\"",
+      "chunk_index": 488,
+      "chunk_size": 42654808
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|5033164800|5075107839": {
+      "chunk_hash": "2e7f9d2a1eb250e93927ffc7c296352b0ce89992b1e565f8f0b0241cbb1bc43e",
+      "etag": "\"aa37dd1b1b7bd91c5d9ceef829fc48aa\"",
+      "chunk_index": 120,
+      "chunk_size": 41943040,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|7801405440|7843348479": {
+      "chunk_hash": "0b9f5f50d8c445754e7b38ff3c369b581e83eaae5ba0ccb2ffd1a8e4266f12ac",
+      "etag": "\"c1951b7619bea3a6c362447499c84992\"",
+      "chunk_index": 186,
+      "chunk_size": 41943040,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|6585057280|6627000319": {
+      "chunk_hash": "93ccde2d1961217c4acb46cfc9b256d617ecff8c4a8faf4e47b08ecfe54a0f46",
+      "etag": "\"81d32d1da3e10e73d93e36f2ed7ab9d6\"",
+      "chunk_index": 157,
+      "chunk_size": 41943040,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|19126026240|19167969279": {
+      "chunk_hash": "bd2c6bde4956610abd0a78fe2858e6bdfdeffec443f3c0600d8215781ad3619c",
+      "etag": "\"8ae4b5920b77212dea0d355fbcf7d430\"",
+      "chunk_index": 456,
+      "chunk_size": 41943040,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|9065029680|9108196487": {
+      "chunk_hash": "2e41095e1db1e174f6b2e2aeb312967a97c2b0ab63b3def2d71b1731edab59c0",
+      "etag": "\"b6f501adf4706b6e7028dc7fffcdc140\"",
+      "chunk_index": 210,
+      "chunk_size": 43166808,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|7252023744|7295190551": {
+      "chunk_hash": "192f5808ad462066e5492139d42020a807f735cc302f5d81c261bb20223bf0e3",
+      "etag": "\"aa2ea474e938fb8cca133b6b6e1455b3\"",
+      "chunk_index": 168,
+      "chunk_size": 43166808,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|12777375168|12820541975": {
+      "chunk_hash": "b0517c1e8c43af81c4cf7345814335f4384b8577e37f16edf98a662063d2a3d5",
+      "etag": "\"8be311468df334f82b2ab0d3e4e7ec47\"",
+      "chunk_index": 296,
+      "chunk_size": 43166808,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|18820728288|18863895095": {
+      "chunk_hash": "322ee8a8547e3ba48cbd5bbe23f39186c3fcc7ac2f584b0b8776ff57453ec010",
+      "etag": "\"1655f3b33220d2361f095e11fcd3718a\"",
+      "chunk_index": 436,
+      "chunk_size": 43166808,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|4921016112|4964182919": {
+      "chunk_hash": "791538e1ef2bf3fece042f9ac26671f8e11b7bad81f4fed5a6153fb91293d999",
+      "etag": "\"29589375087b16a1e69a1db79ffdd989\"",
+      "chunk_index": 114,
+      "chunk_size": 43166808,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|10446367536|10489534343": {
+      "chunk_hash": "8212ad6c473f4d8d7161dd249ba89b6deba0dadbdf7408bdb82269ce69ae6ace",
+      "etag": "\"8ddae00e9053695eed616fa07500b33f\"",
+      "chunk_index": 242,
+      "chunk_size": 43166808,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|6316855856|6360121991": {
+      "chunk_hash": "4f0386e5363b238b4cdc5f1dda83d02f1d87f75d6382408d8322f889b861c7b8",
+      "etag": "\"666bc9d1203b41d9e2fcfbd7728ea632\"",
+      "chunk_index": 146,
+      "chunk_size": 43266136,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|13196171480|13239437615": {
+      "chunk_hash": "d5eed4df9bb566af604828607db59fe89e44c23a7fc868cec99ac4fbca06246d",
+      "etag": "\"e564662bea3906b9ae5764a1d97434f5\"",
+      "chunk_index": 305,
+      "chunk_size": 43266136,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|8090767432|8134033567": {
+      "chunk_hash": "18ac1bb73610dd58432c737de22c63240fb970a55b8c2ef8bddfb064b91113c5",
+      "etag": "\"aec3786d2b59e05c474ef8691b30d19c\"",
+      "chunk_index": 187,
+      "chunk_size": 43266136,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|19296696656|19339962791": {
+      "chunk_hash": "d3c38de05a1c29bfa658b116c787437f2879f7494e8b7a2174b1164ad9423cbd",
+      "etag": "\"8d7ea93c1644e96351533151e494e680\"",
+      "chunk_index": 446,
+      "chunk_size": 43266136,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|4802541096|4845807231": {
+      "chunk_hash": "c9c6b5f54428ba701ab410d6226aa60b45cde390ed8ca54f8e35c79eab520d97",
+      "etag": "\"847df9858b04443d6e5aa4483002a564\"",
+      "chunk_index": 111,
+      "chunk_size": 43266136,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|17479518944|17522785079": {
+      "chunk_hash": "ac460221b74d4af212d7ce74e9f3b9034be31e1aa297f5c6b17c8f05b18254ae",
+      "etag": "\"b7997a1a9999c127b7902786a84f50ca\"",
+      "chunk_index": 404,
+      "chunk_size": 43266136,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|16441606992|16484647847": {
+      "chunk_hash": "ff687a4438526a46db6633f0f885a6d807457b391197105479d4c5efd7ddedc4",
+      "etag": "\"f20a26c43e947162d4330e028ce3f630\"",
+      "chunk_index": 382,
+      "chunk_size": 43040856,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|1506429960|1549470815": {
+      "chunk_hash": "803d688f2f60b4fbe15e98c1c12cd1be43580d2aebca36de69640e17295cb38a",
+      "etag": "\"71717b312e25fa75b84d9d8cc077bd7e\"",
+      "chunk_index": 35,
+      "chunk_size": 43040856,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|5035780152|5078821007": {
+      "chunk_hash": "32256371b27887f56a777635232c81cf980df67c83100c33a5b655ab6fd5afc3",
+      "etag": "\"8b4f220f295e5f96b4d89e47c6d80706\"",
+      "chunk_index": 117,
+      "chunk_size": 43040856,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|4174963032|4218003887": {
+      "chunk_hash": "d265a73b6680680cf1ff6c778e6c0f482e3c6b918fa8b6c2d775aaf9426f4906",
+      "etag": "\"d3d480fed24f1aa05a7fce409875a136\"",
+      "chunk_index": 97,
+      "chunk_size": 43040856,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|20960896872|21003937727": {
+      "chunk_hash": "5a8bbf7cb099120bd5cd9bf82553a9665e9943ba9ef39cf518728ce584acf54f",
+      "etag": "\"d6aad1c4a57d267b5a151a3e4bfb5bc1\"",
+      "chunk_index": 487,
+      "chunk_size": 43040856,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|17603710104|17646750959": {
+      "chunk_hash": "b05b8b6a9222d502b8eec471acd5de1fdb42ede89a70da094f3bdfe0b98f247d",
+      "etag": "\"2490dc1ef0f51b2f56d5520be07b08f4\"",
+      "chunk_index": 409,
+      "chunk_size": 43040856,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|8128028248|8170142383": {
+      "chunk_hash": "a93e6fb12cd7c9c97992e8e50d75562ad8173f09611a23051bf7800fa1b64630",
+      "etag": "\"c8fc7b81f7f26da0061b572ab356b612\"",
+      "chunk_index": 193,
+      "chunk_size": 42114136,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|5095810456|5137924591": {
+      "chunk_hash": "9fc544f0b2d0ebea54ba9cd59c63a8e4813c071435c881f3c2669ea316aa04b9",
+      "etag": "\"d0a6b6a3d80601acad991f273a272b56\"",
+      "chunk_index": 121,
+      "chunk_size": 42114136,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|2990103656|3032217791": {
+      "chunk_hash": "e849bb43d824c2cb37896c64fb2484fa268bb7d85d3fc7f4fc6b21cf6dc4e619",
+      "etag": "\"cdaa4782ba17c5fdf8d55f8ca840266c\"",
+      "chunk_index": 71,
+      "chunk_size": 42114136,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|9644137144|9686251279": {
+      "chunk_hash": "6c6fa00bb3d005155e9a045606050fa68616faefa523c1bf9dd8b42b1351f8b6",
+      "etag": "\"f12da9dc47ea4a73b6ba1d6ba4bd66c1\"",
+      "chunk_index": 229,
+      "chunk_size": 42114136,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|20004214600|20046328735": {
+      "chunk_hash": "4c2f21421a6b9f53a2a3eb369c0bdbe83332a55142ceef587a6d16d70b7ba1a5",
+      "etag": "\"15e9e6acd932b9a786a0dc86c8776215\"",
+      "chunk_index": 475,
+      "chunk_size": 42114136,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|7075174848|7117288983": {
+      "chunk_hash": "4f33fc89c3ae6999ee2f156b5fbef0325c4525408cd4845c10f4966ad18063bc",
+      "etag": "\"14ad4245dda64975e88c0ced3e5b2110\"",
+      "chunk_index": 168,
+      "chunk_size": 42114136,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|8658798200|8701036239": {
+      "chunk_hash": "f4d19659b86a1d0b954a954e9111403144105ffb1d7ad490926265c63abd94dd",
+      "etag": "\"f4a363b4483bc616295cbface60c1d69\"",
+      "chunk_index": 205,
+      "chunk_size": 42238040,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|9165654680|9207892719": {
+      "chunk_hash": "125fde32d713b09b637a23341ab98d056324497b1adb5708ce48e2d68b72412c",
+      "etag": "\"b4210a855f9e0e340e3a5d0b92e8526d\"",
+      "chunk_index": 217,
+      "chunk_size": 42238040,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|9250130760|9292368799": {
+      "chunk_hash": "ebf20dee23013eb130a717e6099cc4923938dc5b6ac7bc0e4539cdeae223acf9",
+      "etag": "\"49f57a94a6906f2306c5da9fa996b906\"",
+      "chunk_index": 219,
+      "chunk_size": 42238040,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|18035643080|18077881119": {
+      "chunk_hash": "745254bbb8ea9c70bcbca7e0e55b3952d128506a890cbf8e7f53416e164ca075",
+      "etag": "\"7b553acfc7e711dbd448945ebcbba582\"",
+      "chunk_index": 427,
+      "chunk_size": 42238040,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|9419082920|9461320959": {
+      "chunk_hash": "070ac63387e815a5790d42b9df54a6222f78f0fa7964938734ac1d541d0a993f",
+      "etag": "\"9b1d64f60569e447cafd6b5e2ad0eadf\"",
+      "chunk_index": 223,
+      "chunk_size": 42238040,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|11660165120|11702108159": {
+      "chunk_hash": "f26bc510ced3bab85bd2f5252d4fcf1a20ee4213edae0c32f26612bb48bd7040",
+      "etag": "\"9091acaf5a2ef2f71a18559c98669947\"",
+      "chunk_index": 278,
+      "chunk_size": 41943040,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|17406361600|17448304639": {
+      "chunk_hash": "379095d365ecf59680fbbb987eedaab3f65b042220a601bf6ad35a5ee2c13c88",
+      "etag": "\"12138841910886ecebe981e692ed441f\"",
+      "chunk_index": 415,
+      "chunk_size": 41943040,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|2642411520|2684354559": {
+      "chunk_hash": "1f1619d595d4e9618b14e1fc8c4c59672bfd04a843a8d2bd16969367ea18c4ce",
+      "etag": "\"fd52c9d99b0caa1bd5f902549f666cbd\"",
+      "chunk_index": 63,
+      "chunk_size": 41943040,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|9863859896|9906933519": {
+      "chunk_hash": "f895eb6d852a8d58eb113e05057bc90b67b4c322f6149881d7205ba75e2139b5",
+      "etag": "\"a765f7c22d1ef3ca98d5e92386abf726\"",
+      "chunk_index": 229,
+      "chunk_size": 43073624,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|16755639736|16798713359": {
+      "chunk_hash": "1bb24331fe2b8d36ead7f3dd423f20471b7d246aad596ebb7728f664a694c04d",
+      "etag": "\"76aeb54a0bd93425d1098cf11064ab32\"",
+      "chunk_index": 389,
+      "chunk_size": 43073624,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|20890707640|20933781263": {
+      "chunk_hash": "ede93be54a1c4a5e97872b7f7221d328c3515fac034097e22f805fb2a6a44fe7",
+      "etag": "\"c73ba10f023e3229d28e2b81eeb614c0\"",
+      "chunk_index": 485,
+      "chunk_size": 43073624,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|12534424584|12577498207": {
+      "chunk_hash": "631fd7deda103cee92776e8f25e34352bdb2aa9f1fcea20e499efe47ed07b549",
+      "etag": "\"3f3055046a3eae7fb8fb0e886c3b3b8c\"",
+      "chunk_index": 291,
+      "chunk_size": 43073624,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|1507576840|1550650463": {
+      "chunk_hash": "cc6cca25a3b5150dca470245aeb0c929347c8e90843157cf3e5c446f5e0390a1",
+      "etag": "\"94dcc386f607e1cdc72ce323716d53a1\"",
+      "chunk_index": 35,
+      "chunk_size": 43073624,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|17358670472|17401744095": {
+      "chunk_hash": "635327321ef6b7fc5ee4ebffa8ce27c0e63e2d883419830463642a46e4c07e8f",
+      "etag": "\"692b371ef77fbaa8e46339c0b743d596\"",
+      "chunk_index": 403,
+      "chunk_size": 43073624,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|18220142952|18263216575": {
+      "chunk_hash": "ec1e93ac13df29c4dc7a92d776693fb8cdd026e69d4dd16d4de3774c37cb2a33",
+      "etag": "\"7af495bad3fd499a05457083b8710bb7\"",
+      "chunk_index": 423,
+      "chunk_size": 43073624,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|18349363824|18392437447": {
+      "chunk_hash": "ed1a8ff219b04e09c7ba97720caf6e7b745c6981063e39bb339fafa72954a7ed",
+      "etag": "\"89c01e70bc5154be8cebe377627670d9\"",
+      "chunk_index": 426,
+      "chunk_size": 43073624,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|6762558968|6805632591": {
+      "chunk_hash": "411d843dfb3faed64418c017d1114aedf9c2824e5f8ed1d12f173d0ee0350502",
+      "etag": "\"5c609905adae9fe9b8d808817d5cfca6\"",
+      "chunk_index": 157,
+      "chunk_size": 43073624,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|1312299688|1354631935": {
+      "chunk_hash": "db2bb84557b1e12f1f784b206074dab80252e1d6bf618a45f7bcd772beba7e9b",
+      "etag": "\"b4f48e745901de9bca3abeee9e70b7c6\"",
+      "chunk_index": 31,
+      "chunk_size": 42332248,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|1269967440|1312299687": {
+      "chunk_hash": "318d98e54a0cc9347c9bc1545da4b4a53075f70e5a7ee379ec965f182a3848f1",
+      "etag": "\"308bbf7300d8a677b04512d78f633f11\"",
+      "chunk_index": 30,
+      "chunk_size": 42332248,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|5799517976|5841850223": {
+      "chunk_hash": "98355f0e6e2b81eda2c43dc4d33f01b884a1760722d92ad5ca036f7e968d47f4",
+      "etag": "\"b9b2e55b49adc1723bd185ee944addfb\"",
+      "chunk_index": 137,
+      "chunk_size": 42332248,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|19007179352|19049511599": {
+      "chunk_hash": "ecdfd91160b424a29e3de13fc977f67de89fd67cdf59229a6dd897861a4f4db5",
+      "etag": "\"63f70ddfe2387e444f9e5a31c00754b2\"",
+      "chunk_index": 449,
+      "chunk_size": 42332248,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|8678110840|8720443087": {
+      "chunk_hash": "a0a4c61e7383f5ae355710d575aba075bef72b4265edb83071f2655198d27a08",
+      "etag": "\"11596d09a333f2aeed08cf4b52149ade\"",
+      "chunk_index": 205,
+      "chunk_size": 42332248,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|1947283408|1989615655": {
+      "chunk_hash": "c01f5c71386cd24fa2db2392ff88abc7b4490c7b6a01380129d8d19ea98ad47c",
+      "etag": "\"09299f38782aa06765130a0a2b249f7a\"",
+      "chunk_index": 46,
+      "chunk_size": 42332248,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|7704469136|7746801383": {
+      "chunk_hash": "24abd9f758674b4a0fb2656f96937600c5b1075e545c596b66c759fffa4abcae",
+      "etag": "\"b357279d5dfeea470b09b5ebc7cee2b9\"",
+      "chunk_index": 182,
+      "chunk_size": 42332248,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|126336264|168448351": {
+      "chunk_hash": "c1d0eda8b20e4adf53fdba92caf1f49a716e696360c20a199f50e2dc25e8e379",
+      "etag": "\"12df8df16cb17a5c000026b5037ad623\"",
+      "chunk_index": 3,
+      "chunk_size": 42112088,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|5095562648|5137674735": {
+      "chunk_hash": "b0f4cb7fae83f7369d41657f2f21ac11bc5648c1784fab9a42e8af69f34e8a1f",
+      "etag": "\"0e0e5b98b9e7a51850494157acc04413\"",
+      "chunk_index": 121,
+      "chunk_size": 42112088,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|5474571440|5516683527": {
+      "chunk_hash": "11f8e448bb494e393a6226342178f1959fea4be8ed6363c0b96bafcc922134fe",
+      "etag": "\"cbb550ca11b0008b2f4333ddc681d31f\"",
+      "chunk_index": 130,
+      "chunk_size": 42112088,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|14949791240|14991903327": {
+      "chunk_hash": "cd8d929d75a294a79391e53787b907f2448a59d5b49895f4b63fd6da89e1fe17",
+      "etag": "\"0ef16bdbcdbd914bc37411659be4948a\"",
+      "chunk_index": 355,
+      "chunk_size": 42112088,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|12380953872|12423065959": {
+      "chunk_hash": "d019666fbbf4a941c2f907cde76ab19ef4124531eacf6ac18ce3ea524a55fcf8",
+      "etag": "\"0350d1de3b845c50dec6b6d222c54230\"",
+      "chunk_index": 294,
+      "chunk_size": 42112088,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|17518628608|17560740695": {
+      "chunk_hash": "6a55ffcb201d0a771fd7fe2efe660fcd72189f6ad566b3033bfeb53124ed9ef0",
+      "etag": "\"93b0b2ee9092f9e2959f68ae18426350\"",
+      "chunk_index": 416,
+      "chunk_size": 42112088,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|10654358264|10696470351": {
+      "chunk_hash": "360e7ed88e1dc4fc90577e45f9f4d8b2ea822bd80701cf60d0fcfc5184c8be92",
+      "etag": "\"507064a2d3af20d6ccefaf8224e4096f\"",
+      "chunk_index": 253,
+      "chunk_size": 42112088,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|19371560480|19413672567": {
+      "chunk_hash": "ea626ee3518c369915d22c845ea5bad990e682454ea891576c9b05c5ae89ac3d",
+      "etag": "\"0ca162a968c8182b2a9e602e81d4137b\"",
+      "chunk_index": 460,
+      "chunk_size": 42112088,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|17154703360|17196646399": {
+      "chunk_hash": "d6b17c227d6757a3bf05aea80b2f295644b9eb13d2cc2e0546b237d49aa1db5d",
+      "etag": "\"846bca587bb6fddf2aea9c068922ad03\"",
+      "chunk_index": 409,
+      "chunk_size": 41943040,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|8933867520|8975810559": {
+      "chunk_hash": "5b902b06c8bea6b08cf1acea3a10999534f7268f571066e1cdc508efcbea8ec8",
+      "etag": "\"bbd8b3a1a3f0f0a4c494b3f67f244aba\"",
+      "chunk_index": 213,
+      "chunk_size": 41943040,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|4320133120|4362076159": {
+      "chunk_hash": "089eb2b79bde95fb3d4f7977dbfd47a5a1aa98a410cb0bfea9274109c45c5f8e",
+      "etag": "\"f89563a73abf8a7bfed7eb1aaa16c973\"",
+      "chunk_index": 103,
+      "chunk_size": 41943040,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|2306867200|2348810239": {
+      "chunk_hash": "743372a767907d443dd8f5db88df10af4dc1ff7a91fb0411171a4d2ce397448f",
+      "etag": "\"f4a569a21831a1a3c63b73324279ef48\"",
+      "chunk_index": 55,
+      "chunk_size": 41943040,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|2013265920|2055208959": {
+      "chunk_hash": "d940c4b9531f1deb9a801feafaf3853201e397fc8f75d2a665fbc0a8ecad5285",
+      "etag": "\"53b1340fa08146a0757cd6bdf79c5cbb\"",
+      "chunk_index": 48,
+      "chunk_size": 41943040,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|18287165440|18329108479": {
+      "chunk_hash": "b62f4e65d3f99fa49620d348446dedbbcd37ac05b85a7cb25ff2524dda6f5a88",
+      "etag": "\"9dd71f9021ec349829766b1a304fcdb2\"",
+      "chunk_index": 436,
+      "chunk_size": 41943040,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|12289310720|12331253759": {
+      "chunk_hash": "7661fde85bf67e25d17346e4b52af56e4b6784c505bb12687848c0d5e9a5f917",
+      "etag": "\"e8919655fef50a83c7472c0aef5759f3\"",
+      "chunk_index": 293,
+      "chunk_size": 41943040,
+      "has_chunk_data": true
+    },
+    "https://ef88e61230a7f9cdaa979b6268878856.r2.cloudflarestorage.com/beam-xfer-test/source/ecx_20_b_gb.bin|12960399360|13002342399": {
+      "chunk_hash": "058c9317d3d30fb45aae7f8735abf851fdf58dd27d4a915f5ea898d9f6772c60",
+      "etag": "\"e755b12a69fcdaaaab4e25028f0930b9\"",
+      "chunk_index": 309,
+      "chunk_size": 41943040,
+      "has_chunk_data": true
     }
   },
-  "updated_at": "2026-07-17T13:17:11.671124+00:00"
+  "updated_at": "2026-07-19T09:20:48.877745+00:00"
 }

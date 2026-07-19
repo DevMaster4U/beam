@@ -45,12 +45,15 @@ def _log_embedded_task_offer(
     beamcore_worker_id: str = "",
 ) -> None:
     chunk_id = chunk_id_from_transfer_context(transfer_context)
+    src, dest = transfer_context_urls(transfer_context)
     fields = [
         f"{_WORKERS_LOG} task_offer task={short_id(task_id)}",
         f"offer={short_id(offer_id)}",
         f"worker_slot={worker_slot}",
         f"chunk_id={chunk_id if chunk_id is not None else '?'}",
         f"range={transfer_context_range_label(transfer_context)}",
+        f"src={src}",
+        f"dest={dest}",
         f"path={path}",
     ]
     if beamcore_worker_id:
@@ -70,9 +73,9 @@ def _log_embedded_task_done(
     put_ms: float = 0.0,
 ) -> None:
     chunk_id = chunk_id_from_transfer_context(transfer_context)
-    src, _dest = transfer_context_urls(transfer_context)
+    src, dest = transfer_context_urls(transfer_context)
     logger.info(
-        "%s task_done task=%s offer=%s chunk_id=%s range=%s src=%s "
+        "%s task_done task=%s offer=%s chunk_id=%s range=%s src=%s dest=%s "
         "hash=%s etag=%s cached=%s fetch_ms=%.1f put_ms=%.1f",
         _WORKERS_LOG,
         short_id(task_id),
@@ -80,6 +83,7 @@ def _log_embedded_task_done(
         chunk_id if chunk_id is not None else "?",
         transfer_context_range_label(transfer_context),
         src,
+        dest,
         chunk_hash or "-",
         etag or "-",
         str(cached).lower(),
@@ -618,6 +622,7 @@ class EmbeddedWorkerPool:
         batch_used_ips: set[str],
         batch_gateway_assigned: set[str],
         allow_used_ip: bool,
+        transfer_context: Optional[dict] = None,
     ) -> bool:
         gateway = self._worker_gateway
         if gateway is None:
@@ -636,13 +641,18 @@ class EmbeddedWorkerPool:
             if profile.ip:
                 batch_used_ips.add(profile.ip)
                 self._mark_spread_ip(profile.ip)
+            src, dest = ("", "")
+            if transfer_context:
+                src, dest = transfer_context_urls(transfer_context)
             logger.info(
-                "%s external_dispatch task=%s offer=%s worker=%s ip=%s",
+                "%s external_dispatch task=%s offer=%s worker=%s ip=%s src=%s dest=%s",
                 _WORKERS_LOG,
                 short_id(task_id),
                 short_id(offer_id),
                 short_id(external_id),
                 profile.ip or "?",
+                src or "-",
+                dest or "-",
             )
             return True
         logger.warning(
@@ -703,6 +713,7 @@ class EmbeddedWorkerPool:
                         batch_used_ips=spread_ips,
                         batch_gateway_assigned=batch_gateway_assigned,
                         allow_used_ip=False,
+                        transfer_context=transfer_context,
                     ):
                         delivered += 1
                         continue
@@ -719,6 +730,7 @@ class EmbeddedWorkerPool:
                         batch_used_ips=batch_used_ips,
                         batch_gateway_assigned=batch_gateway_assigned,
                         allow_used_ip=True,
+                        transfer_context=transfer_context,
                     ):
                         delivered += 1
                         continue
