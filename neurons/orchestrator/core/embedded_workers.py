@@ -25,6 +25,7 @@ from core.config import OrchestratorSettings
 from core.relay_log import (
     chunk_id_from_transfer_context,
     short_id,
+    transfer_context_cache_key,
     transfer_context_range_label,
     transfer_context_urls,
 )
@@ -52,6 +53,7 @@ def _log_embedded_task_offer(
         f"worker_slot={worker_slot}",
         f"chunk_id={chunk_id if chunk_id is not None else '?'}",
         f"range={transfer_context_range_label(transfer_context)}",
+        f"cache_key={transfer_context_cache_key(transfer_context)}",
         f"src={src}",
         f"dest={dest}",
         f"path={path}",
@@ -75,15 +77,16 @@ def _log_embedded_task_done(
     chunk_id = chunk_id_from_transfer_context(transfer_context)
     src, dest = transfer_context_urls(transfer_context)
     logger.info(
-        "%s task_done task=%s offer=%s chunk_id=%s range=%s src=%s dest=%s "
-        "hash=%s etag=%s cached=%s fetch_ms=%.1f put_ms=%.1f",
+        "%s task_done task=%s offer=%s chunk_id=%s src=%s dest=%s "
+        "range=%s cache_key=%s hash=%s etag=%s cached=%s fetch_ms=%.1f put_ms=%.1f",
         _WORKERS_LOG,
         short_id(task_id),
         short_id(offer_id),
         chunk_id if chunk_id is not None else "?",
-        transfer_context_range_label(transfer_context),
         src,
         dest,
+        transfer_context_range_label(transfer_context),
+        transfer_context_cache_key(transfer_context),
         chunk_hash or "-",
         etag or "-",
         str(cached).lower(),
@@ -122,17 +125,19 @@ def _log_embedded_task_failed(
     src, dest = transfer_context_urls(transfer_context)
     cached_label = "?" if cached is None else str(cached).lower()
     logger.warning(
-        "%s failed task=%s offer=%s reason=%s src=%s range=%s hash=%s etag=%s cached=%s dest=%s",
+        "%s failed task=%s offer=%s reason=%s src=%s dest=%s "
+        "range=%s cache_key=%s hash=%s etag=%s cached=%s",
         _WORKERS_LOG,
         short_id(task_id),
         short_id(offer_id),
         reason,
         src,
+        dest,
         transfer_context_range_label(transfer_context),
+        transfer_context_cache_key(transfer_context),
         chunk_hash or "-",
         etag or "-",
         cached_label,
-        dest,
     )
 
 

@@ -83,9 +83,23 @@ def transfer_context_range_label(transfer_context: dict) -> str:
     try:
         range_start = int(transfer_context["range_start"])
         range_end = int(transfer_context["range_end"])
-        return f"bytes={range_start}-{range_end}"
+        size = range_end - range_start + 1
+        return f"bytes={range_start}-{range_end}({size})"
     except (KeyError, TypeError, ValueError):
         return "-"
+
+
+def transfer_context_cache_key(transfer_context: dict) -> str:
+    """Cache key form ``source|range_start|range_end`` (query stripped)."""
+    try:
+        range_start = int(transfer_context["range_start"])
+        range_end = int(transfer_context["range_end"])
+    except (KeyError, TypeError, ValueError):
+        return "-"
+    source = redact_capability_url(transfer_context.get("source_url") or "").rstrip("/")
+    if not source or source == "?":
+        return "-"
+    return f"{source}|{range_start}|{range_end}"
 
 
 def chunk_id_from_transfer_context(transfer_context: dict) -> Optional[int]:

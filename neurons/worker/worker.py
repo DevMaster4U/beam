@@ -3877,10 +3877,17 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
         )
         return False
 
+    try:
+        _rs = int(transfer_context["range_start"])
+        _re = int(transfer_context["range_end"])
+        range_label = f"bytes={_rs}-{_re}({_re - _rs + 1})"
+    except (KeyError, TypeError, ValueError):
+        range_label = "-"
     print(
         f"[Worker] [WS] Task: {task_label(task_id)} offer={task_label(offer_id)} "
         f"src={redact_url(str(transfer_context.get('source_url') or ''))} "
-        f"dest={redact_url(str(transfer_context.get('dest_url') or ''))}"
+        f"dest={redact_url(str(transfer_context.get('dest_url') or ''))} "
+        f"range={range_label}"
     )
 
     capacity_error = try_reserve_ws_capacity(state, task_key, estimated_bytes)
