@@ -47,13 +47,26 @@ def _log_embedded_task_offer(
 ) -> None:
     chunk_id = chunk_id_from_transfer_context(transfer_context)
     src, dest = transfer_context_urls(transfer_context)
+    cache_key = transfer_context_cache_key(transfer_context)
+    chunk_hash = "-"
+    etag = "-"
+    try:
+        transfer = get_transfer_module()
+        known = transfer.get_predefined_etag_cache(transfer_context)
+        if known is not None:
+            chunk_hash = known.chunk_hash or "-"
+            etag = known.etag or "-"
+    except Exception:
+        pass
     fields = [
         f"{_WORKERS_LOG} task_offer task={short_id(task_id)}",
         f"offer={short_id(offer_id)}",
         f"worker_slot={worker_slot}",
         f"chunk_id={chunk_id if chunk_id is not None else '?'}",
         f"range={transfer_context_range_label(transfer_context)}",
-        f"cache_key={transfer_context_cache_key(transfer_context)}",
+        f"cache_key={cache_key}",
+        f"hash={chunk_hash}",
+        f"etag={etag}",
         f"src={src}",
         f"dest={dest}",
         f"path={path}",
@@ -1068,6 +1081,7 @@ class EmbeddedWorkerPool:
                 offer_id=str(offer_id),
                 reason=str(outcome.error or "predefined_submit_failed"),
                 chunk_hash=outcome.chunk_hash,
+                etag=outcome.etag or "",
             )
             if outcome.error:
                 await self._send_result(
