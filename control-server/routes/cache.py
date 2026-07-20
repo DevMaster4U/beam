@@ -19,7 +19,9 @@ from storage import (
     load_predefined_etag_chunk_data,
     load_predefined_etag_range_data,
     merge_predefined_etag_entries,
+    parse_cache_key,
     prune_orphan_chunk_data_files,
+    range_coverage_snapshot,
     range_store_status,
     store_predefined_etag_chunk_data,
     store_predefined_etag_range_data,
@@ -45,13 +47,20 @@ class CacheMergeBody(BaseModel):
 
 @router.get("")
 async def get_cache() -> dict[str, Any]:
+    """Legacy metadata JSON (optional). Prefer GET /ranges for sync."""
     return load_predefined_etag_cache()
 
 
 @router.get("/ranges")
 async def get_range_coverage(src_url: str = "") -> dict[str, Any]:
-    """Continuous range-store coverage report."""
+    """Continuous range-store coverage from segments.json."""
     return range_store_status(src_url=src_url.strip() or None)
+
+
+@router.get("/ranges/snapshot")
+async def get_range_snapshot(src_url: str = "") -> dict[str, Any]:
+    """Compact coverage snapshot used for miner sync (segments only)."""
+    return range_coverage_snapshot(src_url=src_url.strip() or None)
 
 
 @router.put("/ranges")
@@ -90,28 +99,21 @@ async def put_range_data(
         segment = await asyncio.to_thread(
             store_predefined_etag_range_data, source_url, start, end, data
         )
-        key = f"{source_url}|{start}|{end}"
-        entry = await asyncio.to_thread(
-            upsert_predefined_etag_entry,
-            key,
-            chunk_hash,
-            etag,
-            has_chunk_data=True,
+        await miner_hub.broadcast_range(
+            source_url=source_url,
+            start=start,
+            end=end,
+            source_miner=x_miner_id.strip() or "http",
+            exclude_miner=x_miner_id.strip() or None,
         )
-        broadcast = {
-            "type": "cache_broadcast",
-            "key": key,
-            "chunk_hash": entry["chunk_hash"],
-            "etag": entry["etag"],
-            "source_miner": x_miner_id.strip() or "http",
-            "has_chunk_data": True,
+        return {
+            "source_url": source_url,
+            "start": start,
+            "end": end,
+            "bytes": len(data),
+            "chunk_hash": computed_hash,
+            "segment": segment,
         }
-        if "chunk_index" in entry:
-            broadcast["chunk_index"] = entry["chunk_index"]
-        if "chunk_size" in entry:
-            broadcast["chunk_size"] = entry["chunk_size"]
-        await miner_hub.broadcast(broadcast, exclude_miner=x_miner_id.strip() or None)
-        return {"entry": entry, "segment": segment}
     except HTTPException:
         raise
     except Exception as exc:
@@ -151,27 +153,22 @@ async def put_chunk_data(
             raise HTTPException(status_code=400, detail="chunk hash mismatch")
         etag = x_etag.strip()
         await asyncio.to_thread(store_predefined_etag_chunk_data, key, data)
-        entry = await asyncio.to_thread(
-            upsert_predefined_etag_entry,
-            key,
-            chunk_hash,
-            etag,
-            has_chunk_data=True,
-        )
-        broadcast = {
-            "type": "cache_broadcast",
+        parsed = parse_cache_key(key)
+        if parsed is not None:
+            source_url, start, end = parsed
+            await miner_hub.broadcast_range(
+                source_url=source_url,
+                start=start,
+                end=end,
+                source_miner=x_miner_id.strip() or "http",
+                exclude_miner=x_miner_id.strip() or None,
+            )
+        return {
             "key": key,
-            "chunk_hash": entry["chunk_hash"],
-            "etag": entry["etag"],
-            "source_miner": x_miner_id.strip() or "http",
-            "has_chunk_data": True,
+            "bytes": len(data),
+            "chunk_hash": computed_hash,
+            "etag": etag or "",
         }
-        if "chunk_index" in entry:
-            broadcast["chunk_index"] = entry["chunk_index"]
-        if "chunk_size" in entry:
-            broadcast["chunk_size"] = entry["chunk_size"]
-        await miner_hub.broadcast(broadcast, exclude_miner=x_miner_id.strip() or None)
-        return entry
     except HTTPException:
         raise
     except Exception as exc:

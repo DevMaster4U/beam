@@ -23,6 +23,7 @@ from config import get_settings
 from neurons.common.byte_range_store import (  # noqa: E402
     ByteRangeStore,
     parse_cache_key_range,
+    source_digest,
 )
 
 _cache_lock = threading.Lock()
@@ -285,42 +286,39 @@ def _enrich_cache_entries(payload: dict[str, Any]) -> bool:
     return changed
 
 
-def range_store_status(*, src_url: Optional[str] = None) -> dict[str, Any]:
-    """Report continuous range-store coverage per source."""
+def range_coverage_snapshot(*, src_url: Optional[str] = None) -> dict[str, Any]:
+    """Build sync payload from range_data/*/segments.json only (no hash/etag JSON)."""
     store = get_range_store()
-    payload = load_predefined_etag_cache()
-    entries = payload.get("entries") or {}
     filter_url = str(src_url or "").strip()
-
-    sources_seen: set[str] = set()
-    for key in entries:
-        parsed = parse_cache_key(str(key))
-        if parsed is None:
-            continue
-        source_url = parsed[0]
+    sources_out: list[dict[str, Any]] = []
+    for source_url in store.list_sources():
         if filter_url and source_url != filter_url:
             continue
-        sources_seen.add(source_url)
+        segs = store.list_segments(source_url)
+        sources_out.append(
+            {
+                "source_url": source_url,
+                "digest": source_digest(source_url),
+                "segments": [{"start": s.start, "end": s.end} for s in segs],
+                "covered_bytes": sum(s.size for s in segs),
+            }
+        )
+    return {
+        "status": "ok",
+        "source_count": len(sources_out),
+        "sources": sources_out,
+        "updated_at": _utc_now(),
+    }
 
-    # Also include sources that only exist in range_data.
-    range_root = get_settings().cache_dir / "range_data"
-    if range_root.is_dir() and not filter_url:
-        for child in range_root.iterdir():
-            if not child.is_dir():
-                continue
-            index = child / "segments.json"
-            if not index.is_file():
-                continue
-            try:
-                data = json.loads(index.read_text(encoding="utf-8"))
-                src = str(data.get("source_url") or "").strip()
-                if src:
-                    sources_seen.add(src)
-            except (OSError, json.JSONDecodeError):
-                continue
 
+def range_store_status(*, src_url: Optional[str] = None) -> dict[str, Any]:
+    """Report continuous range-store coverage per source (from segments.json)."""
+    store = get_range_store()
+    filter_url = str(src_url or "").strip()
     sources: dict[str, Any] = {}
-    for source_url in sorted(sources_seen):
+    for source_url in store.list_sources():
+        if filter_url and source_url != filter_url:
+            continue
         segs = store.list_segments(source_url)
         if not segs and filter_url:
             continue

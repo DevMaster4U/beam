@@ -616,8 +616,8 @@ async def upload_buffered_predefined_etag(
     offer_id: str = None,
     source_url: str = "",
     log_prefix: str = "[Worker]",
-) -> float:
-    """PUT/POST a buffered predefined-etag chunk; returns send_ms."""
+) -> tuple[float, Optional[str]]:
+    """PUT/POST a buffered predefined-etag chunk; returns (send_ms, etag from response)."""
     is_object_storage = is_object_storage_presigned_url(destination_url)
     body_len = len(body) if isinstance(body, (bytes, bytearray)) else int(expected_max_bytes or 0)
     byte_to = (
@@ -693,7 +693,7 @@ async def upload_buffered_predefined_etag(
         log_prefix=log_prefix,
         detail=f"etag={etag!r} send_ms={send_ms:.1f}",
     )
-    return send_ms
+    return send_ms, etag
 
 
 async def run_predefined_etag_background_upload(
@@ -723,7 +723,7 @@ async def run_predefined_etag_background_upload(
         else:
             return False
 
-        await upload_buffered_predefined_etag(
+        send_ms, _etag = await upload_buffered_predefined_etag(
             client,
             destination_url=transfer_context["dest_url"],
             body=body,
@@ -741,7 +741,7 @@ async def run_predefined_etag_background_upload(
         )
         print(
             f"[Worker] Predefined ETag background upload complete "
-            f"task={task_label(task_id)} offer={task_label(offer_id)}"
+            f"task={task_label(task_id)} offer={task_label(offer_id)} send_ms={send_ms:.1f}"
         )
         return True
     except Exception as exc:
@@ -763,18 +763,19 @@ async def upload_predefined_etag_from_local_cache(
     task_id: str = None,
     offer_id: str = None,
     log_prefix: str = "[Worker]",
-) -> tuple[bool, float, Optional[str]]:
-    """Upload a cached continuous range slice to dest (rate-limited by env max speed)."""
+) -> tuple[bool, float, Optional[str], Optional[str], Optional[str]]:
+    """Upload cached range bytes to dest. Returns (ok, send_ms, etag_real, etag_local, error)."""
     if not has_predefined_etag_chunk_data(transfer_context):
-        return False, 0.0, "cache_file_missing"
+        return False, 0.0, None, None, "cache_file_missing"
 
     data = await asyncio.to_thread(read_predefined_etag_range_bytes, transfer_context)
     if not data:
-        return False, 0.0, "cache_file_empty"
+        return False, 0.0, None, None, "cache_file_empty"
 
     computed = hashlib.sha256(data).hexdigest()
+    etag_local = _etag_quoted_md5(data)
     if chunk_hash and computed.lower() != chunk_hash.lower():
-        return False, 0.0, "cache_file_hash_mismatch"
+        return False, 0.0, None, etag_local, "cache_file_hash_mismatch"
 
     chunk_size = int(transfer_context["chunk_size"])
     range_start = int(transfer_context["range_start"])
@@ -782,11 +783,11 @@ async def upload_predefined_etag_from_local_cache(
     source_url = str(transfer_context.get("source_url") or "")
 
     try:
-        send_ms = await upload_buffered_predefined_etag(
+        send_ms, etag_real = await upload_buffered_predefined_etag(
             client,
             destination_url=transfer_context["dest_url"],
             body=_iter_predefined_etag_range_chunks(transfer_context),
-            chunk_hash=chunk_hash or computed,
+            chunk_hash=computed,
             transfer_id=str(transfer_context.get("transfer_id") or task_id or ""),
             chunk_index=0,
             upload_offset=range_start,
@@ -798,20 +799,22 @@ async def upload_predefined_etag_from_local_cache(
             source_url=source_url,
             log_prefix=log_prefix,
         )
-        return True, send_ms, None
+        return True, send_ms, etag_real, etag_local, None
     except Exception as exc:
-        return False, 0.0, exception_detail(exc)
+        return False, 0.0, None, etag_local, exception_detail(exc)
 
 
 async def ensure_predefined_etag_chunk_data_local(
     transfer_context: dict,
-    chunk_hash: str,
+    chunk_hash: str = "",
 ) -> bool:
-    """Ensure local chunk bytes exist (disk or control-server download)."""
+    """Ensure local range bytes exist (disk or control-server download)."""
     if has_predefined_etag_chunk_data(transfer_context):
         return True
-    key = predefined_etag_cache_key(transfer_context)
-    await _download_predefined_etag_chunk_data(key, chunk_hash)
+    source, start, end = _transfer_byte_range(transfer_context)
+    if not source:
+        return False
+    await _download_predefined_etag_range(source, start, end)
     return has_predefined_etag_chunk_data(transfer_context)
 
 
@@ -1729,9 +1732,15 @@ async def _deferred_predefined_etag_cache_sync(
     etag: Optional[str],
     delay_sec: float,
 ) -> None:
-    """Background: wait, upload range bytes + metadata to control-server (off hot path)."""
+    """Background: wait, upload range bytes to control-server (coverage via segments.json)."""
     key = predefined_etag_cache_key(transfer_context)
-    resolved_etag = etag or PREDEFINED_ETAG
+    source_url = str(transfer_context.get("source_url") or "")
+    try:
+        start = int(transfer_context["range_start"])
+        end = int(transfer_context["range_end"])
+    except (KeyError, TypeError, ValueError):
+        print(f"[Worker] Deferred cache sync skipped (bad range) key={key[:96]}")
+        return
     if delay_sec > 0:
         await asyncio.sleep(delay_sec)
 
@@ -1739,24 +1748,34 @@ async def _deferred_predefined_etag_cache_sync(
     data = await asyncio.to_thread(read_predefined_etag_range_bytes, transfer_context)
     if data:
         try:
-            from neurons.common.control_client import upload_predefined_etag_chunk_data
+            from neurons.common.control_client import upload_predefined_etag_range_data
 
             uploaded_data = await asyncio.to_thread(
-                upload_predefined_etag_chunk_data,
-                key,
+                upload_predefined_etag_range_data,
+                source_url,
+                start,
+                end,
                 data,
-                chunk_hash,
-                resolved_etag,
+                chunk_hash=chunk_hash or hashlib.sha256(data).hexdigest(),
+                etag=etag or "",
             )
         except Exception as exc:
-            print(f"[Worker] Deferred chunk data upload failed key={key[:96]}: {exc}")
+            print(
+                f"[Worker] Deferred range upload failed src={source_url[:96]} "
+                f"range={start}-{end}: {exc}"
+            )
 
-    if not uploaded_data:
-        _push_predefined_etag_cache_to_control_server(key, chunk_hash, resolved_etag)
+    if uploaded_data:
+        try:
+            from neurons.common import control_ws_client
+
+            control_ws_client.schedule_range_update(source_url, start, end)
+        except Exception:
+            pass
 
     print(
-        f"[Worker] Deferred cache sync done key={key[:96]} "
-        f"chunk_data={'yes' if uploaded_data else 'metadata_only'}"
+        f"[Worker] Deferred range sync done src={source_url[:96]} "
+        f"range={start}-{end} uploaded={'yes' if uploaded_data else 'no'}"
     )
 
 
@@ -1816,186 +1835,243 @@ def _chunk_download_semaphore_get() -> asyncio.Semaphore:
     return _chunk_download_semaphore
 
 
-def schedule_predefined_etag_chunk_data_download(
-    cache_key: str,
-    chunk_hash: str,
+def schedule_predefined_etag_range_download(
+    source_url: str,
+    start: int,
+    end: int,
     *,
     force: bool = False,
 ) -> None:
-    """Background-fetch chunk bytes from control-server when local range is missing."""
+    """Background-fetch range bytes from control-server when local coverage is missing."""
     if not force and not WORKER_PREDEFINED_ETAG_AUTO_DOWNLOAD_CHUNKS:
         return
-    if not cache_key or not chunk_hash:
+    if not source_url or end < start:
         return
-    from neurons.common.byte_range_store import parse_cache_key_range
-
-    parsed = parse_cache_key_range(cache_key)
-    if parsed is not None:
-        source, start, end = parsed
-        if get_worker_range_store().covers(source, start, end):
-            return
-    path = predefined_etag_chunk_data_path_for_key(cache_key)
-    if path.is_file() and path.stat().st_size > 0:
+    if get_worker_range_store().covers(source_url, start, end):
         return
-    if cache_key in _CHUNK_DOWNLOAD_IN_FLIGHT:
+    flight_key = f"{source_url}|{start}|{end}"
+    if flight_key in _CHUNK_DOWNLOAD_IN_FLIGHT:
         return
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return
-    _CHUNK_DOWNLOAD_IN_FLIGHT.add(cache_key)
+    _CHUNK_DOWNLOAD_IN_FLIGHT.add(flight_key)
     loop.create_task(
-        _run_predefined_etag_chunk_data_download(cache_key, chunk_hash),
-        name="download-predefined-etag-chunk-data",
+        _run_predefined_etag_range_download(source_url, start, end, flight_key),
+        name="download-predefined-etag-range",
     )
 
 
-async def _run_predefined_etag_chunk_data_download(cache_key: str, chunk_hash: str) -> None:
-    try:
-        async with _chunk_download_semaphore_get():
-            await _download_predefined_etag_chunk_data(cache_key, chunk_hash)
-    finally:
-        _CHUNK_DOWNLOAD_IN_FLIGHT.discard(cache_key)
-
-
-async def _download_predefined_etag_chunk_data(cache_key: str, chunk_hash: str) -> None:
+def schedule_predefined_etag_chunk_data_download(
+    cache_key: str,
+    chunk_hash: str = "",
+    *,
+    force: bool = False,
+) -> None:
+    """Legacy wrapper: map source|start|end key to range download (hash unused)."""
     from neurons.common.byte_range_store import parse_cache_key_range
 
     parsed = parse_cache_key_range(cache_key)
-    if parsed is not None:
-        source, start, end = parsed
-        if get_worker_range_store().covers(source, start, end):
-            return
-    try:
-        from neurons.common.control_client import fetch_predefined_etag_chunk_data
+    if parsed is None:
+        return
+    source, start, end = parsed
+    schedule_predefined_etag_range_download(source, start, end, force=force)
 
-        data = await asyncio.to_thread(fetch_predefined_etag_chunk_data, cache_key)
+
+async def _run_predefined_etag_range_download(
+    source_url: str, start: int, end: int, flight_key: str
+) -> None:
+    try:
+        async with _chunk_download_semaphore_get():
+            await _download_predefined_etag_range(source_url, start, end)
+    finally:
+        _CHUNK_DOWNLOAD_IN_FLIGHT.discard(flight_key)
+
+
+async def _download_predefined_etag_range(
+    source_url: str, start: int, end: int
+) -> None:
+    if get_worker_range_store().covers(source_url, start, end):
+        return
+    try:
+        from neurons.common.control_client import fetch_predefined_etag_range_data
+
+        data = await asyncio.to_thread(
+            fetch_predefined_etag_range_data, source_url, start, end
+        )
     except Exception as exc:
-        print(f"[Worker] Chunk data download failed key={cache_key[:96]}: {exc}")
+        print(
+            f"[Worker] Range download failed src={source_url[:96]} "
+            f"range={start}-{end}: {exc}"
+        )
         return
     if not data:
         return
-    computed = hashlib.sha256(data).hexdigest()
-    if computed.lower() != chunk_hash.lower():
+    expected = end - start + 1
+    if len(data) != expected:
         print(
-            f"[Worker] Chunk data hash mismatch key={cache_key[:96]} "
-            f"expected={chunk_hash[:16]} got={computed[:16]}"
+            f"[Worker] Range size mismatch src={source_url[:96]} "
+            f"range={start}-{end} got={len(data)} expected={expected}"
         )
         return
-    if parsed is not None:
-        source, start, end = parsed
-        await asyncio.to_thread(
-            get_worker_range_store().ingest, source, start, end, data
-        )
-        print(
-            f"[Worker] Chunk data cached in range store key={cache_key[:96]} "
-            f"bytes={len(data)}"
-        )
+    await asyncio.to_thread(
+        get_worker_range_store().ingest, source_url, start, end, data
+    )
+    print(
+        f"[Worker] Range cached in range store src={source_url[:96]} "
+        f"range={start}-{end} bytes={len(data)}"
+    )
+
+
+def apply_range_coverage_snapshot(sources: list[dict]) -> None:
+    """On WS connect: pull missing segments from control-server coverage."""
+    max_downloads = WORKER_PREDEFINED_ETAG_BOOTSTRAP_MAX_DOWNLOADS
+    force = max_downloads > 0 or WORKER_PREDEFINED_ETAG_AUTO_DOWNLOAD_CHUNKS
+    if not force:
         return
-    path = predefined_etag_chunk_data_path_for_key(cache_key)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    await asyncio.to_thread(path.write_bytes, data)
-    print(f"[Worker] Chunk data cached locally key={cache_key[:96]} bytes={len(data)}")
+    scheduled = 0
+    for item in sources or []:
+        source_url = str(item.get("source_url") or "").strip()
+        if not source_url:
+            continue
+        for seg in item.get("segments") or []:
+            if max_downloads > 0 and scheduled >= max_downloads:
+                break
+            try:
+                start = int(seg["start"])
+                end = int(seg["end"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if get_worker_range_store().covers(source_url, start, end):
+                continue
+            schedule_predefined_etag_range_download(
+                source_url, start, end, force=True
+            )
+            scheduled += 1
+        if max_downloads > 0 and scheduled >= max_downloads:
+            break
+    if scheduled:
+        print(
+            f"[Worker] Range snapshot: scheduled {scheduled} missing segment downloads"
+        )
+
+
+async def sync_range_to_control_server(transfer_context: dict) -> bool:
+    """Upload local range bytes to control-server and announce coverage."""
+    source_url = str(transfer_context.get("source_url") or "")
+    try:
+        start = int(transfer_context["range_start"])
+        end = int(transfer_context["range_end"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    data = await asyncio.to_thread(read_predefined_etag_range_bytes, transfer_context)
+    if not data:
+        return False
+    try:
+        from neurons.common.control_client import upload_predefined_etag_range_data
+
+        uploaded = await asyncio.to_thread(
+            upload_predefined_etag_range_data,
+            source_url,
+            start,
+            end,
+            data,
+            chunk_hash=hashlib.sha256(data).hexdigest(),
+            etag="",
+        )
+        if uploaded:
+            from neurons.common import control_ws_client
+
+            control_ws_client.schedule_range_update(source_url, start, end)
+        return uploaded
+    except Exception as exc:
+        print(f"[Worker] Range sync to control-server failed: {exc}")
+        return False
+
+
+def apply_range_coverage_broadcast(source_url: str, start: int, end: int) -> None:
+    """On WS broadcast: download new coverage from control-server and merge locally."""
+    if not source_url or end < start:
+        return
+    schedule_predefined_etag_range_download(source_url, start, end, force=True)
 
 
 def bootstrap_missing_predefined_etag_chunk_files() -> int:
-    """Schedule control-server downloads for metadata entries missing local range bytes."""
-    max_downloads = WORKER_PREDEFINED_ETAG_BOOTSTRAP_MAX_DOWNLOADS
-    if max_downloads <= 0:
-        return 0
-    from neurons.common.byte_range_store import parse_cache_key_range
-
-    scheduled = 0
-    for key, entry in list(_PREDEFINED_ETAG_CHUNK_CACHE.items()):
-        if scheduled >= max_downloads:
-            break
-        parsed = parse_cache_key_range(key)
-        if parsed is not None:
-            source, start, end = parsed
-            if get_worker_range_store().covers(source, start, end):
-                continue
-        elif predefined_etag_chunk_data_path_for_key(key).is_file():
-            continue
-        schedule_predefined_etag_chunk_data_download(key, entry.chunk_hash, force=True)
-        scheduled += 1
-    return scheduled
-
-
-def apply_predefined_etag_cache_entry(key: str, chunk_hash: str, etag: str) -> None:
-    """Merge one cache entry from control-server WS broadcast into local memory."""
-    if not key or not chunk_hash:
-        return
-    resolved_etag = etag or PREDEFINED_ETAG
-    existing = _PREDEFINED_ETAG_CHUNK_CACHE.get(key)
-    if (
-        existing is not None
-        and existing.chunk_hash == chunk_hash
-        and existing.etag == resolved_etag
-    ):
-        schedule_predefined_etag_chunk_data_download(key, chunk_hash)
-        return
-    _PREDEFINED_ETAG_CHUNK_CACHE[key] = PredefinedETagChunkCacheEntry(
-        chunk_hash=chunk_hash,
-        etag=resolved_etag,
-    )
-    save_predefined_etag_chunk_cache()
-    schedule_predefined_etag_chunk_data_download(key, chunk_hash)
-
-
-def apply_predefined_etag_cache_snapshot(entries: dict[str, dict[str, str]]) -> None:
-    """Merge full cache snapshot from control-server on WS connect."""
-    merged = 0
-    for key, item in (entries or {}).items():
-        chunk_hash = str(item.get("chunk_hash") or "").strip()
-        if not chunk_hash:
-            continue
-        _PREDEFINED_ETAG_CHUNK_CACHE[str(key)] = PredefinedETagChunkCacheEntry(
-            chunk_hash=chunk_hash,
-            etag=str(item.get("etag") or PREDEFINED_ETAG),
-        )
-        schedule_predefined_etag_chunk_data_download(str(key), chunk_hash)
-        merged += 1
-    if merged:
-        save_predefined_etag_chunk_cache()
-        print(f"[Worker] Merged {merged} predefined ETag cache entries from control-server WS")
+    """No-op: bootstrap is driven by range_snapshot from control-server WS."""
+    return 0
 
 
 def setup_control_server_cache_sync() -> None:
-    load_predefined_etag_chunk_cache()
     from neurons.common import control_ws_client
 
-    control_ws_client.register_cache_merge_handler(apply_predefined_etag_cache_entry)
-    control_ws_client.register_cache_snapshot_handler(apply_predefined_etag_cache_snapshot)
+    control_ws_client.register_range_snapshot_handler(apply_range_coverage_snapshot)
+    control_ws_client.register_range_broadcast_handler(apply_range_coverage_broadcast)
 
 
 def start_predefined_etag_chunk_download_bootstrap() -> None:
-    """Schedule missing chunk file downloads once the asyncio loop is running."""
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return
-    scheduled = bootstrap_missing_predefined_etag_chunk_files()
-    if scheduled:
-        print(f"[Worker] Bootstrap: scheduled {scheduled} missing predefined ETag chunk downloads")
+    """Range downloads are scheduled from range_snapshot (see setup_control_server_cache_sync)."""
+    return
 
 
 def get_predefined_etag_cache(
     transfer_context: dict,
 ) -> Optional[PredefinedETagChunkCacheEntry]:
-    env_entry = get_predefined_etag_env_entry(transfer_context)
-    if env_entry is not None:
-        return env_entry
-    key = predefined_etag_cache_key(transfer_context)
-    return _PREDEFINED_ETAG_CHUNK_CACHE.get(key)
+    entry, _source = resolve_predefined_etag_cache(transfer_context)
+    return entry
 
 
 def predefined_etag_known_source(transfer_context: dict) -> Optional[str]:
-    """Return how hash/etag were resolved: env, cache, or None."""
-    if get_predefined_etag_env_entry(transfer_context) is not None:
-        return "env"
-    if predefined_etag_cache_key(transfer_context) in _PREDEFINED_ETAG_CHUNK_CACHE:
-        return "cache"
-    return None
+    """Return how hash/etag were resolved: env, range_data, or None."""
+    _entry, source = resolve_predefined_etag_cache(transfer_context)
+    return source
+
+
+def _etag_quoted_md5(data: bytes) -> str:
+    """R2/S3 single-PUT ETag: quoted MD5 of the exact uploaded bytes."""
+    return f'"{hashlib.md5(data).hexdigest()}"'
+
+
+def derive_predefined_etag_from_range_data(
+    transfer_context: dict,
+) -> Optional[PredefinedETagChunkCacheEntry]:
+    """If range_data covers this task, load bytes and compute chunk_hash + etag.
+
+    Always computed from raw bytes (never from predefined_etag_chunks.json).
+    """
+    if not predefined_etag_transfer_eligible(transfer_context):
+        return None
+    if not has_predefined_etag_chunk_data(transfer_context):
+        return None
+    data = read_predefined_etag_range_bytes(transfer_context)
+    if not data:
+        return None
+    try:
+        expected = (
+            int(transfer_context["range_end"]) - int(transfer_context["range_start"]) + 1
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    if len(data) != expected:
+        return None
+
+    return PredefinedETagChunkCacheEntry(
+        chunk_hash=_sha256_hex(data),
+        etag=_etag_quoted_md5(data),
+    )
+
+
+def resolve_predefined_etag_cache(
+    transfer_context: dict,
+) -> tuple[Optional[PredefinedETagChunkCacheEntry], Optional[str]]:
+    """Resolve hash/etag: env → derive from range_data bytes only."""
+    env_entry = get_predefined_etag_env_entry(transfer_context)
+    if env_entry is not None:
+        return env_entry, "env"
+    derived = derive_predefined_etag_from_range_data(transfer_context)
+    if derived is not None:
+        return derived, "range_data"
+    return None, None
 
 
 def push_predefined_etag_cache_for_context(
@@ -2277,13 +2353,35 @@ class PredefinedETagSubmitOutcome:
     success: bool
     chunk_hash: str = ""
     etag: Optional[str] = None
+    etag_local: Optional[str] = None
     error: Optional[str] = None
     used_cache: bool = False
-    uploaded_from_cache: bool = False
-    background_upload_started: bool = False
     hash_source: str = "computed"
     fetch_ms: float = 0.0
     send_ms: float = 0.0
+
+
+def _log_task_done(
+    log_prefix: str,
+    task_id: str,
+    offer_id: str,
+    transfer_context: dict,
+    *,
+    chunk_hash: str = "",
+    etag_real: str = "",
+    etag_local: str = "",
+    cached: bool = False,
+    fetch_ms: float = 0.0,
+    send_ms: float = 0.0,
+) -> None:
+    print(
+        f"{log_prefix} task_done task={task_label(task_id)} offer={task_label(offer_id)} "
+        f"range={transfer_context.get('range_start')}-{transfer_context.get('range_end')} "
+        f"cache_key={predefined_etag_cache_key(transfer_context)[:96]} "
+        f"hash={chunk_hash or '-'} etag_real={etag_real or '-'} "
+        f"etag_local={etag_local or '-'} cached={str(cached).lower()} "
+        f"fetch_ms={fetch_ms:.1f} send_ms={send_ms:.1f}"
+    )
 
 
 def _log_predefined_etag_submit_ready(
@@ -2326,10 +2424,10 @@ async def run_predefined_etag_cached_background_upload(
     task_id: str = None,
     offer_id: str = None,
     log_prefix: str = "[Worker]",
-) -> tuple[bool, float, Optional[str]]:
-    """Upload local cache file to dest before task_result (background task)."""
+) -> tuple[bool, float, Optional[str], Optional[str], Optional[str]]:
+    """Upload local range bytes to dest. Returns (ok, send_ms, etag_real, etag_local, error)."""
     log_task_chunk_from_context(
-        "background_upload_start",
+        "upload_start",
         transfer_context,
         task_id=task_id,
         offer_id=offer_id,
@@ -2337,11 +2435,11 @@ async def run_predefined_etag_cached_background_upload(
         log_prefix=log_prefix,
     )
     if not has_predefined_etag_chunk_data(transfer_context):
-        return False, 0.0, "cache_file_missing"
+        return False, 0.0, None, None, "cache_file_missing"
 
     client = state.http_client
     if client is not None:
-        ok, send_ms, err = await upload_predefined_etag_from_local_cache(
+        result = await upload_predefined_etag_from_local_cache(
             client,
             transfer_context,
             chunk_hash,
@@ -2351,7 +2449,7 @@ async def run_predefined_etag_cached_background_upload(
         )
     else:
         async with httpx.AsyncClient(timeout=SEND_TIMEOUT) as tmp_client:
-            ok, send_ms, err = await upload_predefined_etag_from_local_cache(
+            result = await upload_predefined_etag_from_local_cache(
                 tmp_client,
                 transfer_context,
                 chunk_hash,
@@ -2360,82 +2458,17 @@ async def run_predefined_etag_cached_background_upload(
                 log_prefix=log_prefix,
             )
 
+    ok, send_ms, etag_real, etag_local, err = result
     log_task_chunk_from_context(
-        "background_upload_done" if ok else "background_upload_failed",
+        "upload_done" if ok else "upload_failed",
         transfer_context,
         task_id=task_id,
         offer_id=offer_id,
         chunk_hash=chunk_hash,
         log_prefix=log_prefix,
-        detail=err or f"send_ms={send_ms:.1f}",
+        detail=err or f"etag_real={etag_real!r} send_ms={send_ms:.1f}",
     )
-    if ok:
-        _emit_transfer_log(
-            f"{log_prefix} Cached chunk background upload finished "
-            f"task={task_label(task_id)} offer={task_label(offer_id)} "
-            f"send_ms={send_ms:.1f}",
-            log_prefix=log_prefix,
-        )
-    else:
-        _emit_transfer_log(
-            f"{log_prefix} Cached chunk background upload failed "
-            f"task={task_label(task_id)} offer={task_label(offer_id)} "
-            f"error={err or 'unknown'}",
-            log_prefix=log_prefix,
-        )
-    return ok, send_ms, err
-
-
-def start_predefined_etag_cached_background_upload(
-    state: WorkerState,
-    transfer_context: dict,
-    chunk_hash: str,
-    *,
-    task_id: str = None,
-    offer_id: str = None,
-    log_prefix: str = "[Worker]",
-) -> Optional[asyncio.Task]:
-    """Start cached upload to dest; caller awaits the task before task_result."""
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        return None
-    upload_task = loop.create_task(
-        run_predefined_etag_cached_background_upload(
-            state,
-            transfer_context,
-            chunk_hash,
-            task_id=task_id,
-            offer_id=offer_id,
-            log_prefix=log_prefix,
-        ),
-        name="predefined-etag-cached-background-upload",
-    )
-    _emit_transfer_log(
-        f"{log_prefix} Cached chunk background upload started "
-        f"task={task_label(task_id)} offer={task_label(offer_id)}",
-        log_prefix=log_prefix,
-    )
-    return upload_task
-
-
-async def _await_cached_background_upload_task(
-    upload_task: asyncio.Task,
-    *,
-    task_id: str = None,
-    offer_id: str = None,
-    log_prefix: str = "[Worker]",
-) -> tuple[bool, float, Optional[str]]:
-    """Wait for a cached background upload task and return (ok, send_ms, error)."""
-    try:
-        return await upload_task
-    except asyncio.CancelledError:
-        _emit_transfer_log(
-            f"{log_prefix} Cached chunk background upload cancelled "
-            f"task={task_label(task_id)} offer={task_label(offer_id)}",
-            log_prefix=log_prefix,
-        )
-        raise
+    return result
 
 
 async def predefined_etag_submit_flow(
@@ -2451,113 +2484,66 @@ async def predefined_etag_submit_flow(
     offer_started_at: Optional[float] = None,
     result_label: str = "task_result",
 ) -> PredefinedETagSubmitOutcome:
-    """Predefined ETag: cache hit → background upload, then task_result."""
+    """Predefined ETag: range hit → upload from cache; miss → fetch+upload → sync to control-server."""
     started_at = offer_started_at if offer_started_at is not None else time.perf_counter()
-    hash_source = predefined_etag_known_source(transfer_context)
-    known = get_predefined_etag_cache(transfer_context)
-    stage = hash_source or "cache_miss"
-    log_task_chunk_from_context(
-        stage,
-        transfer_context,
-        task_id=task_id,
-        offer_id=offer_id,
-        chunk_hash=known.chunk_hash if known else "",
-        log_prefix=log_prefix,
-        detail=f"etag={known.etag!r}" if known else "",
-    )
 
-    if known:
-        if has_predefined_etag_chunk_data(transfer_context):
-            upload_task = start_predefined_etag_cached_background_upload(
-                state,
-                transfer_context,
-                known.chunk_hash,
-                task_id=task_id,
-                offer_id=offer_id,
-                log_prefix=log_prefix,
-            )
-            if upload_task is None:
-                return PredefinedETagSubmitOutcome(
-                    success=False,
-                    error="cache_background_upload_not_started",
-                    used_cache=True,
-                )
-
-            waited_sec = await wait_predefined_etag_min_submit_delay(
-                started_at, transfer_context
-            )
-            try:
-                ok, send_ms, err = await _await_cached_background_upload_task(
-                    upload_task,
-                    task_id=task_id,
-                    offer_id=offer_id,
-                    log_prefix=log_prefix,
-                )
-            except asyncio.CancelledError:
-                return PredefinedETagSubmitOutcome(
-                    success=False,
-                    error="cache_background_upload_cancelled",
-                    used_cache=True,
-                )
-            if not ok:
-                return PredefinedETagSubmitOutcome(
-                    success=False,
-                    chunk_hash=known.chunk_hash,
-                    etag=known.etag,
-                    used_cache=True,
-                    error=err or "cache_background_upload_failed",
-                    send_ms=send_ms,
-                )
-            _log_predefined_etag_submit_ready(
-                log_prefix,
-                task_id,
-                offer_id,
-                transfer_context,
-                waited_sec,
-                hash_source=hash_source or "cache",
-                result_label=result_label,
-            )
+    if has_predefined_etag_chunk_data(transfer_context):
+        data = await asyncio.to_thread(read_predefined_etag_range_bytes, transfer_context)
+        if not data:
             return PredefinedETagSubmitOutcome(
-                success=True,
-                chunk_hash=known.chunk_hash,
-                etag=known.etag,
+                success=False,
+                error="range_data_read_failed",
+            )
+        chunk_hash = _sha256_hex(data)
+        etag_local = _etag_quoted_md5(data)
+        log_task_chunk_from_context(
+            "range_hit",
+            transfer_context,
+            task_id=task_id,
+            offer_id=offer_id,
+            chunk_hash=chunk_hash,
+            log_prefix=log_prefix,
+            detail=f"etag_local={etag_local!r}",
+        )
+
+        ok, send_ms, etag_real, _, err = await run_predefined_etag_cached_background_upload(
+            state,
+            transfer_context,
+            chunk_hash,
+            task_id=task_id,
+            offer_id=offer_id,
+            log_prefix=log_prefix,
+        )
+        if not ok:
+            return PredefinedETagSubmitOutcome(
+                success=False,
+                chunk_hash=chunk_hash,
+                etag_local=etag_local,
                 used_cache=True,
-                uploaded_from_cache=True,
-                background_upload_started=True,
-                hash_source=hash_source or "cache",
-                fetch_ms=0.0,
+                error=err or "cache_upload_failed",
                 send_ms=send_ms,
             )
 
-        if hash_source == "env":
-            waited_sec = await wait_predefined_etag_min_submit_delay(
-                started_at, transfer_context
-            )
-            _log_predefined_etag_submit_ready(
-                log_prefix,
-                task_id,
-                offer_id,
-                transfer_context,
-                waited_sec,
-                hash_source="env",
-                result_label=result_label,
-            )
-            return PredefinedETagSubmitOutcome(
-                success=True,
-                chunk_hash=known.chunk_hash,
-                etag=known.etag,
-                used_cache=True,
-                hash_source="env",
-                fetch_ms=0.0,
-                send_ms=0.0,
-            )
-
-        print(
-            f"{log_prefix} Cache metadata hit but chunk file missing; "
-            f"falling back to source fetch: task={task_label(task_id)} "
-            f"offer={task_label(offer_id)}"
+        await wait_predefined_etag_min_submit_delay(started_at, transfer_context, body=data)
+        return PredefinedETagSubmitOutcome(
+            success=True,
+            chunk_hash=chunk_hash,
+            etag=etag_real or etag_local,
+            etag_local=etag_local,
+            used_cache=True,
+            hash_source="range_data",
+            fetch_ms=0.0,
+            send_ms=send_ms,
         )
 
+    log_task_chunk_from_context(
+        "range_miss",
+        transfer_context,
+        task_id=task_id,
+        offer_id=offer_id,
+        log_prefix=log_prefix,
+        detail="fetching from source",
+    )
     result = await execute_task_with_metrics(
         state,
         task_id,
@@ -2571,35 +2557,28 @@ async def predefined_etag_submit_flow(
             success=False,
             chunk_hash=result.chunk_hash,
             error=result.error_msg,
+            fetch_ms=result.fetch_ms,
+            send_ms=result.send_ms,
         )
 
-    etag = result.etag or PREDEFINED_ETAG
-    maybe_store_predefined_etag_cache_on_success(
-        transfer_context,
-        result.chunk_hash,
-        etag,
-        log_prefix=log_prefix,
-        task_id=task_id,
-        offer_id=offer_id,
-        push_to_control_server=push_cache_to_control_server,
-    )
-    waited_sec = await wait_predefined_etag_min_submit_delay(
-        started_at,
-        transfer_context,
-    )
-    _log_predefined_etag_submit_ready(
-        log_prefix,
-        task_id,
-        offer_id,
-        transfer_context,
-        waited_sec,
-        hash_source="computed",
-        result_label=result_label,
-    )
+    etag_local: Optional[str] = None
+    saved = await asyncio.to_thread(read_predefined_etag_range_bytes, transfer_context)
+    if saved:
+        etag_local = _etag_quoted_md5(saved)
+
+    if push_cache_to_control_server:
+        synced = await sync_range_to_control_server(transfer_context)
+        print(
+            f"{log_prefix} Range synced to control-server "
+            f"task={task_label(task_id)} ok={synced}"
+        )
+
+    await wait_predefined_etag_min_submit_delay(started_at, transfer_context)
     return PredefinedETagSubmitOutcome(
         success=True,
         chunk_hash=result.chunk_hash,
-        etag=etag,
+        etag=result.etag,
+        etag_local=etag_local,
         used_cache=False,
         hash_source="computed",
         fetch_ms=result.fetch_ms,
@@ -2630,7 +2609,7 @@ async def run_predefined_etag_background_transfer(
         client = state.http_client
         started = time.perf_counter()
         if client is not None:
-            ok, send_ms, err = await upload_predefined_etag_from_local_cache(
+            ok, send_ms, etag_real, _etag_local, err = await upload_predefined_etag_from_local_cache(
                 client,
                 transfer_context,
                 known.chunk_hash,
@@ -2640,7 +2619,7 @@ async def run_predefined_etag_background_transfer(
             )
         else:
             async with httpx.AsyncClient(timeout=SEND_TIMEOUT) as tmp_client:
-                ok, send_ms, err = await upload_predefined_etag_from_local_cache(
+                ok, send_ms, etag_real, _etag_local, err = await upload_predefined_etag_from_local_cache(
                     tmp_client,
                     transfer_context,
                     known.chunk_hash,
@@ -2649,21 +2628,12 @@ async def run_predefined_etag_background_transfer(
                     log_prefix=log_prefix,
                 )
         duration_ms = (time.perf_counter() - started) * 1000
-        if ok:
-            update_predefined_etag_cache(
-                transfer_context,
-                known.chunk_hash,
-                known.etag,
-                log_prefix=log_prefix,
-                task_id=task_id,
-                offer_id=offer_id,
-            )
         result = TaskExecutionResult(
             success=ok,
             bytes_transferred=predefined_etag_bandwidth_byte_count(transfer_context),
             duration_ms=round(duration_ms, 1),
             chunk_hash=known.chunk_hash,
-            etag=known.etag,
+            etag=etag_real or known.etag,
             error_msg=err,
             fetch_ms=0.0,
             send_ms=send_ms,
@@ -2677,15 +2647,8 @@ async def run_predefined_etag_background_transfer(
             deadline_us,
             log_prefix=log_prefix,
         )
-        if result.success and result.chunk_hash:
-            update_predefined_etag_cache(
-                transfer_context,
-                result.chunk_hash,
-                result.etag,
-                log_prefix=log_prefix,
-                task_id=task_id,
-                offer_id=offer_id,
-            )
+        if result.success:
+            await sync_range_to_control_server(transfer_context)
     log_task_chunk_from_context(
         "background_done" if result.success else "background_failed",
         transfer_context,
@@ -3730,11 +3693,11 @@ async def _handle_ws_task_predefined_etag_early_result(
     transfer_context: dict,
     deadline_us: int,
 ) -> bool:
-    """Predefined ETag: cache hit submits immediately; miss fetch+upload; background if cached."""
-    cached = get_predefined_etag_cache(transfer_context)
+    """Predefined ETag: range hit → upload then task_result; miss → fetch+upload+sync then task_result."""
+    has_range = has_predefined_etag_chunk_data(transfer_context)
     print(
-        f"[Worker] [WS] Predefined ETag: "
-        f"{'cache hit, background upload then submit' if cached else 'cache miss, fetch+upload then submit'}: "
+        f"[Worker] [WS] Predefined ETag "
+        f"{'range hit' if has_range else 'range miss'}: "
         f"task={task_label(task_id)} offer={task_label(offer_id)}"
     )
 
@@ -3776,18 +3739,18 @@ async def _handle_ws_task_predefined_etag_early_result(
         send_ms=outcome.send_ms,
     )
     finalized = await _finalize_ws_task(websocket, state, task_id, offer_id, result)
-
-    if outcome.used_cache and not outcome.background_upload_started:
-        asyncio.create_task(
-            _await_predefined_etag_background_transfer_task(
-                state,
-                task,
-                task_id,
-                offer_id,
-                transfer_context,
-                deadline_us,
-            )
-        )
+    _log_task_done(
+        "[Worker] [WS]",
+        task_id,
+        offer_id,
+        transfer_context,
+        chunk_hash=outcome.chunk_hash,
+        etag_real=outcome.etag or "",
+        etag_local=outcome.etag_local or "",
+        cached=outcome.used_cache,
+        fetch_ms=outcome.fetch_ms,
+        send_ms=outcome.send_ms,
+    )
     return finalized
 
 

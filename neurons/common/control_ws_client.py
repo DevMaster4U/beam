@@ -1,4 +1,4 @@
-"""WebSocket client: connect to control-server, sync and broadcast predefined ETag cache."""
+"""WebSocket client: sync range_data coverage from control-server (segments.json)."""
 
 from __future__ import annotations
 
@@ -13,12 +13,14 @@ from neurons.common.control_client import get_control_server_config
 
 logger = logging.getLogger(__name__)
 
-MergeHandler = Callable[[str, str, str], None]
-SnapshotHandler = Callable[[dict[str, dict[str, str]]], None]
+# sources: list[{source_url, segments:[{start,end}]}]
+RangeSnapshotHandler = Callable[[list[dict[str, Any]]], None]
+# source_url, start, end
+RangeBroadcastHandler = Callable[[str, int, int], None]
 SyncDoneHandler = Callable[[], None]
 
-_merge_handler: Optional[MergeHandler] = None
-_snapshot_handler: Optional[SnapshotHandler] = None
+_range_snapshot_handler: Optional[RangeSnapshotHandler] = None
+_range_broadcast_handler: Optional[RangeBroadcastHandler] = None
 _sync_done_handler: Optional[SyncDoneHandler] = None
 _cache_sync_done_event: Optional[asyncio.Event] = None
 _update_queue: Optional[asyncio.Queue] = None
@@ -26,19 +28,28 @@ _client_task: Optional[asyncio.Task] = None
 _stop_event: Optional[asyncio.Event] = None
 
 
-def register_cache_merge_handler(handler: MergeHandler) -> None:
-    global _merge_handler
-    _merge_handler = handler
+def register_range_snapshot_handler(handler: RangeSnapshotHandler) -> None:
+    global _range_snapshot_handler
+    _range_snapshot_handler = handler
 
 
-def register_cache_snapshot_handler(handler: SnapshotHandler) -> None:
-    global _snapshot_handler
-    _snapshot_handler = handler
+def register_range_broadcast_handler(handler: RangeBroadcastHandler) -> None:
+    global _range_broadcast_handler
+    _range_broadcast_handler = handler
 
 
 def register_sync_done_handler(handler: SyncDoneHandler) -> None:
     global _sync_done_handler
     _sync_done_handler = handler
+
+
+# Backward-compat aliases (old metadata handlers unused for sync).
+def register_cache_merge_handler(handler: Callable[..., None]) -> None:
+    return None
+
+
+def register_cache_snapshot_handler(handler: Callable[..., None]) -> None:
+    return None
 
 
 def _mark_cache_sync_done() -> None:
@@ -76,61 +87,79 @@ except ImportError:
     WEBSOCKETS_AVAILABLE = False
 
 
-def schedule_cache_update(key: str, chunk_hash: str, etag: str) -> None:
-    if _update_queue is None or not chunk_hash or not key:
+def schedule_range_update(source_url: str, start: int, end: int) -> None:
+    """Announce local coverage to control-server (bytes already uploaded via HTTP)."""
+    if _update_queue is None or not source_url or end < start:
         return
     try:
         _update_queue.put_nowait(
             {
-                "type": "cache_update",
-                "key": key,
-                "chunk_hash": chunk_hash,
-                "etag": etag or "",
+                "type": "range_update",
+                "source_url": source_url,
+                "start": int(start),
+                "end": int(end),
             }
         )
     except asyncio.QueueFull:
-        logger.warning("Control WS update queue full; dropping cache_update key=%s", key[:96])
-
-
-def _apply_broadcast(key: str, chunk_hash: str, etag: str) -> None:
-    if not _merge_handler:
-        return
-    try:
-        _merge_handler(key, chunk_hash, etag)
-    except Exception as exc:
-        logger.warning("Cache merge handler failed key=%s err=%s", key[:96], exc)
-
-
-def _schedule_chunk_data_download(key: str, chunk_hash: str) -> None:
-    try:
-        from neurons.worker import worker as transfer_module
-
-        transfer_module.schedule_predefined_etag_chunk_data_download(key, chunk_hash)
-    except Exception as exc:
         logger.warning(
-            "Chunk data download schedule failed key=%s err=%s",
-            key[:96],
-            exc,
+            "Control WS update queue full; dropping range_update src=%s %s-%s",
+            source_url[:96],
+            start,
+            end,
         )
 
 
-def _apply_snapshot(entries: dict[str, Any]) -> None:
-    normalized: dict[str, dict[str, str]] = {}
-    for key, item in (entries or {}).items():
+def schedule_cache_update(key: str, chunk_hash: str, etag: str) -> None:
+    """Legacy: map source|start|end key to range_update (hash/etag ignored)."""
+    from neurons.common.byte_range_store import parse_cache_key_range
+
+    parsed = parse_cache_key_range(key)
+    if parsed is None:
+        return
+    source_url, start, end = parsed
+    schedule_range_update(source_url, start, end)
+
+
+def _apply_range_snapshot(sources: list[Any]) -> None:
+    if not _range_snapshot_handler:
+        return
+    normalized: list[dict[str, Any]] = []
+    for item in sources or []:
         if not isinstance(item, dict):
             continue
-        chunk_hash = str(item.get("chunk_hash") or item.get("hash") or "").strip()
-        if not chunk_hash:
+        source_url = str(item.get("source_url") or "").strip()
+        if not source_url:
             continue
-        normalized[str(key)] = {
-            "chunk_hash": chunk_hash,
-            "etag": str(item.get("etag") or ""),
-        }
-    if _snapshot_handler:
-        _snapshot_handler(normalized)
+        segs_in = item.get("segments") or []
+        segs: list[dict[str, int]] = []
+        if isinstance(segs_in, list):
+            for seg in segs_in:
+                if not isinstance(seg, dict):
+                    continue
+                try:
+                    segs.append({"start": int(seg["start"]), "end": int(seg["end"])})
+                except (KeyError, TypeError, ValueError):
+                    continue
+        normalized.append({"source_url": source_url, "segments": segs})
+    try:
+        _range_snapshot_handler(normalized)
+    except Exception as exc:
+        logger.warning("Range snapshot handler failed: %s", exc)
+
+
+def _apply_range_broadcast(source_url: str, start: int, end: int) -> None:
+    if not _range_broadcast_handler:
         return
-    for key, item in normalized.items():
-        _apply_broadcast(key, item["chunk_hash"], item.get("etag") or "")
+    try:
+        _range_broadcast_handler(source_url, start, end)
+    except Exception as exc:
+        logger.warning(
+            "Range broadcast handler failed src=%s %s-%s err=%s",
+            source_url[:96],
+            start,
+            end,
+            exc,
+        )
 
 
 async def _send_pending_updates(ws) -> None:
@@ -148,7 +177,6 @@ async def _client_loop() -> None:
     assert _update_queue is not None
 
     cfg = get_control_server_config()
-    ws_url = cfg.ws_url
     reconnect_delay = float(os.environ.get("CONTROL_SERVER_WS_RECONNECT_SEC", "3.0"))
 
     while not _stop_event.is_set():
@@ -193,41 +221,38 @@ async def _client_loop() -> None:
 
                     message = json.loads(raw)
                     msg_type = str(message.get("type") or "")
-                    if msg_type == "cache_snapshot":
-                        _apply_snapshot(message.get("entries") or {})
+                    if msg_type == "range_snapshot":
+                        sources = message.get("sources") or []
+                        _apply_range_snapshot(sources if isinstance(sources, list) else [])
                         logger.info(
-                            "Control-server cache snapshot merged entries=%d",
-                            len(message.get("entries") or {}),
+                            "Control-server range snapshot merged sources=%d",
+                            len(sources) if isinstance(sources, list) else 0,
                         )
-                    elif msg_type == "cache_broadcast":
-                        key = str(message.get("key") or "")
-                        chunk_hash = str(message.get("chunk_hash") or message.get("hash") or "")
-                        etag = str(message.get("etag") or "")
-                        if key and chunk_hash:
-                            _apply_broadcast(key, chunk_hash, etag)
-                            if message.get("has_chunk_data"):
-                                _schedule_chunk_data_download(key, chunk_hash)
-                            source_miner = str(message.get("source_miner") or "?")
-                            chunk_index = message.get("chunk_index")
-                            idx_label = (
-                                f" chunk_index={chunk_index}"
-                                if chunk_index is not None
-                                else ""
-                            )
+                    elif msg_type == "range_broadcast":
+                        source_url = str(message.get("source_url") or "")
+                        try:
+                            start = int(message.get("start"))
+                            end = int(message.get("end"))
+                        except (TypeError, ValueError):
+                            continue
+                        if source_url and end >= start:
+                            _apply_range_broadcast(source_url, start, end)
                             logger.info(
-                                "Control-server cache broadcast merged miner_id=%s "
-                                "source_miner=%s key=%s hash=%s%s",
+                                "Control-server range broadcast miner_id=%s "
+                                "source_miner=%s src=%s range=%s-%s",
                                 cfg.miner_id or "miner",
-                                source_miner,
-                                key[:96],
-                                chunk_hash[:16],
-                                idx_label,
+                                message.get("source_miner") or "?",
+                                source_url[:96],
+                                start,
+                                end,
                             )
-                    elif msg_type == "cache_update_ack":
+                    elif msg_type in ("cache_snapshot", "cache_broadcast"):
+                        # Legacy metadata messages ignored — sync is range_data only.
+                        logger.debug("Ignoring legacy %s (range sync active)", msg_type)
+                    elif msg_type in ("range_update_ack", "cache_update_ack"):
                         logger.info(
-                            "Control-server cache push ack miner_id=%s key=%s",
+                            "Control-server range push ack miner_id=%s",
                             cfg.miner_id or "miner",
-                            str(message.get("key") or "")[:96],
                         )
                     elif msg_type == "sync_done":
                         logger.info(

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fetch predefined ETag cache metadata + range bytes from control-server.
+# Fetch range_data coverage (segments.json) + bytes from control-server.
 #
 # Usage:
 #   ./scripts/fetch-cache-data.sh
@@ -7,8 +7,7 @@
 #   CONTROL_SERVER_URL=http://host:8010 CONTROL_SERVER_SECRET=secret ./scripts/fetch-cache-data.sh
 #
 # Writes:
-#   logs/workers/predefined_etag_chunks.json
-#   logs/workers/predefined_etag_range_data/<digest>/   (merge into continuous store)
+#   logs/workers/predefined_etag_range_data/<digest>/segments.json + *.bin
 #
 # Optional:
 #   --legacy-chunk-data  also write logs/workers/predefined_etag_chunk_data/<sha256>.bin
@@ -22,20 +21,17 @@ source "${ROOT}/scripts/lib/systemd.sh"
 ENV_FILE="${1:-}"
 shift || true
 
-DOWNLOAD_ALL=0
 SKIP_CHUNKS=0
 LEGACY_CHUNK_DATA=0
-EXTRA_ARGS=()
 
 usage() {
   cat <<EOF
-Usage: $0 [env-file] [--all-chunks] [--metadata-only] [--legacy-chunk-data]
+Usage: $0 [env-file] [--metadata-only] [--legacy-chunk-data]
 
-Fetch predefined ETag cache from control-server into logs/workers/.
+Fetch range coverage from control-server into logs/workers/predefined_etag_range_data/.
 
   env-file              Optional worker/orchestrator env (CONTROL_SERVER_* vars)
-  --all-chunks          Download bytes even when has_chunk_data is unset
-  --metadata-only       Fetch JSON metadata only (skip range downloads)
+  --metadata-only       Print segment coverage only (skip range downloads)
   --legacy-chunk-data   Also write legacy predefined_etag_chunk_data/*.bin
 
 Environment (from env-file or shell):
@@ -49,7 +45,7 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --all-chunks)
-      DOWNLOAD_ALL=1
+      # Kept for CLI compat; ranges snapshot always lists real coverage.
       shift
       ;;
     --metadata-only)
@@ -65,8 +61,9 @@ while [[ $# -gt 0 ]]; do
       exit 0
       ;;
     *)
-      EXTRA_ARGS+=("$1")
-      shift
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 1
       ;;
   esac
 done
@@ -88,23 +85,19 @@ export PYTHONPATH="${ROOT}:${PYTHONPATH:-}"
 export LOG_DIR="${LOG_DIR:-${ROOT}/logs}"
 
 PY="$(beam_python)"
-exec "$PY" - "$DOWNLOAD_ALL" "$SKIP_CHUNKS" "$LEGACY_CHUNK_DATA" "${EXTRA_ARGS[@]}" <<'PY'
+exec "$PY" - "$SKIP_CHUNKS" "$LEGACY_CHUNK_DATA" <<'PY'
 import hashlib
-import json
 import os
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote
 
 import httpx
 
-from neurons.common.byte_range_store import ByteRangeStore, parse_cache_key_range
+from neurons.common.byte_range_store import ByteRangeStore
 from neurons.common.control_client import get_control_server_config
 
-download_all = sys.argv[1] == "1"
-skip_chunks = sys.argv[2] == "1"
-legacy_chunk_data = sys.argv[3] == "1"
+skip_chunks = sys.argv[1] == "1"
+legacy_chunk_data = sys.argv[2] == "1"
 
 cfg = get_control_server_config()
 if not cfg.secret or not (cfg.http_url or cfg.ws_url):
@@ -114,7 +107,6 @@ if not cfg.secret or not (cfg.http_url or cfg.ws_url):
 
 log_root = Path(os.environ.get("LOG_DIR", "logs"))
 workers_dir = log_root / "workers"
-cache_path = workers_dir / "predefined_etag_chunks.json"
 range_dir = workers_dir / "predefined_etag_range_data"
 chunk_dir = workers_dir / "predefined_etag_chunk_data"
 workers_dir.mkdir(parents=True, exist_ok=True)
@@ -127,31 +119,24 @@ if cfg.miner_id:
     headers["X-Miner-Id"] = cfg.miner_id
 
 http_url = cfg.http_url.rstrip("/")
-print(f"Fetching cache metadata from {http_url}/cache/predefined-etag")
+print(f"Fetching range snapshot from {http_url}/cache/predefined-etag/ranges/snapshot")
 with httpx.Client(timeout=60.0) as client:
-    resp = client.get(f"{http_url}/cache/predefined-etag", headers=headers)
+    resp = client.get(
+        f"{http_url}/cache/predefined-etag/ranges/snapshot",
+        headers=headers,
+    )
     resp.raise_for_status()
     payload = resp.json()
 
-entries = payload.get("entries") or {}
-normalized = {
-    "entries": {
-        str(key): {
-            "chunk_hash": str(item.get("chunk_hash") or "").strip(),
-            "etag": str(item.get("etag") or "").strip(),
-            **(
-                {"has_chunk_data": True}
-                if bool(item.get("has_chunk_data"))
-                else {}
-            ),
-        }
-        for key, item in entries.items()
-        if isinstance(item, dict) and str(item.get("chunk_hash") or "").strip()
-    },
-    "updated_at": payload.get("updated_at") or datetime.now(timezone.utc).isoformat(),
-}
-cache_path.write_text(json.dumps(normalized, indent=2) + "\n", encoding="utf-8")
-print(f"Saved metadata: {cache_path} entries={len(normalized['entries'])}")
+sources = payload.get("sources") or []
+print(f"Coverage sources={len(sources)} updated_at={payload.get('updated_at')}")
+for src in sources:
+    segs = src.get("segments") or []
+    print(
+        f"  digest={src.get('digest')} segments={len(segs)} "
+        f"covered_bytes={src.get('covered_bytes')} "
+        f"url={(src.get('source_url') or '')[:80]}"
+    )
 
 if skip_chunks:
     print("Skipping range downloads (--metadata-only)")
@@ -164,80 +149,63 @@ downloaded = 0
 skipped = 0
 missing = 0
 errors = 0
-hash_mismatch = 0
 
 print(f"Downloading ranges into {range_dir}")
 with httpx.Client(timeout=timeout) as client:
-    for key, item in normalized["entries"].items():
-        has_data = bool(entries.get(key, {}).get("has_chunk_data"))
-        if not has_data and not download_all:
-            missing += 1
+    for src in sources:
+        source_url = str(src.get("source_url") or "").strip()
+        if not source_url:
             continue
-
-        chunk_hash = str(item.get("chunk_hash") or "").strip()
-        parsed = parse_cache_key_range(key)
-        if parsed is not None:
-            source, start, end = parsed
-            if store.covers(source, start, end):
+        for seg in src.get("segments") or []:
+            try:
+                start = int(seg["start"])
+                end = int(seg["end"])
+            except (KeyError, TypeError, ValueError):
+                errors += 1
+                continue
+            if store.covers(source_url, start, end):
                 skipped += 1
                 continue
-        else:
-            source = start = end = None
-
-        url = f"{http_url}/cache/predefined-etag/entries/{quote(key, safe='')}/data"
-        try:
-            resp = client.get(url, headers=headers)
-            if resp.status_code == 404:
-                missing += 1
-                continue
-            resp.raise_for_status()
-            data = resp.content
-            if not data:
-                missing += 1
-                continue
-
-            if chunk_hash:
-                computed = hashlib.sha256(data).hexdigest()
-                if computed.lower() != chunk_hash.lower():
-                    hash_mismatch += 1
-                    print(
-                        f"  hash mismatch key={key[:72]} "
-                        f"expected={chunk_hash[:16]} got={computed[:16]}"
-                    )
+            url = f"{http_url}/cache/predefined-etag/ranges/data"
+            try:
+                resp = client.get(
+                    url,
+                    headers=headers,
+                    params={"source_url": source_url, "start": start, "end": end},
+                )
+                if resp.status_code == 404:
+                    missing += 1
                     continue
-
-            if parsed is not None:
+                resp.raise_for_status()
+                data = resp.content
                 expected = end - start + 1
-                if len(data) != expected:
+                if not data or len(data) != expected:
                     errors += 1
                     print(
-                        f"  size mismatch key={key[:72]} "
-                        f"got={len(data)} expected={expected}"
+                        f"  size mismatch src={source_url[:72]} "
+                        f"range={start}-{end} got={len(data)} expected={expected}"
                     )
                     continue
-                store.ingest(source, start, end, data, merge=True)
-            else:
-                # Non-range key: legacy file only
-                if not legacy_chunk_data:
-                    errors += 1
-                    print(f"  skip non-range key (use --legacy-chunk-data): {key[:72]}")
-                    continue
-
-            if legacy_chunk_data:
-                digest = hashlib.sha256(key.encode()).hexdigest()
-                out_path = chunk_dir / f"{digest}.bin"
-                if not out_path.is_file() or out_path.stat().st_size == 0:
-                    out_path.write_bytes(data)
-
-            downloaded += 1
-            print(f"  range key={key[:96]} bytes={len(data)}")
-        except Exception as exc:
-            errors += 1
-            print(f"  range fetch failed key={key[:72]} err={exc}")
+                store.ingest(source_url, start, end, data, merge=True)
+                if legacy_chunk_data:
+                    key = f"{source_url}|{start}|{end}"
+                    digest = hashlib.sha256(key.encode()).hexdigest()
+                    out_path = chunk_dir / f"{digest}.bin"
+                    if not out_path.is_file() or out_path.stat().st_size == 0:
+                        out_path.write_bytes(data)
+                downloaded += 1
+                print(
+                    f"  range src={source_url[:72]} {start}-{end} bytes={len(data)}"
+                )
+            except Exception as exc:
+                errors += 1
+                print(
+                    f"  range fetch failed src={source_url[:72]} "
+                    f"{start}-{end} err={exc}"
+                )
 
 print(
     f"Ranges: downloaded={downloaded} skipped_covered={skipped} "
-    f"missing_on_server={missing} hash_mismatch={hash_mismatch} "
-    f"errors={errors} dir={range_dir}"
+    f"missing_on_server={missing} errors={errors} dir={range_dir}"
 )
 PY

@@ -71,6 +71,7 @@ def _log_embedded_task_done(
     transfer_context: dict,
     chunk_hash: str = "",
     etag: str = "",
+    etag_local: str = "",
     cached: bool = False,
     fetch_ms: float = 0.0,
     send_ms: float = 0.0,
@@ -79,7 +80,8 @@ def _log_embedded_task_done(
     src, dest = transfer_context_urls(transfer_context)
     logger.info(
         "%s task_done task=%s offer=%s chunk_id=%s src=%s dest=%s "
-        "range=%s cache_key=%s hash=%s etag=%s cached=%s fetch_ms=%.1f send_ms=%.1f",
+        "range=%s cache_key=%s hash=%s etag_real=%s etag_local=%s "
+        "cached=%s fetch_ms=%.1f send_ms=%.1f",
         _WORKERS_LOG,
         short_id(task_id),
         short_id(offer_id),
@@ -90,6 +92,7 @@ def _log_embedded_task_done(
         transfer_context_cache_key(transfer_context),
         chunk_hash or "-",
         etag or "-",
+        etag_local or "-",
         str(cached).lower(),
         fetch_ms,
         send_ms,
@@ -996,18 +999,6 @@ class EmbeddedWorkerPool:
                 worker_id=worker.worker_id,
                 latency_ms=latency_ms,
             )
-            if (
-                success
-                and chunk_hash
-                and transfer_context is not None
-                and cached is not True
-            ):
-                transfer = get_transfer_module()
-                transfer.push_predefined_etag_cache_for_context(
-                    transfer_context,
-                    chunk_hash,
-                    etag,
-                )
         else:
             logger.warning(
                 "Embedded task result not completed: task=%s offer=%s worker=%s "
@@ -1063,7 +1054,6 @@ class EmbeddedWorkerPool:
             transfer_context,
             deadline_us,
             log_prefix="[Embedded]",
-            push_cache_to_control_server=False,
             offer_started_at=offer_started_at,
         )
 
@@ -1097,16 +1087,6 @@ class EmbeddedWorkerPool:
                 )
             return
 
-        _log_embedded_task_done(
-            task_id=str(task_id),
-            offer_id=str(offer_id),
-            transfer_context=transfer_context,
-            chunk_hash=outcome.chunk_hash,
-            etag=outcome.etag or "",
-            cached=outcome.used_cache,
-            fetch_ms=outcome.fetch_ms,
-            send_ms=outcome.send_ms,
-        )
         await self._send_result(
             worker,
             task_id,
@@ -1117,18 +1097,17 @@ class EmbeddedWorkerPool:
             transfer_context=transfer_context,
             cached=outcome.used_cache,
         )
-
-        if outcome.used_cache and not outcome.background_upload_started:
-            asyncio.create_task(
-                self._await_background_transfer_task(
-                    worker,
-                    offer,
-                    task_id,
-                    offer_id,
-                    transfer_context,
-                    deadline_us,
-                )
-            )
+        _log_embedded_task_done(
+            task_id=str(task_id),
+            offer_id=str(offer_id),
+            transfer_context=transfer_context,
+            chunk_hash=outcome.chunk_hash,
+            etag=outcome.etag or "",
+            etag_local=getattr(outcome, "etag_local", "") or "",
+            cached=outcome.used_cache,
+            fetch_ms=outcome.fetch_ms,
+            send_ms=outcome.send_ms,
+        )
 
     async def _await_background_transfer_task(
         self,

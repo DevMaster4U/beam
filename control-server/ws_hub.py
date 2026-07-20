@@ -1,4 +1,4 @@
-"""Connected miner WebSocket hub and cache broadcast."""
+"""Connected miner WebSocket hub and range-coverage broadcast."""
 
 from __future__ import annotations
 
@@ -9,9 +9,8 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from fastapi import WebSocket
-from starlette.websockets import WebSocketDisconnect
 
-from storage import load_predefined_etag_cache, upsert_predefined_etag_entry
+from storage import range_coverage_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +23,7 @@ class MinerConnection:
 
 
 class MinerConnectionHub:
-    """Track miner WS connections and broadcast cache updates."""
+    """Track miner WS connections and broadcast range_data coverage updates."""
 
     def __init__(self) -> None:
         self._connections: dict[str, MinerConnection] = {}
@@ -42,20 +41,20 @@ class MinerConnectionHub:
             with contextlib.suppress(Exception):
                 await old.websocket.close()
         self._connections[miner_id] = MinerConnection(miner_id=miner_id, websocket=websocket)
-        snapshot = load_predefined_etag_cache()
+        snapshot = await asyncio.to_thread(range_coverage_snapshot)
         await self._send(
             miner_id,
             {
-                "type": "cache_snapshot",
-                "entries": snapshot.get("entries") or {},
+                "type": "range_snapshot",
+                "sources": snapshot.get("sources") or [],
                 "updated_at": snapshot.get("updated_at"),
             },
         )
         await self._send(miner_id, {"type": "sync_done"})
         logger.info(
-            "Miner connected miner_id=%s entries=%d total_connections=%d sync_done=sent",
+            "Miner connected miner_id=%s sources=%d total_connections=%d sync_done=sent",
             miner_id,
-            len(snapshot.get("entries") or {}),
+            int(snapshot.get("source_count") or 0),
             self.connection_count,
         )
 
@@ -68,40 +67,86 @@ class MinerConnectionHub:
                 self.connection_count,
             )
 
-    async def handle_cache_update(self, miner_id: str, message: dict[str, Any]) -> None:
-        key = str(message.get("key") or "").strip()
-        chunk_hash = str(message.get("chunk_hash") or message.get("hash") or "").strip()
-        etag = str(message.get("etag") or "").strip()
-        if not key or not chunk_hash:
+    async def handle_range_update(self, miner_id: str, message: dict[str, Any]) -> None:
+        """Announce coverage after a miner uploaded bytes (hash/etag not synced)."""
+        source_url = str(message.get("source_url") or "").strip()
+        try:
+            start = int(message.get("start"))
+            end = int(message.get("end"))
+        except (TypeError, ValueError):
             await self._send(
                 miner_id,
-                {"type": "error", "detail": "cache_update requires key and chunk_hash"},
+                {"type": "error", "detail": "range_update requires source_url, start, end"},
             )
             return
-
-        entry = await asyncio.to_thread(
-            upsert_predefined_etag_entry, key, chunk_hash, etag
-        )
+        if not source_url or end < start:
+            await self._send(
+                miner_id,
+                {"type": "error", "detail": "invalid range_update"},
+            )
+            return
         broadcast = {
-            "type": "cache_broadcast",
-            "key": key,
-            "chunk_hash": entry["chunk_hash"],
-            "etag": entry["etag"],
+            "type": "range_broadcast",
+            "source_url": source_url,
+            "start": start,
+            "end": end,
             "source_miner": miner_id,
         }
-        if "chunk_index" in entry:
-            broadcast["chunk_index"] = entry["chunk_index"]
-        if "chunk_size" in entry:
-            broadcast["chunk_size"] = entry["chunk_size"]
-        if entry.get("has_chunk_data"):
-            broadcast["has_chunk_data"] = True
         await self.broadcast(broadcast, exclude_miner=miner_id)
-        await self._send(miner_id, {"type": "cache_update_ack", "key": key})
-        logger.info(
-            "Cache update from miner=%s key=%s broadcast_to=%d",
+        await self._send(
             miner_id,
-            key[:96],
+            {
+                "type": "range_update_ack",
+                "source_url": source_url,
+                "start": start,
+                "end": end,
+            },
+        )
+        logger.info(
+            "Range update from miner=%s src=%s range=%s-%s broadcast_to=%d",
+            miner_id,
+            source_url[:96],
+            start,
+            end,
             max(0, self.connection_count - 1),
+        )
+
+    async def handle_cache_update(self, miner_id: str, message: dict[str, Any]) -> None:
+        """Backward-compat: map legacy cache_update key to range_broadcast."""
+        key = str(message.get("key") or "").strip()
+        from neurons.common.byte_range_store import parse_cache_key_range
+
+        parsed = parse_cache_key_range(key)
+        if parsed is None:
+            await self._send(
+                miner_id,
+                {"type": "error", "detail": "cache_update key must be source|start|end"},
+            )
+            return
+        source_url, start, end = parsed
+        await self.handle_range_update(
+            miner_id,
+            {"source_url": source_url, "start": start, "end": end},
+        )
+
+    async def broadcast_range(
+        self,
+        *,
+        source_url: str,
+        start: int,
+        end: int,
+        source_miner: str = "http",
+        exclude_miner: Optional[str] = None,
+    ) -> None:
+        await self.broadcast(
+            {
+                "type": "range_broadcast",
+                "source_url": source_url,
+                "start": int(start),
+                "end": int(end),
+                "source_miner": source_miner,
+            },
+            exclude_miner=exclude_miner,
         )
 
     async def broadcast(

@@ -38,7 +38,13 @@ async def miner_websocket(websocket: WebSocket) -> None:
         while True:
             message = await websocket.receive_json()
             msg_type = str(message.get("type") or "")
-            if msg_type == "cache_update":
+            if msg_type == "range_update":
+                asyncio.create_task(
+                    miner_hub.handle_range_update(miner_id, message),
+                    name=f"range-update-{miner_id}",
+                )
+            elif msg_type == "cache_update":
+                # Legacy: source|start|end key → range_broadcast
                 asyncio.create_task(
                     miner_hub.handle_cache_update(miner_id, message),
                     name=f"cache-update-{miner_id}",

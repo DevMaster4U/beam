@@ -22,7 +22,7 @@ from routes.miners import router as miners_router
 from routes.miners_ws import router as miners_ws_router
 from routes.status import router as status_router
 from routes.wallets import router as wallets_router
-from storage import preload_predefined_etag_cache
+from storage import get_range_store, preload_predefined_etag_cache
 from ws_hub import miner_hub
 
 logger = logging.getLogger(__name__)
@@ -32,15 +32,18 @@ logger = logging.getLogger(__name__)
 async def lifespan(_app: FastAPI):
     settings = get_settings()
     configure_logging(settings.log_level)
-    cache_entries = preload_predefined_etag_cache()
+    # Optional legacy JSON preload (not used for WS sync).
+    preload_predefined_etag_cache()
+    range_sources = get_range_store().list_sources()
     logger.info(
-        "Control server ready on %s:%s data_dir=%s miners=%d wallets=%d cache_entries=%d ws=/ws/miners",
+        "Control server ready on %s:%s data_dir=%s miners=%d wallets=%d "
+        "range_sources=%d ws=/ws/miners (sync=segments.json)",
         settings.host,
         settings.port,
         settings.data_dir,
         len(list(settings.miners_dir.glob("*.env"))),
         len([p for p in settings.wallets_dir.iterdir() if p.is_dir()]),
-        cache_entries,
+        len(range_sources),
     )
     yield
     logger.info("Control server stopped")
