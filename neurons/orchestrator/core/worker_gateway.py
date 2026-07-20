@@ -235,13 +235,18 @@ class WorkerGateway:
         *,
         allow_used_ip: bool = True,
         exclude_worker_ids: Optional[set[str]] = None,
+        batch_assigned_counts: Optional[dict[str, int]] = None,
     ) -> Optional[str]:
         """Pick the next worker with capacity, matching global-gateway batch IP spread.
 
-        Within one ``task_offer_batch`` (when batch sets are provided):
+        Goal: finish the batch ASAP (makespan = last task done). Within one
+        ``task_offer_batch`` (when batch sets are provided):
           1. Prefer a fresh IP + worker not yet used in this batch
           2. Then any IP, worker not yet used in this batch
           3. Then reuse workers that still have ``active < max_concurrent_tasks``
+
+        Among eligible workers, prefer lower batch/in-flight load (more parallel
+        bandwidth), then higher observed Mbps (faster finish).
 
         When ``allow_used_ip`` is False, stop after step 1 (hybrid overflow).
         ``exclude_worker_ids`` skips workers already represented by the embedded pool.
@@ -254,6 +259,14 @@ class WorkerGateway:
         start = self._cursor % pool_size
         in_batch = batch_used_ips is not None or batch_assigned_workers is not None
         excluded = exclude_worker_ids or set()
+        counts = batch_assigned_counts
+
+        def _batch_count(worker_id: str) -> int:
+            if counts is not None:
+                return int(counts.get(worker_id, 0))
+            if batch_assigned_workers and worker_id in batch_assigned_workers:
+                return 1
+            return 0
 
         def _eligible(
             worker_id: str,
@@ -266,11 +279,7 @@ class WorkerGateway:
             profile = self._get_profile(worker_id)
             if not profile.has_capacity:
                 return False
-            if (
-                not allow_worker_reuse
-                and batch_assigned_workers
-                and worker_id in batch_assigned_workers
-            ):
+            if not allow_worker_reuse and _batch_count(worker_id) > 0:
                 return False
             ip = profile.ip.strip()
             if (
@@ -287,7 +296,8 @@ class WorkerGateway:
             allow_ip_reuse: bool,
             allow_worker_reuse: bool,
         ) -> Optional[str]:
-            candidates: list[tuple[int, int, str]] = []
+            # (batch_n, active, -mbps, offset, worker_id) — spread then speed
+            candidates: list[tuple[int, int, float, int, str]] = []
             for offset in range(pool_size):
                 idx = (start + offset) % pool_size
                 worker_id = connected[idx]
@@ -298,23 +308,31 @@ class WorkerGateway:
                 ):
                     continue
                 profile = self._get_profile(worker_id)
-                # When reusing, prefer workers with fewer in-flight tasks.
-                candidates.append((profile.active_count, offset, worker_id))
+                candidates.append(
+                    (
+                        _batch_count(worker_id),
+                        profile.active_count,
+                        -profile.average_mbps,
+                        offset,
+                        worker_id,
+                    )
+                )
             if not candidates:
                 return None
-            if allow_worker_reuse:
-                candidates.sort(key=lambda item: (item[0], item[1]))
-            _active, offset, worker_id = candidates[0]
+            candidates.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+            _bc, _active, _neg_mbps, offset, worker_id = candidates[0]
             idx = (start + offset) % pool_size
             self._cursor = (idx + 1) % pool_size
             profile = self._get_profile(worker_id)
             logger.debug(
                 "selected worker %s round_robin ip=%s active=%d/%d "
-                "cursor=%d pool=%d batch_ips=%s reuse_worker=%s",
+                "batch_n=%d mbps=%.1f cursor=%d pool=%d batch_ips=%s reuse_worker=%s",
                 worker_id,
                 profile.ip or "?",
                 profile.active_count,
                 profile.max_concurrent_tasks,
+                _batch_count(worker_id),
+                profile.average_mbps,
                 self._cursor,
                 pool_size,
                 ",".join(sorted(batch_used_ips)) if batch_used_ips else "-",
@@ -331,7 +349,6 @@ class WorkerGateway:
             worker_id = _pick(allow_ip_reuse=True, allow_worker_reuse=False)
             if worker_id:
                 return worker_id
-            # Fill remaining max_concurrent_tasks slots on already-used workers.
             return _pick(allow_ip_reuse=True, allow_worker_reuse=True)
 
         return _pick(allow_ip_reuse=True, allow_worker_reuse=True)
@@ -344,15 +361,18 @@ class WorkerGateway:
 
         batch_used_ips: set[str] = set()
         batch_assigned_workers: set[str] = set()
+        batch_assigned_counts: dict[str, int] = {}
         for _ in range(n):
             worker_id = self.select_worker_round_robin(
                 batch_used_ips=batch_used_ips,
                 batch_assigned_workers=batch_assigned_workers,
+                batch_assigned_counts=batch_assigned_counts,
             )
             if not worker_id:
                 break
             selected.append(worker_id)
             batch_assigned_workers.add(worker_id)
+            batch_assigned_counts[worker_id] = batch_assigned_counts.get(worker_id, 0) + 1
             ip = self._get_profile(worker_id).ip.strip()
             if ip:
                 batch_used_ips.add(ip)
@@ -364,6 +384,7 @@ class WorkerGateway:
         failed = 0
         batch_used_ips: set[str] = set()
         batch_assigned_workers: set[str] = set()
+        batch_assigned_counts: dict[str, int] = {}
 
         for offer in offers:
             if not isinstance(offer, dict):
@@ -373,6 +394,7 @@ class WorkerGateway:
             worker_id = self.select_worker_round_robin(
                 batch_used_ips=batch_used_ips,
                 batch_assigned_workers=batch_assigned_workers,
+                batch_assigned_counts=batch_assigned_counts,
             )
             if not worker_id:
                 logger.warning(
@@ -385,6 +407,9 @@ class WorkerGateway:
             if await self.deliver_task_offer(worker_id, offer):
                 delivered += 1
                 batch_assigned_workers.add(worker_id)
+                batch_assigned_counts[worker_id] = (
+                    batch_assigned_counts.get(worker_id, 0) + 1
+                )
                 ip = self._get_profile(worker_id).ip.strip()
                 if ip:
                     batch_used_ips.add(ip)

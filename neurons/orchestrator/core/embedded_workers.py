@@ -500,6 +500,12 @@ class EmbeddedWorkerPool:
         pool_size = len(workers_pool)
         start = self._cursor % pool_size
         in_batch = batch_used_ips is not None or batch_assigned_counts is not None
+        counts = batch_assigned_counts
+
+        def _batch_count(worker_id: str) -> int:
+            if counts is None:
+                return 0
+            return int(counts.get(worker_id, 0))
 
         def _eligible(
             worker: EmbeddedWorker,
@@ -509,8 +515,8 @@ class EmbeddedWorkerPool:
         ) -> bool:
             if not worker.has_capacity:
                 return False
-            if batch_assigned_counts is not None:
-                assigned = batch_assigned_counts.get(worker.worker_id, 0)
+            assigned = _batch_count(worker.worker_id)
+            if counts is not None:
                 slots_left = worker.max_concurrent_tasks - worker.active_count - assigned
                 if slots_left <= 0:
                     return False
@@ -531,6 +537,8 @@ class EmbeddedWorkerPool:
             allow_used_ip: bool,
             allow_reuse_worker: bool,
         ) -> Optional[EmbeddedWorker]:
+            # Spread load first (makespan), then RR offset.
+            candidates: list[tuple[int, int, int, EmbeddedWorker]] = []
             for offset in range(pool_size):
                 idx = (start + offset) % pool_size
                 worker = workers_pool[idx]
@@ -540,9 +548,20 @@ class EmbeddedWorkerPool:
                     allow_reuse_worker=allow_reuse_worker,
                 ):
                     continue
-                self._cursor = (idx + 1) % pool_size
-                return worker
-            return None
+                candidates.append(
+                    (
+                        _batch_count(worker.worker_id),
+                        worker.active_count,
+                        offset,
+                        worker,
+                    )
+                )
+            if not candidates:
+                return None
+            candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+            _bc, _active, offset, worker = candidates[0]
+            self._cursor = (start + offset + 1) % pool_size
+            return worker
 
         if in_batch:
             worker = _pick(allow_used_ip=False, allow_reuse_worker=False)
@@ -621,15 +640,18 @@ class EmbeddedWorkerPool:
         batch_id: str,
         batch_used_ips: set[str],
         batch_gateway_assigned: set[str],
+        batch_assigned_counts: dict[str, int],
         allow_used_ip: bool,
         transfer_context: Optional[dict] = None,
+        worker_id: Optional[str] = None,
     ) -> bool:
         gateway = self._worker_gateway
         if gateway is None:
             return False
-        external_id = gateway.select_worker_round_robin(
+        external_id = worker_id or gateway.select_worker_round_robin(
             batch_used_ips=batch_used_ips,
             batch_assigned_workers=batch_gateway_assigned,
+            batch_assigned_counts=batch_assigned_counts,
             allow_used_ip=allow_used_ip,
             exclude_worker_ids={w.worker_id for w in self.workers},
         )
@@ -637,6 +659,9 @@ class EmbeddedWorkerPool:
             return False
         if await gateway.deliver_task_offer(external_id, offer):
             batch_gateway_assigned.add(external_id)
+            batch_assigned_counts[external_id] = (
+                batch_assigned_counts.get(external_id, 0) + 1
+            )
             profile = gateway._get_profile(external_id)
             if profile.ip:
                 batch_used_ips.add(profile.ip)
@@ -696,8 +721,9 @@ class EmbeddedWorkerPool:
             else:
                 path = "standard"
 
-            # in_process hybrid: spread across IPs across batches (BeamCore often sends
-            # offers=1). Prefer fresh-IP embedded, then fresh-IP external, then reuse.
+            # in_process hybrid: maximize parallel bandwidth so last task finishes
+            # sooner. Prefer fresh-IP embedded, then fresh-IP external, then reuse
+            # the least-loaded / fastest eligible worker (embedded or external).
             worker: Optional[EmbeddedWorker] = None
             if has_external:
                 spread_ips = self._spread_used_ips(batch_used_ips)
@@ -712,28 +738,51 @@ class EmbeddedWorkerPool:
                         batch_id=batch_id,
                         batch_used_ips=spread_ips,
                         batch_gateway_assigned=batch_gateway_assigned,
+                        batch_assigned_counts=batch_assigned_counts,
                         allow_used_ip=False,
                         transfer_context=transfer_context,
                     ):
                         delivered += 1
                         continue
-                    # All connected IPs seen recently — reset and allow reuse.
+                    # IPs exhausted — reuse for makespan: lowest load, then highest Mbps.
                     self._clear_hybrid_spread_ips()
-                    spread_ips = batch_used_ips
-                    worker = self._select_worker(batch_used_ips, batch_assigned_counts)
-                if worker is None:
-                    if await self._dispatch_external(
-                        offer=offer,
-                        task_id=task_id,
-                        offer_id=offer_id,
-                        batch_id=batch_id,
-                        batch_used_ips=batch_used_ips,
-                        batch_gateway_assigned=batch_gateway_assigned,
-                        allow_used_ip=True,
-                        transfer_context=transfer_context,
-                    ):
-                        delivered += 1
-                        continue
+                    emb = self._select_worker(batch_used_ips, batch_assigned_counts)
+                    emb_n = (
+                        batch_assigned_counts.get(emb.worker_id, 0) if emb else 10**9
+                    )
+                    emb_mbps = 0.0
+                    gateway = self._worker_gateway
+                    ext_id = None
+                    ext_n = 10**9
+                    ext_mbps = 0.0
+                    if gateway is not None:
+                        ext_id = gateway.select_worker_round_robin(
+                            batch_used_ips=batch_used_ips,
+                            batch_assigned_workers=batch_gateway_assigned,
+                            batch_assigned_counts=batch_assigned_counts,
+                            allow_used_ip=True,
+                            exclude_worker_ids={w.worker_id for w in self.workers},
+                        )
+                        if ext_id:
+                            ext_n = batch_assigned_counts.get(ext_id, 0)
+                            ext_mbps = gateway._get_profile(ext_id).average_mbps
+                    # (load, -mbps): prefer less loaded, then faster — not "local first".
+                    if ext_id is not None and (ext_n, -ext_mbps) <= (emb_n, -emb_mbps):
+                        if await self._dispatch_external(
+                            offer=offer,
+                            task_id=task_id,
+                            offer_id=offer_id,
+                            batch_id=batch_id,
+                            batch_used_ips=batch_used_ips,
+                            batch_gateway_assigned=batch_gateway_assigned,
+                            batch_assigned_counts=batch_assigned_counts,
+                            allow_used_ip=True,
+                            transfer_context=transfer_context,
+                            worker_id=ext_id,
+                        ):
+                            delivered += 1
+                            continue
+                    worker = emb
             else:
                 worker = self._select_worker(batch_used_ips, batch_assigned_counts)
 

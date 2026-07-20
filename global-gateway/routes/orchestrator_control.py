@@ -34,6 +34,7 @@ async def handle_task_offer_batch(orchestrator_hotkey: str, message: dict) -> di
     offer_index = 0
     batch_used_ips: set[str] = set()
     batch_assigned_workers: set[str] = set()
+    batch_assigned_counts: dict[str, int] = {}
     worker_pool = str(message.get("worker_pool") or "").strip().lower()
     hidden_only = worker_pool == "hidden"
     for offer in offers:
@@ -55,6 +56,7 @@ async def handle_task_offer_batch(orchestrator_hotkey: str, message: dict) -> di
         worker_id = gateway_state.select_worker(
             batch_used_ips=batch_used_ips,
             batch_assigned_workers=batch_assigned_workers,
+            batch_assigned_counts=batch_assigned_counts,
             hidden_only=hidden_only,
         )
         if not worker_id:
@@ -77,6 +79,7 @@ async def handle_task_offer_batch(orchestrator_hotkey: str, message: dict) -> di
         if await gateway_state.send_to_worker(worker_id, payload):
             gateway_state.mark_worker_busy(worker_id, offer_id)
             batch_assigned_workers.add(worker_id)
+            batch_assigned_counts[worker_id] = batch_assigned_counts.get(worker_id, 0) + 1
             worker_ip = gateway_state.get_profile(worker_id).ip.strip()
             if worker_ip:
                 batch_used_ips.add(worker_ip)
