@@ -616,6 +616,7 @@ async def upload_buffered_predefined_etag(
     offer_id: str = None,
     source_url: str = "",
     log_prefix: str = "[Worker]",
+    quiet: bool = False,
 ) -> tuple[float, Optional[str]]:
     """PUT/POST a buffered predefined-etag chunk; returns (send_ms, etag from response)."""
     is_object_storage = is_object_storage_presigned_url(destination_url)
@@ -625,18 +626,19 @@ async def upload_buffered_predefined_etag(
         if expected_max_bytes and expected_max_bytes > 0
         else upload_offset + body_len - 1
     )
-    log_task_chunk(
-        "put_start",
-        fetch_url=source_url,
-        put_url=destination_url,
-        chunk_index=chunk_index,
-        byte_from=upload_offset,
-        byte_to=byte_to,
-        chunk_hash=chunk_hash,
-        task_id=task_id,
-        offer_id=offer_id,
-        log_prefix=log_prefix,
-    )
+    if not quiet:
+        log_task_chunk(
+            "put_start",
+            fetch_url=source_url,
+            put_url=destination_url,
+            chunk_index=chunk_index,
+            byte_from=upload_offset,
+            byte_to=byte_to,
+            chunk_hash=chunk_hash,
+            task_id=task_id,
+            offer_id=offer_id,
+            log_prefix=log_prefix,
+        )
     send_started = time.perf_counter()
     upload_content: Any = body
     if isinstance(body, (bytes, bytearray)) and PREDEFINED_ETAG_MAX_SPEED_MBPS > 0:
@@ -680,19 +682,20 @@ async def upload_buffered_predefined_etag(
     response.raise_for_status()
     send_ms = (time.perf_counter() - send_started) * 1000
     etag = response.headers.get("ETag") or response.headers.get("etag")
-    log_task_chunk(
-        "put_done",
-        fetch_url=source_url,
-        put_url=destination_url,
-        chunk_index=chunk_index,
-        byte_from=upload_offset,
-        byte_to=byte_to,
-        chunk_hash=chunk_hash,
-        task_id=task_id,
-        offer_id=offer_id,
-        log_prefix=log_prefix,
-        detail=f"etag={etag!r} send_ms={send_ms:.1f}",
-    )
+    if not quiet:
+        log_task_chunk(
+            "put_done",
+            fetch_url=source_url,
+            put_url=destination_url,
+            chunk_index=chunk_index,
+            byte_from=upload_offset,
+            byte_to=byte_to,
+            chunk_hash=chunk_hash,
+            task_id=task_id,
+            offer_id=offer_id,
+            log_prefix=log_prefix,
+            detail=f"etag={etag!r} send_ms={send_ms:.1f}",
+        )
     return send_ms, etag
 
 
@@ -763,19 +766,22 @@ async def upload_predefined_etag_from_local_cache(
     task_id: str = None,
     offer_id: str = None,
     log_prefix: str = "[Worker]",
+    data: Optional[bytes] = None,
+    etag_local: Optional[str] = None,
 ) -> tuple[bool, float, Optional[str], Optional[str], Optional[str]]:
     """Upload cached range bytes to dest. Returns (ok, send_ms, etag_real, etag_local, error)."""
-    if not has_predefined_etag_chunk_data(transfer_context):
+    if not has_predefined_etag_chunk_data(transfer_context) and not data:
         return False, 0.0, None, None, "cache_file_missing"
 
-    data = await asyncio.to_thread(read_predefined_etag_range_bytes, transfer_context)
+    if data is None:
+        data = await asyncio.to_thread(read_predefined_etag_range_bytes, transfer_context)
     if not data:
         return False, 0.0, None, None, "cache_file_empty"
 
     computed = hashlib.sha256(data).hexdigest()
-    etag_local = _etag_quoted_md5(data)
+    resolved_etag_local = etag_local or _etag_quoted_md5(data)
     if chunk_hash and computed.lower() != chunk_hash.lower():
-        return False, 0.0, None, etag_local, "cache_file_hash_mismatch"
+        return False, 0.0, None, resolved_etag_local, "cache_file_hash_mismatch"
 
     chunk_size = int(transfer_context["chunk_size"])
     range_start = int(transfer_context["range_start"])
@@ -786,7 +792,7 @@ async def upload_predefined_etag_from_local_cache(
         send_ms, etag_real = await upload_buffered_predefined_etag(
             client,
             destination_url=transfer_context["dest_url"],
-            body=_iter_predefined_etag_range_chunks(transfer_context),
+            body=data,
             chunk_hash=computed,
             transfer_id=str(transfer_context.get("transfer_id") or task_id or ""),
             chunk_index=0,
@@ -798,10 +804,11 @@ async def upload_predefined_etag_from_local_cache(
             offer_id=offer_id,
             source_url=source_url,
             log_prefix=log_prefix,
+            quiet=True,
         )
-        return True, send_ms, etag_real, etag_local, None
+        return True, send_ms, etag_real, resolved_etag_local, None
     except Exception as exc:
-        return False, 0.0, None, etag_local, exception_detail(exc)
+        return False, 0.0, None, resolved_etag_local, exception_detail(exc)
 
 
 async def ensure_predefined_etag_chunk_data_local(
@@ -2357,6 +2364,8 @@ class PredefinedETagSubmitOutcome:
     error: Optional[str] = None
     used_cache: bool = False
     hash_source: str = "computed"
+    load_ms: float = 0.0
+    hash_ms: float = 0.0
     fetch_ms: float = 0.0
     send_ms: float = 0.0
 
@@ -2371,16 +2380,28 @@ def _log_task_done(
     etag_real: str = "",
     etag_local: str = "",
     cached: bool = False,
+    load_ms: float = 0.0,
+    hash_ms: float = 0.0,
     fetch_ms: float = 0.0,
     send_ms: float = 0.0,
 ) -> None:
+    bytes_count = 0
+    try:
+        bytes_count = (
+            int(transfer_context["range_end"]) - int(transfer_context["range_start"]) + 1
+        )
+    except (KeyError, TypeError, ValueError):
+        bytes_count = int(transfer_context.get("chunk_size") or 0)
+    total_ms = load_ms + hash_ms + fetch_ms + send_ms
+    mbps = transfer_mbps(bytes_count, total_ms)
     print(
         f"{log_prefix} task_done task={task_label(task_id)} offer={task_label(offer_id)} "
         f"range={transfer_context.get('range_start')}-{transfer_context.get('range_end')} "
-        f"cache_key={predefined_etag_cache_key(transfer_context)[:96]} "
+        f"bytes={bytes_count} cached={str(cached).lower()} "
         f"hash={chunk_hash or '-'} etag_real={etag_real or '-'} "
-        f"etag_local={etag_local or '-'} cached={str(cached).lower()} "
-        f"fetch_ms={fetch_ms:.1f} send_ms={send_ms:.1f}"
+        f"etag_local={etag_local or '-'} "
+        f"load_ms={load_ms:.1f} hash_ms={hash_ms:.1f} fetch_ms={fetch_ms:.1f} "
+        f"send_ms={send_ms:.1f} total_ms={total_ms:.1f} mbps={mbps:.1f}"
     )
 
 
@@ -2424,51 +2445,27 @@ async def run_predefined_etag_cached_background_upload(
     task_id: str = None,
     offer_id: str = None,
     log_prefix: str = "[Worker]",
+    data: Optional[bytes] = None,
+    etag_local: Optional[str] = None,
 ) -> tuple[bool, float, Optional[str], Optional[str], Optional[str]]:
     """Upload local range bytes to dest. Returns (ok, send_ms, etag_real, etag_local, error)."""
-    log_task_chunk_from_context(
-        "upload_start",
-        transfer_context,
-        task_id=task_id,
-        offer_id=offer_id,
-        chunk_hash=chunk_hash,
-        log_prefix=log_prefix,
-    )
-    if not has_predefined_etag_chunk_data(transfer_context):
+    if not data and not has_predefined_etag_chunk_data(transfer_context):
         return False, 0.0, None, None, "cache_file_missing"
 
     client = state.http_client
-    if client is not None:
-        result = await upload_predefined_etag_from_local_cache(
-            client,
-            transfer_context,
-            chunk_hash,
-            task_id=task_id,
-            offer_id=offer_id,
-            log_prefix=log_prefix,
-        )
-    else:
-        async with httpx.AsyncClient(timeout=SEND_TIMEOUT) as tmp_client:
-            result = await upload_predefined_etag_from_local_cache(
-                tmp_client,
-                transfer_context,
-                chunk_hash,
-                task_id=task_id,
-                offer_id=offer_id,
-                log_prefix=log_prefix,
-            )
-
-    ok, send_ms, etag_real, etag_local, err = result
-    log_task_chunk_from_context(
-        "upload_done" if ok else "upload_failed",
-        transfer_context,
+    kwargs = dict(
+        transfer_context=transfer_context,
+        chunk_hash=chunk_hash,
         task_id=task_id,
         offer_id=offer_id,
-        chunk_hash=chunk_hash,
         log_prefix=log_prefix,
-        detail=err or f"etag_real={etag_real!r} send_ms={send_ms:.1f}",
+        data=data,
+        etag_local=etag_local,
     )
-    return result
+    if client is not None:
+        return await upload_predefined_etag_from_local_cache(client, **kwargs)
+    async with httpx.AsyncClient(timeout=SEND_TIMEOUT) as tmp_client:
+        return await upload_predefined_etag_from_local_cache(tmp_client, **kwargs)
 
 
 async def predefined_etag_submit_flow(
@@ -2488,23 +2485,20 @@ async def predefined_etag_submit_flow(
     started_at = offer_started_at if offer_started_at is not None else time.perf_counter()
 
     if has_predefined_etag_chunk_data(transfer_context):
+        load_started = time.perf_counter()
         data = await asyncio.to_thread(read_predefined_etag_range_bytes, transfer_context)
+        load_ms = (time.perf_counter() - load_started) * 1000
         if not data:
             return PredefinedETagSubmitOutcome(
                 success=False,
                 error="range_data_read_failed",
+                load_ms=load_ms,
             )
+
+        hash_started = time.perf_counter()
         chunk_hash = _sha256_hex(data)
         etag_local = _etag_quoted_md5(data)
-        log_task_chunk_from_context(
-            "range_hit",
-            transfer_context,
-            task_id=task_id,
-            offer_id=offer_id,
-            chunk_hash=chunk_hash,
-            log_prefix=log_prefix,
-            detail=f"etag_local={etag_local!r}",
-        )
+        hash_ms = (time.perf_counter() - hash_started) * 1000
 
         ok, send_ms, etag_real, _, err = await run_predefined_etag_cached_background_upload(
             state,
@@ -2513,6 +2507,8 @@ async def predefined_etag_submit_flow(
             task_id=task_id,
             offer_id=offer_id,
             log_prefix=log_prefix,
+            data=data,
+            etag_local=etag_local,
         )
         if not ok:
             return PredefinedETagSubmitOutcome(
@@ -2521,6 +2517,8 @@ async def predefined_etag_submit_flow(
                 etag_local=etag_local,
                 used_cache=True,
                 error=err or "cache_upload_failed",
+                load_ms=load_ms,
+                hash_ms=hash_ms,
                 send_ms=send_ms,
             )
 
@@ -2532,18 +2530,12 @@ async def predefined_etag_submit_flow(
             etag_local=etag_local,
             used_cache=True,
             hash_source="range_data",
+            load_ms=load_ms,
+            hash_ms=hash_ms,
             fetch_ms=0.0,
             send_ms=send_ms,
         )
 
-    log_task_chunk_from_context(
-        "range_miss",
-        transfer_context,
-        task_id=task_id,
-        offer_id=offer_id,
-        log_prefix=log_prefix,
-        detail="fetching from source",
-    )
     result = await execute_task_with_metrics(
         state,
         task_id,
@@ -3485,8 +3477,11 @@ async def ws_send_task_result(
     error: str = None,
     offer_id: str = None,
     transfer_mbps: float = 0.0,
+    load_ms: float = 0.0,
+    hash_ms: float = 0.0,
     fetch_ms: float = 0.0,
     send_ms: float = 0.0,
+    cached: Optional[bool] = None,
 ) -> bool:
     """Send task completion receipt over WebSocket."""
     try:
@@ -3500,6 +3495,10 @@ async def ws_send_task_result(
         }
         if transfer_mbps > 0:
             msg["transfer_mbps"] = round(transfer_mbps, 1)
+        if load_ms > 0:
+            msg["load_ms"] = round(float(load_ms), 1)
+        if hash_ms > 0:
+            msg["hash_ms"] = round(float(hash_ms), 1)
         if fetch_ms > 0:
             msg["fetch_ms"] = round(float(fetch_ms), 1)
         if send_ms > 0:
@@ -3508,6 +3507,8 @@ async def ws_send_task_result(
             msg["chunk_hash"] = chunk_hash
         if etag:
             msg["etag"] = etag
+        if cached is not None:
+            msg["cached"] = bool(cached)
         if error:
             msg["error"] = error
         await ws_send_json(websocket, state, msg)
@@ -3528,8 +3529,12 @@ async def finalize_ws_task_result(
     error: str = None,
     offer_id: str = None,
     transfer_mbps: float = 0.0,
+    load_ms: float = 0.0,
+    hash_ms: float = 0.0,
     fetch_ms: float = 0.0,
     send_ms: float = 0.0,
+    cached: Optional[bool] = None,
+    quiet: bool = False,
 ) -> TaskSummaryAck:
     """Send task_result until BeamCore assumes or rejects relay ownership."""
     result_key = offer_id or task_id
@@ -3540,11 +3545,12 @@ async def finalize_ws_task_result(
         state.pending_task_results[result_key] = ack_future
 
         try:
-            print(
-                f"[Worker] [WS] Sending task_result: task={task_label(task_id)} "
-                f"offer={task_label(offer_id)} success={success} "
-                f"bytes={bytes_transferred} mbps={round(transfer_mbps, 1)}"
-            )
+            if not quiet:
+                print(
+                    f"[Worker] [WS] Sending task_result: task={task_label(task_id)} "
+                    f"offer={task_label(offer_id)} success={success} "
+                    f"bytes={bytes_transferred} mbps={round(transfer_mbps, 1)}"
+                )
             sent = await ws_send_task_result(
                 websocket,
                 state,
@@ -3556,8 +3562,11 @@ async def finalize_ws_task_result(
                 error=error,
                 offer_id=offer_id,
                 transfer_mbps=transfer_mbps,
+                load_ms=load_ms,
+                hash_ms=hash_ms,
                 fetch_ms=fetch_ms,
                 send_ms=send_ms,
+                cached=cached,
             )
             if not sent:
                 if attempt < WS_TASK_RESULT_SEND_ATTEMPTS - 1:
@@ -3567,11 +3576,12 @@ async def finalize_ws_task_result(
             try:
                 ack = await asyncio.wait_for(ack_future, timeout=WS_TASK_RESULT_ACK_TIMEOUT)
                 if ack.status in TASK_RESULT_TERMINAL_STATUSES:
-                    print(
-                        f"[Worker] [WS] Task result settled by BeamCore: "
-                        f"task={task_label(task_id)} offer={task_label(offer_id)} "
-                        f"status={ack.status or 'unknown'}"
-                    )
+                    if not quiet:
+                        print(
+                            f"[Worker] [WS] Task result settled by BeamCore: "
+                            f"task={task_label(task_id)} offer={task_label(offer_id)} "
+                            f"status={ack.status or 'unknown'}"
+                        )
                     return ack
                 print(
                     f"[Worker] [WS] Task result relay not terminal: "
@@ -3642,7 +3652,15 @@ async def _finalize_ws_task(
     task_id: str,
     offer_id: str,
     result: TaskExecutionResult,
+    *,
+    load_ms: float = 0.0,
+    hash_ms: float = 0.0,
+    cached: Optional[bool] = None,
+    quiet: bool = False,
 ) -> bool:
+    duration_ms = result.duration_ms
+    if duration_ms <= 0:
+        duration_ms = load_ms + hash_ms + result.fetch_ms + result.send_ms
     await finalize_ws_task_result(
         websocket,
         state,
@@ -3653,16 +3671,21 @@ async def _finalize_ws_task(
         etag=result.etag,
         error=result.error_msg,
         offer_id=offer_id,
-        transfer_mbps=transfer_mbps(result.bytes_transferred, result.duration_ms),
+        transfer_mbps=transfer_mbps(result.bytes_transferred, duration_ms),
+        load_ms=load_ms,
+        hash_ms=hash_ms,
         fetch_ms=result.fetch_ms,
         send_ms=result.send_ms,
+        cached=cached,
+        quiet=quiet,
     )
 
-    status = "OK" if result.success else f"FAIL: {result.error_msg}"
-    print(
-        f"[Worker] [WS] Task {task_label(task_id)} offer={task_label(offer_id)}: {status} | "
-        f"{result.bytes_transferred} bytes"
-    )
+    if not quiet:
+        status = "OK" if result.success else f"FAIL: {result.error_msg}"
+        print(
+            f"[Worker] [WS] Task {task_label(task_id)} offer={task_label(offer_id)}: {status} | "
+            f"{result.bytes_transferred} bytes"
+        )
     return result.success
 
 
@@ -3694,13 +3717,6 @@ async def _handle_ws_task_predefined_etag_early_result(
     deadline_us: int,
 ) -> bool:
     """Predefined ETag: range hit → upload then task_result; miss → fetch+upload+sync then task_result."""
-    has_range = has_predefined_etag_chunk_data(transfer_context)
-    print(
-        f"[Worker] [WS] Predefined ETag "
-        f"{'range hit' if has_range else 'range miss'}: "
-        f"task={task_label(task_id)} offer={task_label(offer_id)}"
-    )
-
     outcome = await predefined_etag_submit_flow(
         state,
         task_id,
@@ -3726,19 +3742,40 @@ async def _handle_ws_task_predefined_etag_early_result(
                 fetch_ms=outcome.fetch_ms,
                 send_ms=outcome.send_ms,
             )
-            return await _finalize_ws_task(websocket, state, task_id, offer_id, result)
+            return await _finalize_ws_task(
+                websocket,
+                state,
+                task_id,
+                offer_id,
+                result,
+                load_ms=outcome.load_ms,
+                hash_ms=outcome.hash_ms,
+                cached=outcome.used_cache,
+            )
         return False
 
     result = TaskExecutionResult(
         success=True,
         bytes_transferred=int(transfer_context.get("chunk_size") or 0),
-        duration_ms=0.0,
+        duration_ms=(
+            outcome.load_ms + outcome.hash_ms + outcome.fetch_ms + outcome.send_ms
+        ),
         chunk_hash=outcome.chunk_hash,
         etag=outcome.etag,
         fetch_ms=outcome.fetch_ms,
         send_ms=outcome.send_ms,
     )
-    finalized = await _finalize_ws_task(websocket, state, task_id, offer_id, result)
+    finalized = await _finalize_ws_task(
+        websocket,
+        state,
+        task_id,
+        offer_id,
+        result,
+        load_ms=outcome.load_ms,
+        hash_ms=outcome.hash_ms,
+        cached=outcome.used_cache,
+        quiet=True,
+    )
     _log_task_done(
         "[Worker] [WS]",
         task_id,
@@ -3748,6 +3785,8 @@ async def _handle_ws_task_predefined_etag_early_result(
         etag_real=outcome.etag or "",
         etag_local=outcome.etag_local or "",
         cached=outcome.used_cache,
+        load_ms=outcome.load_ms,
+        hash_ms=outcome.hash_ms,
         fetch_ms=outcome.fetch_ms,
         send_ms=outcome.send_ms,
     )

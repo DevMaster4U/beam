@@ -25,7 +25,6 @@ from core.config import OrchestratorSettings
 from core.relay_log import (
     chunk_id_from_transfer_context,
     short_id,
-    transfer_context_cache_key,
     transfer_context_range_label,
     transfer_context_urls,
 )
@@ -54,7 +53,6 @@ def _log_embedded_task_offer(
         f"worker_slot={worker_slot}",
         f"chunk_id={chunk_id if chunk_id is not None else '?'}",
         f"range={transfer_context_range_label(transfer_context)}",
-        f"cache_key={transfer_context_cache_key(transfer_context)}",
         f"src={src}",
         f"dest={dest}",
         f"path={path}",
@@ -73,15 +71,18 @@ def _log_embedded_task_done(
     etag: str = "",
     etag_local: str = "",
     cached: bool = False,
+    load_ms: float = 0.0,
+    hash_ms: float = 0.0,
     fetch_ms: float = 0.0,
     send_ms: float = 0.0,
 ) -> None:
     chunk_id = chunk_id_from_transfer_context(transfer_context)
     src, dest = transfer_context_urls(transfer_context)
+    total_ms = load_ms + hash_ms + fetch_ms + send_ms
     logger.info(
         "%s task_done task=%s offer=%s chunk_id=%s src=%s dest=%s "
-        "range=%s cache_key=%s hash=%s etag_real=%s etag_local=%s "
-        "cached=%s fetch_ms=%.1f send_ms=%.1f",
+        "range=%s hash=%s etag_real=%s etag_local=%s "
+        "cached=%s load_ms=%.1f hash_ms=%.1f fetch_ms=%.1f send_ms=%.1f total_ms=%.1f",
         _WORKERS_LOG,
         short_id(task_id),
         short_id(offer_id),
@@ -89,13 +90,15 @@ def _log_embedded_task_done(
         src,
         dest,
         transfer_context_range_label(transfer_context),
-        transfer_context_cache_key(transfer_context),
         chunk_hash or "-",
         etag or "-",
         etag_local or "-",
         str(cached).lower(),
+        load_ms,
+        hash_ms,
         fetch_ms,
         send_ms,
+        total_ms,
     )
 
 
@@ -130,7 +133,7 @@ def _log_embedded_task_failed(
     cached_label = "?" if cached is None else str(cached).lower()
     logger.warning(
         "%s failed task=%s offer=%s reason=%s src=%s dest=%s "
-        "range=%s cache_key=%s hash=%s etag=%s cached=%s",
+        "range=%s hash=%s etag=%s cached=%s",
         _WORKERS_LOG,
         short_id(task_id),
         short_id(offer_id),
@@ -138,7 +141,6 @@ def _log_embedded_task_failed(
         src,
         dest,
         transfer_context_range_label(transfer_context),
-        transfer_context_cache_key(transfer_context),
         chunk_hash or "-",
         etag or "-",
         cached_label,
@@ -683,21 +685,15 @@ class EmbeddedWorkerPool:
                 if transfer_context
                 else "-"
             )
-            cache_key = (
-                transfer_context_cache_key(transfer_context)
-                if transfer_context
-                else "-"
-            )
             logger.info(
                 "%s external_dispatch task=%s offer=%s worker=%s ip=%s "
-                "range=%s cache_key=%s src=%s dest=%s",
+                "range=%s src=%s dest=%s",
                 _WORKERS_LOG,
                 short_id(task_id),
                 short_id(offer_id),
                 short_id(external_id),
                 profile.ip or "?",
                 range_label,
-                cache_key,
                 src or "-",
                 dest or "-",
             )
@@ -1105,6 +1101,8 @@ class EmbeddedWorkerPool:
             etag=outcome.etag or "",
             etag_local=getattr(outcome, "etag_local", "") or "",
             cached=outcome.used_cache,
+            load_ms=getattr(outcome, "load_ms", 0.0) or 0.0,
+            hash_ms=getattr(outcome, "hash_ms", 0.0) or 0.0,
             fetch_ms=outcome.fetch_ms,
             send_ms=outcome.send_ms,
         )

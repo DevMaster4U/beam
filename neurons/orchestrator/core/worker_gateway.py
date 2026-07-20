@@ -18,7 +18,6 @@ from core.relay_log import (
     chunk_id_from_transfer_context,
     log_relay,
     short_id,
-    transfer_context_cache_key,
     transfer_context_range_label,
     transfer_context_urls,
 )
@@ -259,11 +258,19 @@ class WorkerGateway:
         chunk_hash = str(msg.get("chunk_hash") or "") or "-"
         etag = str(msg.get("etag") or "") or "-"
         success = bool(msg.get("success"))
+        cached = msg.get("cached")
         src, dest = transfer_context_urls(ctx) if ctx else ("-", "-")
         range_label = transfer_context_range_label(ctx) if ctx else "-"
-        cache_key = transfer_context_cache_key(ctx) if ctx else "-"
         chunk_id = chunk_id_from_transfer_context(ctx) if ctx else None
         if success:
+            try:
+                load_ms = float(msg.get("load_ms") or 0.0)
+            except (TypeError, ValueError):
+                load_ms = 0.0
+            try:
+                hash_ms = float(msg.get("hash_ms") or 0.0)
+            except (TypeError, ValueError):
+                hash_ms = 0.0
             try:
                 fetch_ms = float(msg.get("fetch_ms") or 0.0)
             except (TypeError, ValueError):
@@ -272,10 +279,15 @@ class WorkerGateway:
                 send_ms = float(msg.get("send_ms") or 0.0)
             except (TypeError, ValueError):
                 send_ms = 0.0
+            total_ms = load_ms + hash_ms + fetch_ms + send_ms
+            cached_label = (
+                str(bool(cached)).lower() if cached is not None else "?"
+            )
             logger.info(
                 "_workers | task_done task=%s offer=%s chunk_id=%s worker=%s "
-                "src=%s dest=%s range=%s cache_key=%s hash=%s etag=%s "
-                "cached=false path=external fetch_ms=%.1f send_ms=%.1f",
+                "src=%s dest=%s range=%s hash=%s etag_real=%s "
+                "cached=%s path=external load_ms=%.1f hash_ms=%.1f fetch_ms=%.1f "
+                "send_ms=%.1f total_ms=%.1f",
                 short_id(task_id),
                 short_id(offer_id),
                 chunk_id if chunk_id is not None else "?",
@@ -283,16 +295,19 @@ class WorkerGateway:
                 src,
                 dest,
                 range_label,
-                cache_key,
                 chunk_hash,
                 etag,
+                cached_label,
+                load_ms,
+                hash_ms,
                 fetch_ms,
                 send_ms,
+                total_ms,
             )
         else:
             logger.warning(
                 "_workers | failed task=%s offer=%s worker=%s reason=%s "
-                "src=%s dest=%s range=%s cache_key=%s hash=%s etag=%s",
+                "src=%s dest=%s range=%s hash=%s etag=%s",
                 short_id(task_id),
                 short_id(offer_id),
                 short_id(worker_id),
@@ -300,7 +315,6 @@ class WorkerGateway:
                 src,
                 dest,
                 range_label,
-                cache_key,
                 chunk_hash,
                 etag,
             )
