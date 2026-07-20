@@ -206,7 +206,10 @@ def upload_predefined_etag_range_data(
     config: Optional[ControlServerConfig] = None,
 ) -> bool:
     """Upload a byte range into the control-server continuous range store."""
+    from neurons.common.byte_range_store import normalize_source_url
+
     cfg = config or get_control_server_config()
+    source_url = normalize_source_url(source_url)
     if not cfg.http_url or not cfg.secret or not source_url or not data:
         return False
     if end < start or len(data) != (end - start + 1):

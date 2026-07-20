@@ -1576,18 +1576,37 @@ def _predefined_etag_range_data_dir() -> Path:
 
 
 _worker_range_store = None
+_worker_range_store_consolidated = False
 
 
 def get_worker_range_store():
     """Lazy worker-local continuous byte-range store."""
-    global _worker_range_store
+    global _worker_range_store, _worker_range_store_consolidated
     if _worker_range_store is None:
         from neurons.common.byte_range_store import ByteRangeStore
 
         root = _predefined_etag_range_data_dir()
         root.mkdir(parents=True, exist_ok=True)
         _worker_range_store = ByteRangeStore(root)
+    if not _worker_range_store_consolidated:
+        _worker_range_store_consolidated = True
+        try:
+            result = _worker_range_store.consolidate_signed_url_orphans()
+            if result.get("merged_dirs") or result.get("ingested_segments"):
+                print(
+                    f"[Worker] Range store orphan merge: "
+                    f"merged_dirs={result.get('merged_dirs')} "
+                    f"ingested_segments={result.get('ingested_segments')} "
+                    f"removed={result.get('removed_dirs')}"
+                )
+        except Exception as exc:
+            print(f"[Worker] Range store orphan merge failed: {exc}")
     return _worker_range_store
+
+
+def setup_worker_range_store() -> None:
+    """Initialize local range_data and merge signed-URL orphan directories."""
+    get_worker_range_store()
 
 
 def predefined_etag_chunk_data_path_for_key(cache_key: str) -> Path:
@@ -1740,13 +1759,18 @@ async def _deferred_predefined_etag_cache_sync(
     delay_sec: float,
 ) -> None:
     """Background: wait, upload range bytes to control-server (coverage via segments.json)."""
+    from neurons.common.byte_range_store import normalize_source_url
+
     key = predefined_etag_cache_key(transfer_context)
-    source_url = str(transfer_context.get("source_url") or "")
+    source_url = normalize_source_url(str(transfer_context.get("source_url") or ""))
     try:
         start = int(transfer_context["range_start"])
         end = int(transfer_context["range_end"])
     except (KeyError, TypeError, ValueError):
         print(f"[Worker] Deferred cache sync skipped (bad range) key={key[:96]}")
+        return
+    if not source_url:
+        print(f"[Worker] Deferred cache sync skipped (empty source) key={key[:96]}")
         return
     if delay_sec > 0:
         await asyncio.sleep(delay_sec)
@@ -1850,6 +1874,9 @@ def schedule_predefined_etag_range_download(
     force: bool = False,
 ) -> None:
     """Background-fetch range bytes from control-server when local coverage is missing."""
+    from neurons.common.byte_range_store import normalize_source_url
+
+    source_url = normalize_source_url(source_url)
     if not force and not WORKER_PREDEFINED_ETAG_AUTO_DOWNLOAD_CHUNKS:
         return
     if not source_url or end < start:
@@ -1966,11 +1993,15 @@ def apply_range_coverage_snapshot(sources: list[dict]) -> None:
 
 async def sync_range_to_control_server(transfer_context: dict) -> bool:
     """Upload local range bytes to control-server and announce coverage."""
-    source_url = str(transfer_context.get("source_url") or "")
+    from neurons.common.byte_range_store import normalize_source_url
+
+    source_url = normalize_source_url(str(transfer_context.get("source_url") or ""))
     try:
         start = int(transfer_context["range_start"])
         end = int(transfer_context["range_end"])
     except (KeyError, TypeError, ValueError):
+        return False
+    if not source_url:
         return False
     data = await asyncio.to_thread(read_predefined_etag_range_bytes, transfer_context)
     if not data:
@@ -2010,6 +2041,7 @@ def bootstrap_missing_predefined_etag_chunk_files() -> int:
 
 
 def setup_control_server_cache_sync() -> None:
+    setup_worker_range_store()
     from neurons.common import control_ws_client
 
     control_ws_client.register_range_snapshot_handler(apply_range_coverage_snapshot)
@@ -2393,7 +2425,8 @@ def _log_task_done(
     except (KeyError, TypeError, ValueError):
         bytes_count = int(transfer_context.get("chunk_size") or 0)
     total_ms = load_ms + hash_ms + fetch_ms + send_ms
-    mbps = transfer_mbps(bytes_count, total_ms)
+    # Upload rate uses send_ms only (dest PUT). wall_ms is end-to-end.
+    mbps = transfer_mbps(bytes_count, send_ms if send_ms > 0 else total_ms)
     print(
         f"{log_prefix} task_done task={task_label(task_id)} offer={task_label(offer_id)} "
         f"range={transfer_context.get('range_start')}-{transfer_context.get('range_end')} "
@@ -2401,7 +2434,7 @@ def _log_task_done(
         f"hash={chunk_hash or '-'} etag_real={etag_real or '-'} "
         f"etag_local={etag_local or '-'} "
         f"load_ms={load_ms:.1f} hash_ms={hash_ms:.1f} fetch_ms={fetch_ms:.1f} "
-        f"send_ms={send_ms:.1f} total_ms={total_ms:.1f} mbps={mbps:.1f}"
+        f"send_ms={send_ms:.1f} wall_ms={total_ms:.1f} mbps={mbps:.1f}"
     )
 
 
@@ -3661,6 +3694,8 @@ async def _finalize_ws_task(
     duration_ms = result.duration_ms
     if duration_ms <= 0:
         duration_ms = load_ms + hash_ms + result.fetch_ms + result.send_ms
+    # Report upload Mbps from send_ms (dest PUT), not wall-clock.
+    mbps_duration = result.send_ms if result.send_ms > 0 else duration_ms
     await finalize_ws_task_result(
         websocket,
         state,
@@ -3671,7 +3706,7 @@ async def _finalize_ws_task(
         etag=result.etag,
         error=result.error_msg,
         offer_id=offer_id,
-        transfer_mbps=transfer_mbps(result.bytes_transferred, duration_ms),
+        transfer_mbps=transfer_mbps(result.bytes_transferred, mbps_duration),
         load_ms=load_ms,
         hash_ms=hash_ms,
         fetch_ms=result.fetch_ms,

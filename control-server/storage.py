@@ -131,7 +131,11 @@ def store_predefined_etag_range_data(
     source_url: str, start: int, end: int, data: bytes
 ) -> dict[str, Any]:
     """Ingest bytes into the continuous range store (merge + ≤1 GiB pack)."""
-    segment = get_range_store().ingest(source_url, start, end, data)
+    from neurons.common.byte_range_store import normalize_source_url
+
+    segment = get_range_store().ingest(
+        normalize_source_url(source_url), start, end, data
+    )
     return segment.to_dict()
 
 

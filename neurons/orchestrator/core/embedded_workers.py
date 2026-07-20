@@ -82,7 +82,7 @@ def _log_embedded_task_done(
     logger.info(
         "%s task_done task=%s offer=%s chunk_id=%s src=%s dest=%s "
         "range=%s hash=%s etag_real=%s etag_local=%s "
-        "cached=%s load_ms=%.1f hash_ms=%.1f fetch_ms=%.1f send_ms=%.1f total_ms=%.1f",
+        "cached=%s load_ms=%.1f hash_ms=%.1f fetch_ms=%.1f send_ms=%.1f wall_ms=%.1f",
         _WORKERS_LOG,
         short_id(task_id),
         short_id(offer_id),

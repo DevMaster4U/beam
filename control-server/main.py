@@ -34,7 +34,16 @@ async def lifespan(_app: FastAPI):
     configure_logging(settings.log_level)
     # Optional legacy JSON preload (not used for WS sync).
     preload_predefined_etag_cache()
-    range_sources = get_range_store().list_sources()
+    store = get_range_store()
+    consolidate = store.consolidate_signed_url_orphans()
+    if consolidate.get("merged_dirs") or consolidate.get("ingested_segments"):
+        logger.info(
+            "Range store orphan merge: merged_dirs=%s ingested_segments=%s removed=%s",
+            consolidate.get("merged_dirs"),
+            consolidate.get("ingested_segments"),
+            consolidate.get("removed_dirs"),
+        )
+    range_sources = store.list_sources()
     logger.info(
         "Control server ready on %s:%s data_dir=%s miners=%d wallets=%d "
         "range_sources=%d ws=/ws/miners (sync=segments.json)",

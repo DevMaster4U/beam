@@ -29,6 +29,7 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 
 COPY_CHUNK = 1024 * 1024
@@ -57,6 +58,23 @@ class Segment:
 
     def to_dict(self) -> dict[str, Any]:
         return {"start": self.start, "end": self.end, "file": self.file}
+
+
+def normalize_source_url(source_url: str) -> str:
+    """Canonical object URL for range_data digests: scheme/host/path only (no query/fragment).
+
+    Presigned R2/S3 URLs change signature query params every request; hashing the
+    full URL would create a new directory per task. Strip those so the same object
+    always maps to one store root.
+    """
+    raw = str(source_url or "").strip()
+    if not raw:
+        return ""
+    parts = urlsplit(raw)
+    if not parts.scheme or not parts.netloc:
+        # Already path-like / non-URL — keep as-is minus trailing slash.
+        return raw.rstrip("/")
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", "")).rstrip("/")
 
 
 def merge_intervals(ranges: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -100,7 +118,7 @@ def shard_bounds(
 
 
 def source_digest(source_url: str) -> str:
-    return hashlib.sha256(str(source_url).encode("utf-8")).hexdigest()[:32]
+    return hashlib.sha256(normalize_source_url(source_url).encode("utf-8")).hexdigest()[:32]
 
 
 def _segment_filename(start: int, end: int) -> str:
@@ -163,6 +181,7 @@ class ByteRangeStore:
         return sorted(segments, key=lambda s: s.start)
 
     def _save_segments(self, source_url: str, segments: list[Segment]) -> None:
+        source_url = normalize_source_url(source_url)
         directory = self.source_dir(source_url)
         directory.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -176,13 +195,15 @@ class ByteRangeStore:
         os.replace(tmp, path)
 
     def list_segments(self, source_url: str) -> list[Segment]:
+        source_url = normalize_source_url(source_url)
         digest = source_digest(source_url)
         with self._source_lock(digest):
             return self._load_segments(source_url)
 
     def list_sources(self) -> list[str]:
-        """Return source_url values discovered from segments.json under root."""
+        """Return canonical source_url values discovered from segments.json under root."""
         sources: list[str] = []
+        seen: set[str] = set()
         if not self.root.is_dir():
             return sources
         for child in sorted(self.root.iterdir()):
@@ -195,9 +216,14 @@ class ByteRangeStore:
                 data = json.loads(index.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
-            src = str(data.get("source_url") or "").strip()
-            if src:
-                sources.append(src)
+            src = normalize_source_url(str(data.get("source_url") or "").strip())
+            if not src or src in seen:
+                continue
+            # Prefer directories whose name matches the canonical digest.
+            if child.name != source_digest(src):
+                continue
+            seen.add(src)
+            sources.append(src)
         return sources
 
     def covers(self, source_url: str, start: int, end: int) -> bool:
@@ -632,6 +658,83 @@ class ByteRangeStore:
                 "merged_groups": merged_groups,
                 "segments": [s.to_dict() for s in new_segments],
             }
+
+    def consolidate_signed_url_orphans(self) -> dict[str, Any]:
+        """Merge directories created from presigned URLs into the canonical digest dir.
+
+        Older code hashed the full signed URL (query params included), so each
+        task could create a new directory for the same object. After
+        ``normalize_source_url``, those orphans are merged then deleted.
+        """
+        if not self.root.is_dir():
+            return {"merged_dirs": 0, "ingested_segments": 0, "removed_dirs": []}
+
+        merged_dirs = 0
+        ingested = 0
+        removed: list[str] = []
+
+        for child in sorted(self.root.iterdir()):
+            if not child.is_dir():
+                continue
+            index = child / "segments.json"
+            if not index.is_file():
+                continue
+            try:
+                data = json.loads(index.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            raw_src = str(data.get("source_url") or "").strip()
+            canonical = normalize_source_url(raw_src)
+            if not canonical:
+                continue
+            canonical_digest = source_digest(canonical)
+            if child.name == canonical_digest:
+                # Rewrite index if it still stores a signed URL.
+                if raw_src != canonical:
+                    segs = self._load_segments(canonical)
+                    self._save_segments(canonical, segs)
+                continue
+
+            items = data.get("segments") if isinstance(data, dict) else []
+            if not isinstance(items, list):
+                items = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    start = int(item["start"])
+                    end = int(item["end"])
+                    file_name = str(item.get("file") or _segment_filename(start, end))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                src_path = child / file_name
+                if not src_path.is_file():
+                    continue
+                if self.covers(canonical, start, end):
+                    continue
+                self.ingest_from_file(canonical, start, end, src_path, merge=True)
+                ingested += 1
+
+            # Remove orphan directory after successful merge.
+            for leftover in child.iterdir():
+                try:
+                    leftover.unlink()
+                except IsADirectoryError:
+                    continue
+                except OSError:
+                    continue
+            try:
+                child.rmdir()
+                removed.append(child.name)
+                merged_dirs += 1
+            except OSError:
+                pass
+
+        return {
+            "merged_dirs": merged_dirs,
+            "ingested_segments": ingested,
+            "removed_dirs": removed,
+        }
 
     def merge_all(self) -> list[dict[str, Any]]:
         """Run merge_source for every source under this store root."""
