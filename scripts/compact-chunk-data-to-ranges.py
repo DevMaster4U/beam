@@ -113,8 +113,7 @@ def main() -> int:
 
     store = ByteRangeStore(range_dir)
     ingested = 0
-    # Ingest largest-first within each source so later overlaps overwrite with
-    # newer? Actually last-write-wins per ingest order — sort by start then size.
+    # Store-only during bulk import (merge=False), then pack once per source.
     for source, items in by_source.items():
         items_sorted = sorted(items, key=lambda x: (x[0], -(x[1] - x[0])))
         for start, end, key, path in items_sorted:
@@ -125,12 +124,19 @@ def main() -> int:
                     f"WARN size mismatch key={key[:80]} expected={expected} actual={actual}; skipping"
                 )
                 continue
-            store.ingest_from_file(source, start, end, path)
+            store.ingest_from_file(source, start, end, path, merge=False)
             ingested += 1
             if ingested % 50 == 0:
                 print(f"  ingested {ingested}...")
 
     print(f"ingested={ingested}")
+    print("packing merged ≤1 GiB segments...")
+    for result in store.merge_all():
+        print(
+            f"  {result['source_url'].split('/')[-1]}: "
+            f"{result['before']} → {result['after']} "
+            f"(groups={result['merged_groups']})"
+        )
 
     # Verify random samples against legacy files.
     samples = []

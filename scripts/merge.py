@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
-"""Manually merge adjacent/overlapping range_data segments.
+"""Merge / re-pack range_data segments into continuous ≤1 GiB files.
 
-Reads each source's segments.json, merges touching groups into continuous
-.bin files, updates segments.json, and deletes obsolete segment files.
-
-Does NOT run automatically on task ingest — run this yourself when you want
-to compact disk.
+Task ingest already merges+packs automatically. Use this script to compact
+existing stores that were written before auto-merge, or to re-pack oversized
+segment files.
 
 Usage:
-  # Dry-run: show what would merge (control-server cache)
+  # Dry-run: show what would change (control-server cache)
   python3 scripts/merge.py
 
-  # Apply merges
+  # Apply merges / 1 GiB packing
   python3 scripts/merge.py --apply
 
   # Worker local mirror
@@ -31,7 +29,11 @@ _REPO = Path(__file__).resolve().parents[1]
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from neurons.common.byte_range_store import ByteRangeStore, source_digest
+from neurons.common.byte_range_store import (
+    ByteRangeStore,
+    MAX_SEGMENT_BYTES,
+    source_digest,
+)
 
 
 def _default_root() -> Path:
@@ -71,6 +73,7 @@ def main() -> int:
         return 0
 
     print(f"root={root}")
+    print(f"max_segment_bytes={MAX_SEGMENT_BYTES} ({MAX_SEGMENT_BYTES / (1 << 30):.2f} GiB)")
     print(f"sources={len(sources)} apply={args.apply}")
 
     for source_url in sources:
@@ -78,8 +81,10 @@ def main() -> int:
         segs = store.list_segments(source_url)
         print(f"\n{digest}  {source_url.split('/')[-1]}")
         print(f"  segments_before={len(segs)}")
+        oversized = sum(1 for s in segs if s.size > store.max_segment_bytes)
+        if oversized:
+            print(f"  oversized_segments={oversized}")
 
-        # Preview merge groups without writing when dry-run.
         if not args.apply:
             groups = 0
             if segs:
@@ -96,7 +101,10 @@ def main() -> int:
                         cur_hi = seg.end
                 if group_size > 1:
                     groups += 1
-            print(f"  mergeable_groups={groups} (dry-run; pass --apply to compact)")
+            print(
+                f"  mergeable_groups={groups} oversized={oversized} "
+                f"(dry-run; pass --apply to compact/pack)"
+            )
             continue
 
         result = store.merge_source(source_url)

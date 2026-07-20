@@ -1609,7 +1609,7 @@ def has_predefined_etag_chunk_data(transfer_context: dict) -> bool:
 
 
 def save_predefined_etag_chunk_data(transfer_context: dict, data: bytes) -> Optional[Path]:
-    """Persist fetched chunk bytes into the continuous range store."""
+    """Persist fetched chunk bytes into the continuous range store (merge + ≤1 GiB)."""
     if not data or not predefined_etag_transfer_eligible(transfer_context):
         return None
     source, start, end = _transfer_byte_range(transfer_context)

@@ -129,7 +129,7 @@ def predefined_etag_chunk_data_path(key: str) -> Path:
 def store_predefined_etag_range_data(
     source_url: str, start: int, end: int, data: bytes
 ) -> dict[str, Any]:
-    """Ingest bytes into the continuous range store."""
+    """Ingest bytes into the continuous range store (merge + ≤1 GiB pack)."""
     segment = get_range_store().ingest(source_url, start, end, data)
     return segment.to_dict()
 

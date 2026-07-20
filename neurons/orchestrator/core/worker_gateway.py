@@ -238,8 +238,12 @@ class WorkerGateway:
     ) -> Optional[str]:
         """Pick the next worker with capacity, matching global-gateway batch IP spread.
 
-        When ``allow_used_ip`` is False, never pick a worker whose IP is already in
-        ``batch_used_ips`` (used by in_process hybrid overflow).
+        Within one ``task_offer_batch`` (when batch sets are provided):
+          1. Prefer a fresh IP + worker not yet used in this batch
+          2. Then any IP, worker not yet used in this batch
+          3. Then reuse workers that still have ``active < max_concurrent_tasks``
+
+        When ``allow_used_ip`` is False, stop after step 1 (hybrid overflow).
         ``exclude_worker_ids`` skips workers already represented by the embedded pool.
         """
         connected = self._ordered_connected_worker_ids()
@@ -251,13 +255,22 @@ class WorkerGateway:
         in_batch = batch_used_ips is not None or batch_assigned_workers is not None
         excluded = exclude_worker_ids or set()
 
-        def _eligible(worker_id: str, *, allow_ip_reuse: bool) -> bool:
+        def _eligible(
+            worker_id: str,
+            *,
+            allow_ip_reuse: bool,
+            allow_worker_reuse: bool,
+        ) -> bool:
             if worker_id in excluded:
                 return False
             profile = self._get_profile(worker_id)
             if not profile.has_capacity:
                 return False
-            if batch_assigned_workers and worker_id in batch_assigned_workers:
+            if (
+                not allow_worker_reuse
+                and batch_assigned_workers
+                and worker_id in batch_assigned_workers
+            ):
                 return False
             ip = profile.ip.strip()
             if (
@@ -269,37 +282,59 @@ class WorkerGateway:
                 return False
             return True
 
-        def _pick(allow_ip_reuse: bool) -> Optional[str]:
+        def _pick(
+            *,
+            allow_ip_reuse: bool,
+            allow_worker_reuse: bool,
+        ) -> Optional[str]:
+            candidates: list[tuple[int, int, str]] = []
             for offset in range(pool_size):
                 idx = (start + offset) % pool_size
                 worker_id = connected[idx]
-                if not _eligible(worker_id, allow_ip_reuse=allow_ip_reuse):
-                    continue
-                self._cursor = (idx + 1) % pool_size
-                profile = self._get_profile(worker_id)
-                logger.debug(
-                    "selected worker %s round_robin ip=%s active=%d/%d "
-                    "cursor=%d pool=%d batch_ips=%s",
+                if not _eligible(
                     worker_id,
-                    profile.ip or "?",
-                    profile.active_count,
-                    profile.max_concurrent_tasks,
-                    self._cursor,
-                    pool_size,
-                    ",".join(sorted(batch_used_ips)) if batch_used_ips else "-",
-                )
-                return worker_id
-            return None
+                    allow_ip_reuse=allow_ip_reuse,
+                    allow_worker_reuse=allow_worker_reuse,
+                ):
+                    continue
+                profile = self._get_profile(worker_id)
+                # When reusing, prefer workers with fewer in-flight tasks.
+                candidates.append((profile.active_count, offset, worker_id))
+            if not candidates:
+                return None
+            if allow_worker_reuse:
+                candidates.sort(key=lambda item: (item[0], item[1]))
+            _active, offset, worker_id = candidates[0]
+            idx = (start + offset) % pool_size
+            self._cursor = (idx + 1) % pool_size
+            profile = self._get_profile(worker_id)
+            logger.debug(
+                "selected worker %s round_robin ip=%s active=%d/%d "
+                "cursor=%d pool=%d batch_ips=%s reuse_worker=%s",
+                worker_id,
+                profile.ip or "?",
+                profile.active_count,
+                profile.max_concurrent_tasks,
+                self._cursor,
+                pool_size,
+                ",".join(sorted(batch_used_ips)) if batch_used_ips else "-",
+                allow_worker_reuse,
+            )
+            return worker_id
 
         if in_batch:
-            worker_id = _pick(allow_ip_reuse=False)
+            worker_id = _pick(allow_ip_reuse=False, allow_worker_reuse=False)
             if worker_id:
                 return worker_id
-            if allow_used_ip:
-                return _pick(allow_ip_reuse=True)
-            return None
+            if not allow_used_ip:
+                return None
+            worker_id = _pick(allow_ip_reuse=True, allow_worker_reuse=False)
+            if worker_id:
+                return worker_id
+            # Fill remaining max_concurrent_tasks slots on already-used workers.
+            return _pick(allow_ip_reuse=True, allow_worker_reuse=True)
 
-        return _pick(allow_ip_reuse=True)
+        return _pick(allow_ip_reuse=True, allow_worker_reuse=True)
 
     def get_workers_round_robin(self, n: int = 1) -> list[str]:
         """Return up to n worker_ids with batch-aware round-robin (IP + capacity)."""

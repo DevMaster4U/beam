@@ -342,10 +342,12 @@ class GlobalGatewayState:
     ) -> Optional[str]:
         """Pick the next worker with capacity in round-robin order.
 
-        When ``batch_used_ips`` / ``batch_assigned_workers`` are provided (same
-        task_offer_batch), prefer workers on IPs not already used in that batch,
-        then assign the next round-robin worker not yet used in the batch.
-        Across separate batches omit both sets for pure round-robin.
+        Within one ``task_offer_batch`` (when batch sets are provided):
+          1. Prefer a fresh IP + worker not yet used in this batch
+          2. Then any IP, worker not yet used in this batch
+          3. Then reuse workers that still have ``active < max_concurrent_tasks``
+
+        Across separate batches omit both sets for pure round-robin by capacity.
         """
         connected = self.ordered_worker_ids(self.list_worker_ids())
         if hidden_only:
@@ -359,13 +361,22 @@ class GlobalGatewayState:
         start = self.worker_cursor % pool_size
         in_batch = batch_used_ips is not None or batch_assigned_workers is not None
 
-        def _eligible(worker_id: str, *, allow_used_ip: bool) -> bool:
+        def _eligible(
+            worker_id: str,
+            *,
+            allow_used_ip: bool,
+            allow_worker_reuse: bool,
+        ) -> bool:
             profile = self.get_profile(worker_id)
             if hidden_only and not profile.hidden:
                 return False
             if not profile.has_capacity:
                 return False
-            if batch_assigned_workers and worker_id in batch_assigned_workers:
+            if (
+                not allow_worker_reuse
+                and batch_assigned_workers
+                and worker_id in batch_assigned_workers
+            ):
                 return False
             ip = profile.ip.strip()
             if (
@@ -377,35 +388,55 @@ class GlobalGatewayState:
                 return False
             return True
 
-        def _pick(allow_used_ip: bool) -> Optional[str]:
+        def _pick(
+            *,
+            allow_used_ip: bool,
+            allow_worker_reuse: bool,
+        ) -> Optional[str]:
+            candidates: list[tuple[int, int, str]] = []
             for offset in range(pool_size):
                 idx = (start + offset) % pool_size
                 worker_id = connected[idx]
-                if not _eligible(worker_id, allow_used_ip=allow_used_ip):
-                    continue
-                self.worker_cursor = (idx + 1) % pool_size
-                profile = self.get_profile(worker_id)
-                logger.debug(
-                    "selected worker %s round_robin ip=%s active=%d/%d "
-                    "cursor=%d pool=%d batch_ips=%s",
+                if not _eligible(
                     worker_id,
-                    profile.ip or "?",
-                    profile.active_count,
-                    profile.max_concurrent_tasks,
-                    self.worker_cursor,
-                    pool_size,
-                    ",".join(sorted(batch_used_ips)) if batch_used_ips else "-",
-                )
-                return worker_id
-            return None
+                    allow_used_ip=allow_used_ip,
+                    allow_worker_reuse=allow_worker_reuse,
+                ):
+                    continue
+                profile = self.get_profile(worker_id)
+                candidates.append((profile.active_count, offset, worker_id))
+            if not candidates:
+                return None
+            if allow_worker_reuse:
+                candidates.sort(key=lambda item: (item[0], item[1]))
+            _active, offset, worker_id = candidates[0]
+            idx = (start + offset) % pool_size
+            self.worker_cursor = (idx + 1) % pool_size
+            profile = self.get_profile(worker_id)
+            logger.debug(
+                "selected worker %s round_robin ip=%s active=%d/%d "
+                "cursor=%d pool=%d batch_ips=%s reuse_worker=%s",
+                worker_id,
+                profile.ip or "?",
+                profile.active_count,
+                profile.max_concurrent_tasks,
+                self.worker_cursor,
+                pool_size,
+                ",".join(sorted(batch_used_ips)) if batch_used_ips else "-",
+                allow_worker_reuse,
+            )
+            return worker_id
 
         if in_batch:
-            worker_id = _pick(allow_used_ip=False)
+            worker_id = _pick(allow_used_ip=False, allow_worker_reuse=False)
             if worker_id:
                 return worker_id
-            return _pick(allow_used_ip=True)
+            worker_id = _pick(allow_used_ip=True, allow_worker_reuse=False)
+            if worker_id:
+                return worker_id
+            return _pick(allow_used_ip=True, allow_worker_reuse=True)
 
-        return _pick(allow_used_ip=True)
+        return _pick(allow_used_ip=True, allow_worker_reuse=True)
 
     def get_workers_round_robin(self, n: int = 1) -> list[str]:
         """Select up to n workers in round-robin order for one batch."""
