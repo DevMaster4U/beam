@@ -45,28 +45,16 @@ def _log_embedded_task_offer(
     path: str,
     beamcore_worker_id: str = "",
 ) -> None:
+    # hash/etag are only known after upload — logged on task_done, not here.
     chunk_id = chunk_id_from_transfer_context(transfer_context)
     src, dest = transfer_context_urls(transfer_context)
-    cache_key = transfer_context_cache_key(transfer_context)
-    chunk_hash = "-"
-    etag = "-"
-    try:
-        transfer = get_transfer_module()
-        known = transfer.get_predefined_etag_cache(transfer_context)
-        if known is not None:
-            chunk_hash = known.chunk_hash or "-"
-            etag = known.etag or "-"
-    except Exception:
-        pass
     fields = [
         f"{_WORKERS_LOG} task_offer task={short_id(task_id)}",
         f"offer={short_id(offer_id)}",
         f"worker_slot={worker_slot}",
         f"chunk_id={chunk_id if chunk_id is not None else '?'}",
         f"range={transfer_context_range_label(transfer_context)}",
-        f"cache_key={cache_key}",
-        f"hash={chunk_hash}",
-        f"etag={etag}",
+        f"cache_key={transfer_context_cache_key(transfer_context)}",
         f"src={src}",
         f"dest={dest}",
         f"path={path}",
@@ -687,13 +675,26 @@ class EmbeddedWorkerPool:
             src, dest = ("", "")
             if transfer_context:
                 src, dest = transfer_context_urls(transfer_context)
+            range_label = (
+                transfer_context_range_label(transfer_context)
+                if transfer_context
+                else "-"
+            )
+            cache_key = (
+                transfer_context_cache_key(transfer_context)
+                if transfer_context
+                else "-"
+            )
             logger.info(
-                "%s external_dispatch task=%s offer=%s worker=%s ip=%s src=%s dest=%s",
+                "%s external_dispatch task=%s offer=%s worker=%s ip=%s "
+                "range=%s cache_key=%s src=%s dest=%s",
                 _WORKERS_LOG,
                 short_id(task_id),
                 short_id(offer_id),
                 short_id(external_id),
                 profile.ip or "?",
+                range_label,
+                cache_key,
                 src or "-",
                 dest or "-",
             )
@@ -1230,6 +1231,17 @@ class EmbeddedWorkerPool:
                 cached=False,
                 fetch_ms=result.fetch_ms,
                 put_ms=result.send_ms,
+            )
+        else:
+            self._log_task_failed(
+                transfer,
+                transfer_context,
+                task_id=str(task_id),
+                offer_id=str(offer_id),
+                reason=str(result.error_msg or "standard_transfer_failed"),
+                chunk_hash=result.chunk_hash,
+                etag=result.etag or "",
+                cached=False,
             )
         await self._send_result(
             worker,

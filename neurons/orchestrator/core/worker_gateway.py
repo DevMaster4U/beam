@@ -14,7 +14,14 @@ import logging
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Dict, Optional, Set
 
-from core.relay_log import log_relay, short_id
+from core.relay_log import (
+    chunk_id_from_transfer_context,
+    log_relay,
+    short_id,
+    transfer_context_cache_key,
+    transfer_context_range_label,
+    transfer_context_urls,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +103,8 @@ class WorkerGateway:
         self._result_forward_tasks: Dict[str, asyncio.Task] = {}
         self._terminal_result_acks: Dict[str, dict] = {}
         self._terminal_result_order = deque()
+        # offer_id → transfer_context-like dict for completion logs
+        self._offer_contexts: Dict[str, dict] = {}
 
     def set_upstream(self, upstream: object) -> None:
         self._upstream = upstream
@@ -205,6 +214,87 @@ class WorkerGateway:
         await asyncio.gather(*tasks, return_exceptions=True)
         self._result_forward_tasks.clear()
 
+    def _remember_offer_context(self, offer: dict) -> None:
+        offer_id = str(offer.get("offer_id") or offer.get("task_id") or "").strip()
+        if not offer_id:
+            return
+        ctx: dict = {}
+        source_url = offer.get("source_url")
+        dest_url = offer.get("dest_url")
+        if isinstance(source_url, str) and source_url.strip():
+            ctx["source_url"] = source_url
+        if isinstance(dest_url, str) and dest_url.strip():
+            ctx["dest_url"] = dest_url
+        range_start = offer.get("range_start")
+        range_end = offer.get("range_end")
+        if range_start is None or range_end is None:
+            headers = offer.get("source_headers") or {}
+            if isinstance(headers, dict):
+                range_hdr = str(headers.get("Range") or headers.get("range") or "")
+                # bytes=START-END
+                if range_hdr.lower().startswith("bytes="):
+                    try:
+                        start_s, end_s = range_hdr.split("=", 1)[1].split("-", 1)
+                        range_start = int(start_s)
+                        range_end = int(end_s)
+                    except (TypeError, ValueError):
+                        pass
+        try:
+            if range_start is not None and range_end is not None:
+                ctx["range_start"] = int(range_start)
+                ctx["range_end"] = int(range_end)
+        except (TypeError, ValueError):
+            pass
+        if ctx:
+            self._offer_contexts[offer_id] = ctx
+            # Bound memory for long-running orch
+            while len(self._offer_contexts) > 5000:
+                self._offer_contexts.pop(next(iter(self._offer_contexts)), None)
+
+    def _log_external_task_result(self, worker_id: str, msg: dict) -> None:
+        """Log hash/etag for external worker completions (after upload)."""
+        task_id = msg.get("task_id")
+        offer_id = str(msg.get("offer_id") or task_id or "")
+        ctx = self._offer_contexts.pop(offer_id, {}) if offer_id else {}
+        chunk_hash = str(msg.get("chunk_hash") or "") or "-"
+        etag = str(msg.get("etag") or "") or "-"
+        success = bool(msg.get("success"))
+        src, dest = transfer_context_urls(ctx) if ctx else ("-", "-")
+        range_label = transfer_context_range_label(ctx) if ctx else "-"
+        cache_key = transfer_context_cache_key(ctx) if ctx else "-"
+        chunk_id = chunk_id_from_transfer_context(ctx) if ctx else None
+        if success:
+            logger.info(
+                "_workers | task_done task=%s offer=%s chunk_id=%s worker=%s "
+                "src=%s dest=%s range=%s cache_key=%s hash=%s etag=%s "
+                "cached=false path=external",
+                short_id(task_id),
+                short_id(offer_id),
+                chunk_id if chunk_id is not None else "?",
+                short_id(worker_id),
+                src,
+                dest,
+                range_label,
+                cache_key,
+                chunk_hash,
+                etag,
+            )
+        else:
+            logger.warning(
+                "_workers | failed task=%s offer=%s worker=%s reason=%s "
+                "src=%s dest=%s range=%s cache_key=%s hash=%s etag=%s",
+                short_id(task_id),
+                short_id(offer_id),
+                short_id(worker_id),
+                msg.get("error") or "external_task_failed",
+                src,
+                dest,
+                range_label,
+                cache_key,
+                chunk_hash,
+                etag,
+            )
+
     async def deliver_task_offer(
         self,
         worker_id: str,
@@ -218,6 +308,7 @@ class WorkerGateway:
             return False
         try:
             await ws.send_text(json.dumps({"type": "task_offer", **offer}))
+            self._remember_offer_context(offer)
             if mark_busy:
                 offer_id = offer.get("offer_id") or offer.get("task_id")
                 if offer_id:
@@ -480,6 +571,7 @@ class WorkerGateway:
                 f"task={short_id(msg.get('task_id'))} offer={short_id(msg.get('offer_id') or msg.get('task_id'))} "
                 f"success={msg.get('success')} bytes={msg.get('bytes_transferred')}"
             )
+            self._log_external_task_result(worker_id, msg)
             await self._relay_task_result(worker_id, msg)
             transfer_mbps = msg.get("transfer_mbps")
             if transfer_mbps is not None:
