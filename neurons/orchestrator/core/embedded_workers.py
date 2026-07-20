@@ -73,13 +73,13 @@ def _log_embedded_task_done(
     etag: str = "",
     cached: bool = False,
     fetch_ms: float = 0.0,
-    put_ms: float = 0.0,
+    send_ms: float = 0.0,
 ) -> None:
     chunk_id = chunk_id_from_transfer_context(transfer_context)
     src, dest = transfer_context_urls(transfer_context)
     logger.info(
         "%s task_done task=%s offer=%s chunk_id=%s src=%s dest=%s "
-        "range=%s cache_key=%s hash=%s etag=%s cached=%s fetch_ms=%.1f put_ms=%.1f",
+        "range=%s cache_key=%s hash=%s etag=%s cached=%s fetch_ms=%.1f send_ms=%.1f",
         _WORKERS_LOG,
         short_id(task_id),
         short_id(offer_id),
@@ -92,7 +92,7 @@ def _log_embedded_task_done(
         etag or "-",
         str(cached).lower(),
         fetch_ms,
-        put_ms,
+        send_ms,
     )
 
 
@@ -1105,7 +1105,7 @@ class EmbeddedWorkerPool:
             etag=outcome.etag or "",
             cached=outcome.used_cache,
             fetch_ms=outcome.fetch_ms,
-            put_ms=outcome.send_ms,
+            send_ms=outcome.send_ms,
         )
         await self._send_result(
             worker,
@@ -1230,7 +1230,7 @@ class EmbeddedWorkerPool:
                 etag=result.etag or "",
                 cached=False,
                 fetch_ms=result.fetch_ms,
-                put_ms=result.send_ms,
+                send_ms=result.send_ms,
             )
         else:
             self._log_task_failed(

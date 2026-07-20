@@ -264,10 +264,18 @@ class WorkerGateway:
         cache_key = transfer_context_cache_key(ctx) if ctx else "-"
         chunk_id = chunk_id_from_transfer_context(ctx) if ctx else None
         if success:
+            try:
+                fetch_ms = float(msg.get("fetch_ms") or 0.0)
+            except (TypeError, ValueError):
+                fetch_ms = 0.0
+            try:
+                send_ms = float(msg.get("send_ms") or 0.0)
+            except (TypeError, ValueError):
+                send_ms = 0.0
             logger.info(
                 "_workers | task_done task=%s offer=%s chunk_id=%s worker=%s "
                 "src=%s dest=%s range=%s cache_key=%s hash=%s etag=%s "
-                "cached=false path=external",
+                "cached=false path=external fetch_ms=%.1f send_ms=%.1f",
                 short_id(task_id),
                 short_id(offer_id),
                 chunk_id if chunk_id is not None else "?",
@@ -278,6 +286,8 @@ class WorkerGateway:
                 cache_key,
                 chunk_hash,
                 etag,
+                fetch_ms,
+                send_ms,
             )
         else:
             logger.warning(

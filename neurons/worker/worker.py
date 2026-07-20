@@ -3522,6 +3522,8 @@ async def ws_send_task_result(
     error: str = None,
     offer_id: str = None,
     transfer_mbps: float = 0.0,
+    fetch_ms: float = 0.0,
+    send_ms: float = 0.0,
 ) -> bool:
     """Send task completion receipt over WebSocket."""
     try:
@@ -3535,6 +3537,10 @@ async def ws_send_task_result(
         }
         if transfer_mbps > 0:
             msg["transfer_mbps"] = round(transfer_mbps, 1)
+        if fetch_ms > 0:
+            msg["fetch_ms"] = round(float(fetch_ms), 1)
+        if send_ms > 0:
+            msg["send_ms"] = round(float(send_ms), 1)
         if chunk_hash:
             msg["chunk_hash"] = chunk_hash
         if etag:
@@ -3559,6 +3565,8 @@ async def finalize_ws_task_result(
     error: str = None,
     offer_id: str = None,
     transfer_mbps: float = 0.0,
+    fetch_ms: float = 0.0,
+    send_ms: float = 0.0,
 ) -> TaskSummaryAck:
     """Send task_result until BeamCore assumes or rejects relay ownership."""
     result_key = offer_id or task_id
@@ -3585,6 +3593,8 @@ async def finalize_ws_task_result(
                 error=error,
                 offer_id=offer_id,
                 transfer_mbps=transfer_mbps,
+                fetch_ms=fetch_ms,
+                send_ms=send_ms,
             )
             if not sent:
                 if attempt < WS_TASK_RESULT_SEND_ATTEMPTS - 1:
@@ -3681,6 +3691,8 @@ async def _finalize_ws_task(
         error=result.error_msg,
         offer_id=offer_id,
         transfer_mbps=transfer_mbps(result.bytes_transferred, result.duration_ms),
+        fetch_ms=result.fetch_ms,
+        send_ms=result.send_ms,
     )
 
     status = "OK" if result.success else f"FAIL: {result.error_msg}"
@@ -3748,6 +3760,8 @@ async def _handle_ws_task_predefined_etag_early_result(
                 duration_ms=0.0,
                 chunk_hash=outcome.chunk_hash,
                 error_msg=outcome.error,
+                fetch_ms=outcome.fetch_ms,
+                send_ms=outcome.send_ms,
             )
             return await _finalize_ws_task(websocket, state, task_id, offer_id, result)
         return False
@@ -3758,6 +3772,8 @@ async def _handle_ws_task_predefined_etag_early_result(
         duration_ms=0.0,
         chunk_hash=outcome.chunk_hash,
         etag=outcome.etag,
+        fetch_ms=outcome.fetch_ms,
+        send_ms=outcome.send_ms,
     )
     finalized = await _finalize_ws_task(websocket, state, task_id, offer_id, result)
 
