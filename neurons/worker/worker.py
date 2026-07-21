@@ -397,10 +397,8 @@ TASK_RESULT_ACK_STATUSES = {
 }
 TASK_RESULT_TERMINAL_STATUSES = TASK_RESULT_ACK_STATUSES - {"retry"}
 WORKER_PREDEFINED_ETAG_EARLY_SUBMIT = _env_bool("WORKER_PREDEFINED_ETAG_EARLY_SUBMIT", True)
-# When false, skip expected chunk_hash mismatch failures (hash was only a check).
+# true: compute sha256 and verify against offer chunk_hash/chunk_hashes when present.
 WORKER_VERIFY_CHUNK_HASH = _env_bool("WORKER_VERIFY_CHUNK_HASH", True)
-# When true, also compute sha256 for task_result (optional; BeamCore signed-URL path needs etag).
-WORKER_COMPUTE_CHUNK_HASH = _env_bool("WORKER_COMPUTE_CHUNK_HASH", False)
 PREDEFINED_ETAG_MAX_PARALLEL = max(
     1, int(os.environ.get("WORKER_PREDEFINED_ETAG_MAX_PARALLEL", "1"))
 )
@@ -2248,6 +2246,19 @@ def matches_predefined_etag_source(source_url: str) -> bool:
     return got == expected or got.startswith(f"{expected}/")
 
 
+def offer_expected_chunk_hash(offer: dict, chunk_index: int = 0) -> str:
+    """Expected sha256 from the offer, if BeamCore provided one."""
+    if not isinstance(offer, dict):
+        return ""
+    raw_map = offer.get("chunk_hashes")
+    if isinstance(raw_map, dict):
+        for key in (chunk_index, str(chunk_index)):
+            value = raw_map.get(key)
+            if value:
+                return str(value).strip()
+    return str(offer.get("chunk_hash") or "").strip()
+
+
 def _sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -2294,10 +2305,8 @@ def should_buffer_predefined_etag_fetch(
     is_object_storage: bool = False,
     is_canary: bool = False,
 ) -> bool:
-    """Return True when fetch_and_send_chunk should buffer for early predefined submit."""
+    """Return True when fetch_and_send_chunk should buffer for predefined-etag path."""
     if fetch_ready is None or is_canary or not is_object_storage:
-        return False
-    if not WORKER_PREDEFINED_ETAG_EARLY_SUBMIT:
         return False
     if transfer_context is not None:
         return predefined_etag_transfer_eligible(transfer_context)
@@ -2305,17 +2314,16 @@ def should_buffer_predefined_etag_fetch(
 
 
 def uses_predefined_etag_early_submit(transfer_context: dict) -> bool:
-    """Return True when tasks may submit early using source URL + byte-range cache."""
-    return (
-        WORKER_PREDEFINED_ETAG_EARLY_SUBMIT
-        and predefined_etag_transfer_eligible(transfer_context)
-    )
+    """True when the predefined-etag worker path should run (cache hit or miss).
+
+    WORKER_PREDEFINED_ETAG_EARLY_SUBMIT only controls whether cache hits pre-submit
+    with a locally computed etag; the path itself runs whenever the transfer is eligible.
+    """
+    return predefined_etag_transfer_eligible(transfer_context)
 
 
 def predefined_etag_early_submit_skip_reasons(transfer_context: dict) -> list[str]:
-    """Explain why the predefined ETag fast path is not used."""
-    if not WORKER_PREDEFINED_ETAG_EARLY_SUBMIT:
-        return []
+    """Explain why the predefined ETag path is not used."""
     if uses_predefined_etag_early_submit(transfer_context):
         return []
 
@@ -2519,9 +2527,11 @@ async def predefined_etag_submit_flow(
 ) -> PredefinedETagSubmitOutcome:
     """Predefined ETag submit paths:
 
-    Cache hit (pre-submit): load → md5 etag from cached bytes → ready for task_result
-      (upload runs in background after submit; same as needing etag before PUT response).
-    Miss (original): fetch+upload → etag from PUT response → defer control-server sync.
+    Cache + EARLY_SUBMIT=true:  load → md5 etag → task_result ready (PUT in background)
+    Cache + EARLY_SUBMIT=false: load → PUT → etag from response (no local etag calc)
+    Miss: fetch+upload → etag from PUT response → defer control-server sync
+
+    WORKER_VERIFY_CHUNK_HASH=true: compute sha256 and verify against offer expected hash.
     """
     started_at = offer_started_at if offer_started_at is not None else time.perf_counter()
 
@@ -2536,26 +2546,79 @@ async def predefined_etag_submit_flow(
                 load_ms=load_ms,
             )
 
-        # Pre-submit needs etag before upload response — md5 of cached bytes only.
-        hash_started = time.perf_counter()
-        etag_local = await asyncio.to_thread(_etag_quoted_md5, data)
+        hash_ms = 0.0
         chunk_hash = ""
-        if WORKER_COMPUTE_CHUNK_HASH:
+        expected = offer_expected_chunk_hash(offer)
+        if WORKER_VERIFY_CHUNK_HASH:
+            hash_started = time.perf_counter()
             chunk_hash = await asyncio.to_thread(_sha256_hex, data)
-        hash_ms = (time.perf_counter() - hash_started) * 1000
+            hash_ms = (time.perf_counter() - hash_started) * 1000
+            if expected and chunk_hash.lower() != expected.lower():
+                return PredefinedETagSubmitOutcome(
+                    success=False,
+                    chunk_hash=chunk_hash,
+                    used_cache=True,
+                    error=(
+                        f"chunk hash mismatch: expected {expected}, got {chunk_hash}"
+                    ),
+                    load_ms=load_ms,
+                    hash_ms=hash_ms,
+                )
 
+        if WORKER_PREDEFINED_ETAG_EARLY_SUBMIT:
+            # Pre-submit: local md5 etag only (needed before PUT response).
+            etag_started = time.perf_counter()
+            etag_local = await asyncio.to_thread(_etag_quoted_md5, data)
+            hash_ms += (time.perf_counter() - etag_started) * 1000
+            await wait_predefined_etag_min_submit_delay(
+                started_at, transfer_context, body=data
+            )
+            return PredefinedETagSubmitOutcome(
+                success=True,
+                chunk_hash=chunk_hash,
+                etag=etag_local,
+                etag_local=etag_local,
+                used_cache=True,
+                hash_source="range_data",
+                load_ms=load_ms,
+                hash_ms=hash_ms,
+                fetch_ms=0.0,
+                send_ms=0.0,
+            )
+
+        # EARLY_SUBMIT=false: no local etag — upload first, use response ETag.
+        ok, send_ms, etag_real, _, err = await run_predefined_etag_cached_background_upload(
+            state,
+            transfer_context,
+            chunk_hash,
+            task_id=task_id,
+            offer_id=offer_id,
+            log_prefix=log_prefix,
+            data=data,
+            skip_hash=True,
+        )
+        if not ok:
+            return PredefinedETagSubmitOutcome(
+                success=False,
+                chunk_hash=chunk_hash,
+                used_cache=True,
+                error=err or "cache_upload_failed",
+                load_ms=load_ms,
+                hash_ms=hash_ms,
+                send_ms=send_ms,
+            )
         await wait_predefined_etag_min_submit_delay(started_at, transfer_context, body=data)
         return PredefinedETagSubmitOutcome(
             success=True,
             chunk_hash=chunk_hash,
-            etag=etag_local,
-            etag_local=etag_local,
+            etag=etag_real,
+            etag_local=None,
             used_cache=True,
-            hash_source="range_data",
+            hash_source="response_etag",
             load_ms=load_ms,
             hash_ms=hash_ms,
             fetch_ms=0.0,
-            send_ms=0.0,
+            send_ms=send_ms,
         )
 
     result = await execute_task_with_metrics(
@@ -2575,7 +2638,7 @@ async def predefined_etag_submit_flow(
             send_ms=result.send_ms,
         )
 
-    # Original path: etag comes from storage PUT response — do not md5 the file for submit.
+    # Miss/original: etag from storage PUT response — do not md5 the file for submit.
     if push_cache_to_control_server:
         schedule_deferred_predefined_etag_cache_sync(
             transfer_context,
@@ -2586,7 +2649,7 @@ async def predefined_etag_submit_flow(
     await wait_predefined_etag_min_submit_delay(started_at, transfer_context)
     return PredefinedETagSubmitOutcome(
         success=True,
-        chunk_hash=result.chunk_hash if WORKER_COMPUTE_CHUNK_HASH else "",
+        chunk_hash=result.chunk_hash if WORKER_VERIFY_CHUNK_HASH else "",
         etag=result.etag,
         etag_local=None,
         used_cache=False,
@@ -3827,8 +3890,13 @@ async def _handle_ws_task_predefined_etag_early_result(
         send_ms=outcome.send_ms,
     )
 
-    # Pre-submit cache hit: PUT runs after task_result (etag already taken from cached bytes).
-    if finalized and outcome.used_cache:
+    # Pre-submit cache hit only: PUT after task_result (local md5 etag already submitted).
+    if (
+        finalized
+        and outcome.used_cache
+        and WORKER_PREDEFINED_ETAG_EARLY_SUBMIT
+        and outcome.send_ms <= 0
+    ):
         track_ws_task(
             state,
             _await_predefined_etag_background_transfer_task(

@@ -1106,7 +1106,9 @@ class EmbeddedWorkerPool:
             fetch_ms=outcome.fetch_ms,
             send_ms=outcome.send_ms,
         )
-        if outcome.used_cache:
+        if outcome.used_cache and transfer.WORKER_PREDEFINED_ETAG_EARLY_SUBMIT and (
+            getattr(outcome, "send_ms", 0.0) or 0.0
+        ) <= 0:
             asyncio.create_task(
                 self._await_background_transfer_task(
                     worker,
