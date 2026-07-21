@@ -1106,6 +1106,17 @@ class EmbeddedWorkerPool:
             fetch_ms=outcome.fetch_ms,
             send_ms=outcome.send_ms,
         )
+        if outcome.used_cache:
+            asyncio.create_task(
+                self._await_background_transfer_task(
+                    worker,
+                    offer,
+                    task_id,
+                    offer_id,
+                    transfer_context,
+                    deadline_us,
+                )
+            )
 
     async def _await_background_transfer_task(
         self,
