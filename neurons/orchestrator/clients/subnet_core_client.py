@@ -698,10 +698,7 @@ class SubnetCoreClient:
             msg_type = envelope.get("message_type") or payload.get("type")
             if msg_type == "worker_task_offer_batch":
                 self._note_beamcore_upstream_recovered("worker_task_offer_batch from BeamCore")
-                accepted = await self._handle_task_offer_batch(payload)
-                if msg.reply:
-                    response = self._envelope("worker_task_offer_batch", {"type": "worker_task_offer_batch_ack", "accepted": accepted, "batch_id": payload.get("batch_id")}, envelope.get("request_id"))
-                    await msg.respond(_pack(response))
+                await self._handle_task_offer_batch(payload)
             elif msg_type == "error":
                 logger.warning("BeamCore NATS control error: %s", payload)
             else:
@@ -720,27 +717,26 @@ class SubnetCoreClient:
             return True
         return self._worker_gateway is not None
 
-    async def _handle_task_offer_batch(self, data: dict) -> bool:
+    async def _handle_task_offer_batch(self, data: dict) -> None:
         batch_id = data.get("batch_id")
         offers = data.get("offers") or []
         if not isinstance(offers, list) or not offers:
             logger.warning("worker_task_offer_batch missing offers: batch=%s", batch_id)
-            return False
+            return
         if not self._has_delivery_target():
             logger.warning("No worker delivery target available for batch %s", batch_id)
-            return False
+            return
         if self._task_offer_dispatcher:
             await self._task_offer_dispatcher.start()
-            accepted = self._task_offer_dispatcher.enqueue_offer(data)
-            if accepted:
+            queued = self._task_offer_dispatcher.enqueue_offer(data)
+            if queued:
                 logger.info(
                     "worker_task_offer_batch queued: batch=%s offers=%s",
                     batch_id,
                     len(offers),
                 )
-            return accepted
+            return
         await self._deliver_task_offer_batch_to_workers(data)
-        return True
 
     async def _deliver_task_offer_batch_to_workers(self, data: dict) -> None:
         batch_id = data.get("batch_id")
