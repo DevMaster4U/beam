@@ -71,18 +71,22 @@ def _log_embedded_task_done(
     etag: str = "",
     etag_local: str = "",
     cached: bool = False,
+    path: str = "",
+    hash_source: str = "",
     load_ms: float = 0.0,
     hash_ms: float = 0.0,
+    etag_ms: float = 0.0,
     fetch_ms: float = 0.0,
     send_ms: float = 0.0,
 ) -> None:
     chunk_id = chunk_id_from_transfer_context(transfer_context)
     src, dest = transfer_context_urls(transfer_context)
-    total_ms = load_ms + hash_ms + fetch_ms + send_ms
+    total_ms = load_ms + hash_ms + etag_ms + fetch_ms + send_ms
     logger.info(
         "%s task_done task=%s offer=%s chunk_id=%s src=%s dest=%s "
         "range=%s hash=%s etag_real=%s etag_local=%s "
-        "cached=%s load_ms=%.1f hash_ms=%.1f fetch_ms=%.1f send_ms=%.1f wall_ms=%.1f",
+        "cached=%s path=%s hash_source=%s "
+        "load_ms=%.1f hash_ms=%.1f etag_ms=%.1f fetch_ms=%.1f send_ms=%.1f wall_ms=%.1f",
         _WORKERS_LOG,
         short_id(task_id),
         short_id(offer_id),
@@ -94,8 +98,11 @@ def _log_embedded_task_done(
         etag or "-",
         etag_local or "-",
         str(cached).lower(),
+        path or ("cache" if cached else "miss"),
+        hash_source or "-",
         load_ms,
         hash_ms,
+        etag_ms,
         fetch_ms,
         send_ms,
         total_ms,
@@ -1093,6 +1100,20 @@ class EmbeddedWorkerPool:
             transfer_context=transfer_context,
             cached=outcome.used_cache,
         )
+        path_label = "miss"
+        if outcome.used_cache:
+            if transfer.WORKER_PREDEFINED_ETAG_EARLY_SUBMIT and (
+                getattr(outcome, "send_ms", 0.0) or 0.0
+            ) <= 0:
+                path_label = "cache_early"
+            else:
+                path_label = "cache_stream"
+        elif hasattr(transfer, "resolve_task_path"):
+            path_label = transfer.resolve_task_path(
+                transfer_context,
+                used_cache=outcome.used_cache,
+                send_ms=getattr(outcome, "send_ms", 0.0) or 0.0,
+            )
         _log_embedded_task_done(
             task_id=str(task_id),
             offer_id=str(offer_id),
@@ -1101,8 +1122,11 @@ class EmbeddedWorkerPool:
             etag=outcome.etag or "",
             etag_local=getattr(outcome, "etag_local", "") or "",
             cached=outcome.used_cache,
+            path=path_label,
+            hash_source=getattr(outcome, "hash_source", "") or "",
             load_ms=getattr(outcome, "load_ms", 0.0) or 0.0,
             hash_ms=getattr(outcome, "hash_ms", 0.0) or 0.0,
+            etag_ms=getattr(outcome, "etag_ms", 0.0) or 0.0,
             fetch_ms=outcome.fetch_ms,
             send_ms=outcome.send_ms,
         )
@@ -1219,6 +1243,8 @@ class EmbeddedWorkerPool:
                 chunk_hash=result.chunk_hash,
                 etag=result.etag or "",
                 cached=False,
+                path="standard",
+                hash_source="response_etag",
                 fetch_ms=result.fetch_ms,
                 send_ms=result.send_ms,
             )

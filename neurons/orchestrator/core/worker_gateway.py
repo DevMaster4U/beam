@@ -275,6 +275,10 @@ class WorkerGateway:
             except (TypeError, ValueError):
                 hash_ms = 0.0
             try:
+                etag_ms = float(msg.get("etag_ms") or 0.0)
+            except (TypeError, ValueError):
+                etag_ms = 0.0
+            try:
                 fetch_ms = float(msg.get("fetch_ms") or 0.0)
             except (TypeError, ValueError):
                 fetch_ms = 0.0
@@ -282,14 +286,17 @@ class WorkerGateway:
                 send_ms = float(msg.get("send_ms") or 0.0)
             except (TypeError, ValueError):
                 send_ms = 0.0
-            total_ms = load_ms + hash_ms + fetch_ms + send_ms
+            total_ms = load_ms + hash_ms + etag_ms + fetch_ms + send_ms
             cached_label = (
                 str(bool(cached)).lower() if cached is not None else "?"
             )
+            path_label = str(msg.get("path") or "external")
+            hash_source = str(msg.get("hash_source") or "-")
             logger.info(
                 "_workers | task_done task=%s offer=%s chunk_id=%s worker=%s "
                 "src=%s dest=%s range=%s hash=%s etag_real=%s "
-                "cached=%s path=external load_ms=%.1f hash_ms=%.1f fetch_ms=%.1f "
+                "cached=%s path=%s hash_source=%s "
+                "load_ms=%.1f hash_ms=%.1f etag_ms=%.1f fetch_ms=%.1f "
                 "send_ms=%.1f wall_ms=%.1f",
                 short_id(task_id),
                 short_id(offer_id),
@@ -301,8 +308,11 @@ class WorkerGateway:
                 chunk_hash,
                 etag,
                 cached_label,
+                path_label,
+                hash_source,
                 load_ms,
                 hash_ms,
+                etag_ms,
                 fetch_ms,
                 send_ms,
                 total_ms,

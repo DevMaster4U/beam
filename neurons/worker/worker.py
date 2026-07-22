@@ -2413,6 +2413,86 @@ def uses_predefined_etag_early_submit(transfer_context: dict) -> bool:
     return predefined_etag_transfer_eligible(transfer_context)
 
 
+def chunk_id_from_transfer_context(transfer_context: dict) -> Optional[int]:
+    """chunk_id = range_start // (range_end - range_start + 1 - 1) matching orch relay_log."""
+    try:
+        range_start = int(transfer_context["range_start"])
+        range_end = int(transfer_context["range_end"])
+        span = range_end - range_start
+        if span <= 0:
+            return None
+        return range_start // span
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def resolve_task_path(
+    transfer_context: dict,
+    *,
+    used_cache: Optional[bool] = None,
+    send_ms: float = 0.0,
+) -> str:
+    """Label execution path for logs: cache_early | cache_stream | miss | standard."""
+    if used_cache is not None:
+        if used_cache:
+            if WORKER_PREDEFINED_ETAG_EARLY_SUBMIT and send_ms <= 0:
+                return "cache_early"
+            return "cache_stream"
+        if uses_predefined_etag_early_submit(transfer_context):
+            return "miss"
+        return "standard"
+
+    if not uses_predefined_etag_early_submit(transfer_context):
+        return "standard"
+    if uses_local_cache_file(transfer_context):
+        if WORKER_PREDEFINED_ETAG_EARLY_SUBMIT:
+            return "cache_early"
+        return "cache_stream"
+    return "miss"
+
+
+def log_task_start(
+    log_prefix: str,
+    task_id: str,
+    offer_id: str,
+    transfer_context: dict,
+    *,
+    state: Optional["WorkerState"] = None,
+    estimated_bytes: int = 0,
+) -> None:
+    """Detailed task-offer / start log (path, cache flags, chunk, capacity)."""
+    try:
+        range_start = int(transfer_context["range_start"])
+        range_end = int(transfer_context["range_end"])
+        range_label = f"bytes={range_start}-{range_end}({range_end - range_start + 1})"
+    except (KeyError, TypeError, ValueError):
+        range_label = "-"
+    chunk_id = chunk_id_from_transfer_context(transfer_context)
+    path = resolve_task_path(transfer_context)
+    cache_hit = has_predefined_etag_chunk_data(transfer_context)
+    fields = [
+        f"{log_prefix} task_start task={task_label(task_id)}",
+        f"offer={task_label(offer_id)}",
+        f"chunk_id={chunk_id if chunk_id is not None else '?'}",
+        f"src={redact_url(str(transfer_context.get('source_url') or ''))}",
+        f"dest={redact_url(str(transfer_context.get('dest_url') or ''))}",
+        f"range={range_label}",
+        f"path={path}",
+        f"cache_hit={str(cache_hit).lower()}",
+        f"use_cache={str(WORKER_USE_CACHE_FILE).lower()}",
+        f"early_submit={str(WORKER_PREDEFINED_ETAG_EARLY_SUBMIT).lower()}",
+        f"verify_hash={str(WORKER_VERIFY_CHUNK_HASH).lower()}",
+    ]
+    if state is not None:
+        fields.append(
+            f"in_flight={len(state.active_ws_task_ids)}/"
+            f"{MAX_CONCURRENT_TASKS} "
+            f"reserved_bytes={state.reserved_bytes}/{MAX_IN_FLIGHT_BYTES} "
+            f"reserve={estimated_bytes}"
+        )
+    print(" ".join(fields))
+
+
 def predefined_etag_early_submit_skip_reasons(transfer_context: dict) -> list[str]:
     """Explain why the predefined ETag path is not used."""
     if uses_predefined_etag_early_submit(transfer_context):
@@ -2513,6 +2593,8 @@ def _log_task_done(
     etag_real: str = "",
     etag_local: str = "",
     cached: bool = False,
+    hash_source: str = "",
+    path: str = "",
     load_ms: float = 0.0,
     hash_ms: float = 0.0,
     etag_ms: float = 0.0,
@@ -2529,12 +2611,21 @@ def _log_task_done(
     total_ms = load_ms + hash_ms + etag_ms + fetch_ms + send_ms
     # Upload rate uses send_ms only (dest PUT). wall_ms is end-to-end.
     mbps = transfer_mbps(bytes_count, send_ms if send_ms > 0 else total_ms)
+    path_label = path or resolve_task_path(
+        transfer_context, used_cache=cached, send_ms=send_ms
+    )
+    chunk_id = chunk_id_from_transfer_context(transfer_context)
     print(
         f"{log_prefix} task_done task={task_label(task_id)} offer={task_label(offer_id)} "
+        f"chunk_id={chunk_id if chunk_id is not None else '?'} "
         f"range={transfer_context.get('range_start')}-{transfer_context.get('range_end')} "
-        f"bytes={bytes_count} cached={str(cached).lower()} "
+        f"bytes={bytes_count} path={path_label} cached={str(cached).lower()} "
+        f"hash_source={hash_source or '-'} "
         f"hash={chunk_hash or '-'} etag_real={etag_real or '-'} "
         f"etag_local={etag_local or '-'} "
+        f"use_cache={str(WORKER_USE_CACHE_FILE).lower()} "
+        f"early_submit={str(WORKER_PREDEFINED_ETAG_EARLY_SUBMIT).lower()} "
+        f"verify_hash={str(WORKER_VERIFY_CHUNK_HASH).lower()} "
         f"load_ms={load_ms:.1f} hash_ms={hash_ms:.1f} etag_ms={etag_ms:.1f} "
         f"fetch_ms={fetch_ms:.1f} send_ms={send_ms:.1f} wall_ms={total_ms:.1f} mbps={mbps:.1f}"
     )
@@ -3645,9 +3736,12 @@ async def ws_send_task_result(
     transfer_mbps: float = 0.0,
     load_ms: float = 0.0,
     hash_ms: float = 0.0,
+    etag_ms: float = 0.0,
     fetch_ms: float = 0.0,
     send_ms: float = 0.0,
     cached: Optional[bool] = None,
+    path: str = "",
+    hash_source: str = "",
 ) -> bool:
     """Send task completion receipt over WebSocket."""
     try:
@@ -3665,6 +3759,8 @@ async def ws_send_task_result(
             msg["load_ms"] = round(float(load_ms), 1)
         if hash_ms > 0:
             msg["hash_ms"] = round(float(hash_ms), 1)
+        if etag_ms > 0:
+            msg["etag_ms"] = round(float(etag_ms), 1)
         if fetch_ms > 0:
             msg["fetch_ms"] = round(float(fetch_ms), 1)
         if send_ms > 0:
@@ -3675,6 +3771,10 @@ async def ws_send_task_result(
             msg["etag"] = etag
         if cached is not None:
             msg["cached"] = bool(cached)
+        if path:
+            msg["path"] = path
+        if hash_source:
+            msg["hash_source"] = hash_source
         if error:
             msg["error"] = error
         await ws_send_json(websocket, state, msg)
@@ -3697,9 +3797,12 @@ async def finalize_ws_task_result(
     transfer_mbps: float = 0.0,
     load_ms: float = 0.0,
     hash_ms: float = 0.0,
+    etag_ms: float = 0.0,
     fetch_ms: float = 0.0,
     send_ms: float = 0.0,
     cached: Optional[bool] = None,
+    path: str = "",
+    hash_source: str = "",
     quiet: bool = False,
 ) -> TaskSummaryAck:
     """Send task_result until BeamCore assumes or rejects relay ownership."""
@@ -3715,6 +3818,7 @@ async def finalize_ws_task_result(
                 print(
                     f"[Worker] [WS] Sending task_result: task={task_label(task_id)} "
                     f"offer={task_label(offer_id)} success={success} "
+                    f"path={path or '-'} cached={cached} hash_source={hash_source or '-'} "
                     f"bytes={bytes_transferred} mbps={round(transfer_mbps, 1)}"
                 )
             sent = await ws_send_task_result(
@@ -3730,9 +3834,12 @@ async def finalize_ws_task_result(
                 transfer_mbps=transfer_mbps,
                 load_ms=load_ms,
                 hash_ms=hash_ms,
+                etag_ms=etag_ms,
                 fetch_ms=fetch_ms,
                 send_ms=send_ms,
                 cached=cached,
+                path=path,
+                hash_source=hash_source,
             )
             if not sent:
                 if attempt < WS_TASK_RESULT_SEND_ATTEMPTS - 1:
@@ -3821,12 +3928,15 @@ async def _finalize_ws_task(
     *,
     load_ms: float = 0.0,
     hash_ms: float = 0.0,
+    etag_ms: float = 0.0,
     cached: Optional[bool] = None,
+    path: str = "",
+    hash_source: str = "",
     quiet: bool = False,
 ) -> bool:
     duration_ms = result.duration_ms
     if duration_ms <= 0:
-        duration_ms = load_ms + hash_ms + result.fetch_ms + result.send_ms
+        duration_ms = load_ms + hash_ms + etag_ms + result.fetch_ms + result.send_ms
     # Report upload Mbps from send_ms (dest PUT), not wall-clock.
     mbps_duration = result.send_ms if result.send_ms > 0 else duration_ms
     await finalize_ws_task_result(
@@ -3842,9 +3952,12 @@ async def _finalize_ws_task(
         transfer_mbps=transfer_mbps(result.bytes_transferred, mbps_duration),
         load_ms=load_ms,
         hash_ms=hash_ms,
+        etag_ms=etag_ms,
         fetch_ms=result.fetch_ms,
         send_ms=result.send_ms,
         cached=cached,
+        path=path,
+        hash_source=hash_source,
         quiet=quiet,
     )
 
@@ -3852,7 +3965,7 @@ async def _finalize_ws_task(
         status = "OK" if result.success else f"FAIL: {result.error_msg}"
         print(
             f"[Worker] [WS] Task {task_label(task_id)} offer={task_label(offer_id)}: {status} | "
-            f"{result.bytes_transferred} bytes"
+            f"{result.bytes_transferred} bytes path={path or '-'}"
         )
     return result.success
 
@@ -3896,11 +4009,17 @@ async def _handle_ws_task_predefined_etag_early_result(
         deadline_us,
         log_prefix="[Worker] [WS]",
     )
+    path_label = resolve_task_path(
+        transfer_context,
+        used_cache=outcome.used_cache,
+        send_ms=outcome.send_ms,
+    )
+    etag_ms = getattr(outcome, "etag_ms", 0.0) or 0.0
 
     if not outcome.success:
         print(
             f"[Worker] [WS] Predefined submit failed: task={task_label(task_id)} "
-            f"offer={task_label(offer_id)} reason={outcome.error}"
+            f"offer={task_label(offer_id)} reason={outcome.error} path={path_label}"
         )
         if outcome.error:
             result = TaskExecutionResult(
@@ -3920,7 +4039,10 @@ async def _handle_ws_task_predefined_etag_early_result(
                 result,
                 load_ms=outcome.load_ms,
                 hash_ms=outcome.hash_ms,
+                etag_ms=etag_ms,
                 cached=outcome.used_cache,
+                path=path_label,
+                hash_source=outcome.hash_source,
             )
         return False
 
@@ -3928,7 +4050,7 @@ async def _handle_ws_task_predefined_etag_early_result(
         success=True,
         bytes_transferred=int(transfer_context.get("chunk_size") or 0),
         duration_ms=(
-            outcome.load_ms + outcome.hash_ms + outcome.fetch_ms + outcome.send_ms
+            outcome.load_ms + outcome.hash_ms + etag_ms + outcome.fetch_ms + outcome.send_ms
         ),
         chunk_hash=outcome.chunk_hash,
         etag=outcome.etag,
@@ -3943,7 +4065,10 @@ async def _handle_ws_task_predefined_etag_early_result(
         result,
         load_ms=outcome.load_ms,
         hash_ms=outcome.hash_ms,
+        etag_ms=etag_ms,
         cached=outcome.used_cache,
+        path=path_label,
+        hash_source=outcome.hash_source,
         quiet=True,
     )
     _log_task_done(
@@ -3955,9 +4080,11 @@ async def _handle_ws_task_predefined_etag_early_result(
         etag_real=outcome.etag or "",
         etag_local=outcome.etag_local or "",
         cached=outcome.used_cache,
+        hash_source=outcome.hash_source,
+        path=path_label,
         load_ms=outcome.load_ms,
         hash_ms=outcome.hash_ms,
-        etag_ms=getattr(outcome, "etag_ms", 0.0) or 0.0,
+        etag_ms=etag_ms,
         fetch_ms=outcome.fetch_ms,
         send_ms=outcome.send_ms,
     )
@@ -4085,19 +4212,6 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
         )
         return False
 
-    try:
-        _rs = int(transfer_context["range_start"])
-        _re = int(transfer_context["range_end"])
-        range_label = f"bytes={_rs}-{_re}({_re - _rs + 1})"
-    except (KeyError, TypeError, ValueError):
-        range_label = "-"
-    print(
-        f"[Worker] [WS] Task: {task_label(task_id)} offer={task_label(offer_id)} "
-        f"src={redact_url(str(transfer_context.get('source_url') or ''))} "
-        f"dest={redact_url(str(transfer_context.get('dest_url') or ''))} "
-        f"range={range_label}"
-    )
-
     capacity_error = try_reserve_ws_capacity(state, task_key, estimated_bytes)
     if capacity_error == "duplicate":
         print(
@@ -4114,6 +4228,15 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
         )
         return False
     reserved_capacity = True
+
+    log_task_start(
+        "[Worker] [WS]",
+        task_id,
+        offer_id,
+        transfer_context,
+        state=state,
+        estimated_bytes=estimated_bytes,
+    )
 
     log_predefined_etag_fast_path_skipped(
         task, transfer_context, log_prefix="[Worker] [WS]"
@@ -4161,7 +4284,30 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
                 task_id=task_id,
                 offer_id=offer_id,
             )
-        return await _finalize_ws_task(websocket, state, task_id, offer_id, result)
+        finalized = await _finalize_ws_task(
+            websocket,
+            state,
+            task_id,
+            offer_id,
+            result,
+            path="standard",
+            hash_source="response_etag" if result.success else "",
+            quiet=True,
+        )
+        _log_task_done(
+            "[Worker] [WS]",
+            task_id,
+            offer_id,
+            transfer_context,
+            chunk_hash=result.chunk_hash,
+            etag_real=result.etag or "",
+            cached=False,
+            hash_source="response_etag" if result.success else "",
+            path="standard",
+            fetch_ms=result.fetch_ms,
+            send_ms=result.send_ms,
+        )
+        return finalized
     finally:
         release_ws_capacity(state, task_key, estimated_bytes, reserved_capacity)
 
