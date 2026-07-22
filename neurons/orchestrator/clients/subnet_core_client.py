@@ -730,7 +730,7 @@ class SubnetCoreClient:
             await self._task_offer_dispatcher.start()
             queued = self._task_offer_dispatcher.enqueue_offer(data)
             if queued:
-                logger.info(
+                logger.debug(
                     "worker_task_offer_batch queued: batch=%s offers=%s",
                     batch_id,
                     len(offers),
@@ -753,7 +753,7 @@ class SubnetCoreClient:
                 str(batch_id or "unknown"),
                 valid_offers,
             )
-            logger.info(
+            logger.debug(
                 "worker_task_offer_batch handled by embedded workers: batch=%s offers=%s delivered=%s failed=%s",
                 batch_id,
                 len(valid_offers),
@@ -767,7 +767,7 @@ class SubnetCoreClient:
                 str(batch_id or "unknown"),
                 valid_offers,
             )
-            logger.info(
+            logger.debug(
                 "worker_task_offer_batch forwarded to global gateway: batch=%s offers=%s sent=%s failed=%s",
                 batch_id,
                 len(valid_offers),
@@ -782,7 +782,7 @@ class SubnetCoreClient:
 
         if hasattr(self._worker_gateway, "deliver_task_offer_batch"):
             delivered, failed = await self._worker_gateway.deliver_task_offer_batch(valid_offers)
-            logger.info(
+            logger.debug(
                 "worker_task_offer_batch delivered locally: batch=%s offers=%s delivered=%s failed=%s",
                 batch_id,
                 len(valid_offers),

@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
 import os
 import time
@@ -49,56 +48,19 @@ def _log_embedded_task_offer(
     path: str,
     beamcore_worker_id: str = "",
 ) -> None:
-    # hash/etag are only known after upload — logged on task_done, not here.
-    # CF path: keep offer log short (no signed URLs / no task_offer_info dump).
+    # Short start log only; hash/etag land on task_done.
     chunk_id = chunk_id_from_transfer_context(transfer_context)
-    if path == "cloudflare_worker":
-        fields = [
-            f"{_WORKERS_LOG} task_offer task={short_id(task_id)}",
-            f"offer={short_id(offer_id)}",
-            f"worker_slot={worker_slot}",
-            f"chunk_id={chunk_id if chunk_id is not None else '?'}",
-            f"range={transfer_context_range_label(transfer_context)}",
-            f"path={path}",
-        ]
-        logger.info(" ".join(fields))
-        return
-
-    src, dest = transfer_context_urls(transfer_context)
     fields = [
-        f"{_WORKERS_LOG} task_offer task={task_id}",
-        f"offer={offer_id}",
+        f"{_WORKERS_LOG} task_start task={short_id(task_id)}",
+        f"offer={short_id(offer_id)}",
         f"worker_slot={worker_slot}",
         f"chunk_id={chunk_id if chunk_id is not None else '?'}",
         f"range={transfer_context_range_label(transfer_context)}",
         f"path={path}",
-        f"src={src}",
-        f"dest={dest}",
     ]
     if beamcore_worker_id:
-        fields.append(f"beamcore_worker={beamcore_worker_id}")
+        fields.append(f"beamcore_worker={short_id(beamcore_worker_id)}")
     logger.info(" ".join(fields))
-    logger.info(
-        "%s task_offer_info task=%s offer=%s transfer_context=%s",
-        _WORKERS_LOG,
-        task_id,
-        offer_id,
-        json.dumps(
-            {
-                "source_url": transfer_context.get("source_url"),
-                "dest_url": transfer_context.get("dest_url"),
-                "range_start": transfer_context.get("range_start"),
-                "range_end": transfer_context.get("range_end"),
-                "chunk_size": transfer_context.get("chunk_size"),
-                "etag_required": transfer_context.get("etag_required"),
-                "transfer_id": transfer_context.get("transfer_id"),
-                "source_headers": transfer_context.get("source_headers"),
-                "dest_headers": transfer_context.get("dest_headers"),
-            },
-            separators=(",", ":"),
-            default=str,
-        ),
-    )
 
 
 def _log_embedded_task_done(
@@ -155,7 +117,7 @@ def _log_embedded_task_completed(
     worker_id: str,
     latency_ms: float,
 ) -> None:
-    logger.info(
+    logger.debug(
         "%s task_completed task=%s offer=%s worker=%s latency_ms=%.1f",
         _WORKERS_LOG,
         short_id(task_id),
@@ -833,26 +795,6 @@ class EmbeddedWorkerPool:
             if profile.ip:
                 batch_used_ips.add(profile.ip)
                 self._mark_spread_ip(profile.ip)
-            src, dest = ("", "")
-            if transfer_context:
-                src, dest = transfer_context_urls(transfer_context)
-            range_label = (
-                transfer_context_range_label(transfer_context)
-                if transfer_context
-                else "-"
-            )
-            logger.info(
-                "%s external_dispatch task=%s offer=%s worker=%s ip=%s "
-                "range=%s src=%s dest=%s",
-                _WORKERS_LOG,
-                short_id(task_id),
-                short_id(offer_id),
-                short_id(external_id),
-                profile.ip or "?",
-                range_label,
-                src or "-",
-                dest or "-",
-            )
             return True
         logger.warning(
             "External worker dispatch failed: batch=%s task=%s offer=%s worker=%s",

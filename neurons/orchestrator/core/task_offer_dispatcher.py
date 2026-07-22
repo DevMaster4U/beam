@@ -82,7 +82,7 @@ class TaskOfferDispatcher:
             logger.error("Error handling worker_task_offer_batch batch=%s task=%s: %s", batch_id, task_id[:8], exc)
         finally:
             handler_ms = (time.monotonic() - started_at) * 1000.0
-            logger.info(
+            logger.debug(
                 "worker_task_offer_batch handled batch=%s task=%s offer_handler_ms=%.1f",
                 batch_id,
                 task_id[:8] if task_id else "unknown",

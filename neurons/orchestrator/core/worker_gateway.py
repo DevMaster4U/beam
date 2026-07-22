@@ -467,24 +467,26 @@ class WorkerGateway:
                 if offer_id:
                     self.mark_worker_busy(worker_id, str(offer_id))
             offer_id = str(offer.get("offer_id") or offer.get("task_id") or "")
-            logger.info(
-                "_workers | task_offer_full worker=%s task=%s offer=%s "
-                "src=%s dest=%s chunk_size=%s range=%s etag_required=%s "
-                "transfer_id=%s offer_json=%s",
-                short_id(worker_id),
-                offer.get("task_id"),
-                offer.get("offer_id"),
-                offer.get("source_url") or "-",
-                offer.get("dest_url") or "-",
-                offer.get("chunk_size"),
-                (
+            task_id = str(offer.get("task_id") or "")
+            ctx = self._offer_contexts.get(offer_id) or {}
+            chunk_id = chunk_id_from_transfer_context(ctx) if ctx else None
+            range_label = (
+                transfer_context_range_label(ctx)
+                if ctx
+                else (
                     (offer.get("source_headers") or {}).get("Range")
                     or (offer.get("source_headers") or {}).get("range")
                     or "-"
-                ),
-                offer.get("etag_required"),
-                offer.get("transfer_id") or "-",
-                json.dumps(offer, separators=(",", ":"), default=str),
+                )
+            )
+            logger.info(
+                "_workers | task_start task=%s offer=%s worker=%s "
+                "chunk_id=%s range=%s",
+                short_id(task_id),
+                short_id(offer_id),
+                short_id(worker_id),
+                chunk_id if chunk_id is not None else "?",
+                range_label,
             )
             return True
         except Exception as exc:
@@ -834,7 +836,7 @@ class WorkerGateway:
                     }
                     self._cache_terminal_result_ack(result_key, terminal_ack)
                     await self._send_to_worker(worker_id, terminal_ack)
-                    logger.info(
+                    logger.debug(
                         "task_result relay terminal: task=%s offer=%s worker=%s status=%s",
                         short_id(task_id),
                         short_id(offer_id),
