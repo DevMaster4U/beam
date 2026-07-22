@@ -23,6 +23,7 @@ import bittensor as bt
 import httpx
 
 from core.config import OrchestratorSettings
+from core.cloudflare_transfer import call_cloudflare_transfer_worker
 from core.relay_log import (
     chunk_id_from_transfer_context,
     short_id,
@@ -177,6 +178,17 @@ def _log_embedded_task_failed(
     )
 
 
+def _env_bool(raw: str, default: bool = False) -> bool:
+    value = (raw or "").strip().lower()
+    if not value:
+        return default
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
 @dataclass
 class EmbeddedWorkerConfig:
     slot: int
@@ -184,6 +196,7 @@ class EmbeddedWorkerConfig:
     hotkey: str
     initial_order: int = 0
     max_concurrent_tasks: int = 4
+    cf_transfer_enabled: bool = False
 
 
 @dataclass
@@ -197,6 +210,7 @@ class EmbeddedWorker:
     state: Any
     initial_order: int = 0
     max_concurrent_tasks: int = 4
+    cf_transfer_enabled: bool = False
     http_client: Optional[httpx.AsyncClient] = None
     active_offer_ids: Set[str] = field(default_factory=set)
 
@@ -255,6 +269,15 @@ def parse_embedded_worker_configs(settings: OrchestratorSettings) -> List[Embedd
         else:
             max_concurrent = default_max_tasks
 
+        # Per-worker CF transfer; falls back to global CF_TRANSFER_ENABLED.
+        cf_raw = os.environ.get(f"WORKER_{idx}_CF_TRANSFER_ENABLED", "").strip()
+        if cf_raw:
+            cf_transfer_enabled = _env_bool(cf_raw, False)
+        else:
+            cf_transfer_enabled = bool(
+                getattr(settings, "cf_transfer_enabled", False)
+            )
+
         configs.append(
             EmbeddedWorkerConfig(
                 slot=idx,
@@ -262,6 +285,7 @@ def parse_embedded_worker_configs(settings: OrchestratorSettings) -> List[Embedd
                 hotkey=hotkey,
                 initial_order=initial_order,
                 max_concurrent_tasks=max_concurrent,
+                cf_transfer_enabled=cf_transfer_enabled,
             )
         )
         idx += 1
@@ -406,6 +430,19 @@ class EmbeddedWorkerPool:
         if gateway is None:
             self._hybrid_used_ips.clear()
 
+    def _cf_transfer_url(self, worker: Optional["EmbeddedWorker"] = None) -> str:
+        """Return CF worker URL when this embedded worker has CF transfer enabled."""
+        if worker is not None and not bool(getattr(worker, "cf_transfer_enabled", False)):
+            return ""
+        if worker is None and not any(
+            bool(getattr(w, "cf_transfer_enabled", False)) for w in self.workers
+        ):
+            return ""
+        return (self.settings.cf_transfer_worker_url or "").strip()
+
+    def _cf_transfer_active(self, worker: Optional["EmbeddedWorker"] = None) -> bool:
+        return bool(self._cf_transfer_url(worker))
+
     def _spread_used_ips(self, batch_used_ips: set[str]) -> set[str]:
         """IPs already used in this batch plus recent cross-batch hybrid assignments."""
         if self._worker_gateway is None:
@@ -433,6 +470,30 @@ class EmbeddedWorkerPool:
             timeout=httpx.Timeout(120.0, connect=30.0),
             limits=httpx.Limits(max_connections=64, max_keepalive_connections=32),
         )
+
+        cf_url = (self.settings.cf_transfer_worker_url or "").strip()
+        cf_slots = [cfg.slot for cfg in configs if cfg.cf_transfer_enabled]
+        if cf_slots:
+            if cf_url:
+                logger.info(
+                    "Embedded CF transfer ENABLED slots=%s url=%s timeout_s=%.1f "
+                    "send_accept=%s",
+                    cf_slots,
+                    cf_url,
+                    float(self.settings.cf_transfer_worker_timeout or 120.0),
+                    str(bool(getattr(self.settings, "cf_transfer_send_accept", True))).lower(),
+                )
+            else:
+                logger.warning(
+                    "CF transfer enabled for slots=%s but CF_TRANSFER_WORKER_URL is empty; "
+                    "those slots will use normal local transfer",
+                    cf_slots,
+                )
+        elif cf_url:
+            logger.info(
+                "CF_TRANSFER_WORKER_URL is set but no WORKER_N_CF_TRANSFER_ENABLED "
+                "(and CF_TRANSFER_ENABLED=false); using normal local transfer"
+            )
 
         for cfg in configs:
             wallet = bt.Wallet(
@@ -475,14 +536,16 @@ class EmbeddedWorkerPool:
                 state=state,
                 initial_order=cfg.initial_order,
                 max_concurrent_tasks=cfg.max_concurrent_tasks,
+                cf_transfer_enabled=cfg.cf_transfer_enabled,
                 http_client=worker_client,
             )
             self.workers.append(worker)
             logger.info(
-                "Embedded worker ready slot=%s worker_id=%s hotkey=%s",
+                "Embedded worker ready slot=%s worker_id=%s hotkey=%s cf_transfer=%s",
                 cfg.slot,
                 short_id(worker_id),
                 hotkey[:16],
+                str(bool(cfg.cf_transfer_enabled)).lower(),
             )
 
         logger.info(
@@ -764,10 +827,12 @@ class EmbeddedWorkerPool:
                 )
                 failed += 1
                 continue
-            elif transfer.uses_predefined_etag_early_submit(transfer_context):
-                path = "predefined_etag"
-            else:
-                path = "standard"
+            # Path finalized after worker selection (CF enable is per embedded worker).
+            path = (
+                "predefined_etag"
+                if transfer.uses_predefined_etag_early_submit(transfer_context)
+                else "standard"
+            )
 
             # in_process hybrid: maximize parallel bandwidth so last task finishes
             # sooner. Prefer fresh-IP embedded, then fresh-IP external, then reuse
@@ -857,6 +922,12 @@ class EmbeddedWorkerPool:
             if worker.ip:
                 batch_used_ips.add(worker.ip)
                 self._mark_spread_ip(worker.ip)
+
+            if (
+                path == "predefined_etag"
+                and self._cf_transfer_active(worker)
+            ):
+                path = "cloudflare_worker"
 
             _log_embedded_task_offer(
                 task_id=str(task_id),
@@ -953,14 +1024,26 @@ class EmbeddedWorkerPool:
                 )
 
             if transfer.uses_predefined_etag_early_submit(transfer_context):
-                await self._handle_predefined_etag_offer(
-                    worker,
-                    offer,
-                    task_id,
-                    offer_id,
-                    transfer_context,
-                    deadline_us,
-                )
+                cf_url = self._cf_transfer_url(worker)
+                if cf_url:
+                    await self._handle_cloudflare_transfer_offer(
+                        worker,
+                        offer,
+                        task_id,
+                        offer_id,
+                        transfer_context,
+                        deadline_us,
+                        worker_url=cf_url,
+                    )
+                else:
+                    await self._handle_predefined_etag_offer(
+                        worker,
+                        offer,
+                        task_id,
+                        offer_id,
+                        transfer_context,
+                        deadline_us,
+                    )
             else:
                 await self._handle_standard_offer(
                     worker,
@@ -988,6 +1071,43 @@ class EmbeddedWorkerPool:
         if not worker.has_capacity:
             return f"queue_full:{worker.active_count}"
         return None
+
+    async def _send_accept(
+        self,
+        worker: EmbeddedWorker,
+        task_id: str,
+        offer_id: str,
+    ) -> dict:
+        """BeamCore task_accept as the embedded worker (CF path never accepts itself)."""
+        transfer = get_transfer_module()
+        worker_version = str(getattr(transfer, "WORKER_VERSION", "") or "")
+        logger.info(
+            "_workers | task_accept step=send task=%s offer=%s worker=%s slot=%s",
+            short_id(task_id),
+            short_id(offer_id),
+            short_id(worker.worker_id),
+            worker.slot,
+        )
+        started = time.perf_counter()
+        ack = await self.upstream.send_task_accept(
+            str(task_id),
+            worker.worker_id,
+            offer_id=str(offer_id),
+            worker_version=worker_version or None,
+        )
+        latency_ms = (time.perf_counter() - started) * 1000
+        accepted = bool(ack.get("accepted", False))
+        logger.info(
+            "_workers | task_accept step=ack task=%s offer=%s worker=%s "
+            "accepted=%s reason=%s latency_ms=%.1f",
+            short_id(task_id),
+            short_id(offer_id),
+            short_id(worker.worker_id),
+            str(accepted).lower(),
+            ack.get("reason") or ack.get("error") or "-",
+            latency_ms,
+        )
+        return ack
 
     async def _send_result(
         self,
@@ -1037,6 +1157,167 @@ class EmbeddedWorkerPool:
                 ack.get("reason") or ack.get("error") or ack.get("message"),
             )
         return ack
+
+    async def _handle_cloudflare_transfer_offer(
+        self,
+        worker: EmbeddedWorker,
+        offer: dict,
+        task_id: str,
+        offer_id: str,
+        transfer_context: dict,
+        deadline_us: int,
+        *,
+        worker_url: str,
+    ) -> None:
+        """CF Worker does transfer only; embedded worker owns task_accept + task_result."""
+        transfer = get_transfer_module()
+        timeout_sec = float(self.settings.cf_transfer_worker_timeout or 120.0)
+
+        remaining = transfer.remaining_deadline_seconds(deadline_us)
+        if remaining is not None and remaining < 5:
+            reason = f"deadline_too_close:{remaining:.1f}s"
+            logger.warning(
+                "CF transfer skipped: task=%s offer=%s reason=%s",
+                short_id(task_id),
+                short_id(offer_id),
+                reason,
+            )
+            self._log_task_failed(
+                transfer,
+                transfer_context,
+                task_id=str(task_id),
+                offer_id=str(offer_id),
+                reason=reason,
+            )
+            await self._send_result(
+                worker,
+                task_id,
+                offer_id,
+                success=False,
+                error=reason,
+                transfer_context=transfer_context,
+            )
+            return
+
+        logger.info(
+            "_workers | cf_transfer step=offer_accepted task=%s offer=%s "
+            "worker_slot=%s beamcore_worker=%s path=cloudflare_worker "
+            "note=accept_and_result_via_embedded",
+            short_id(task_id),
+            short_id(offer_id),
+            worker.slot,
+            short_id(worker.worker_id),
+        )
+
+        accept_ack = {"accepted": True, "reason": "cf_transfer_send_accept_disabled"}
+        if bool(getattr(self.settings, "cf_transfer_send_accept", True)):
+            accept_ack = await self._send_accept(worker, str(task_id), str(offer_id))
+            if not bool(accept_ack.get("accepted", False)):
+                reason = str(
+                    accept_ack.get("reason")
+                    or accept_ack.get("error")
+                    or "task_accept_rejected"
+                )
+                self._log_task_failed(
+                    transfer,
+                    transfer_context,
+                    task_id=str(task_id),
+                    offer_id=str(offer_id),
+                    reason=f"task_accept:{reason}",
+                )
+                await self._send_result(
+                    worker,
+                    task_id,
+                    offer_id,
+                    success=False,
+                    error=f"task_accept:{reason}",
+                    transfer_context=transfer_context,
+                )
+                return
+        else:
+            logger.info(
+                "_workers | task_accept step=skipped task=%s offer=%s "
+                "reason=CF_TRANSFER_SEND_ACCEPT=false",
+                short_id(task_id),
+                short_id(offer_id),
+            )
+
+        result = await call_cloudflare_transfer_worker(
+            worker_url=worker_url,
+            offer=offer,
+            task_id=str(task_id),
+            offer_id=str(offer_id),
+            timeout_sec=timeout_sec,
+        )
+
+        if not result.success:
+            reason = str(result.error or "cf_transfer_failed")
+            self._log_task_failed(
+                transfer,
+                transfer_context,
+                task_id=str(task_id),
+                offer_id=str(offer_id),
+                reason=reason,
+                etag=result.etag or "",
+            )
+            logger.info(
+                "_workers | cf_transfer step=submit_fail task=%s offer=%s "
+                "part=%s reason=%s",
+                short_id(task_id),
+                short_id(offer_id),
+                result.part_number or "-",
+                reason.replace("\n", " ")[:200],
+            )
+            await self._send_result(
+                worker,
+                task_id,
+                offer_id,
+                success=False,
+                error=reason,
+                etag=result.etag,
+                transfer_context=transfer_context,
+                cached=False,
+            )
+            return
+
+        logger.info(
+            "_workers | cf_transfer step=submit_result task=%s offer=%s "
+            "part=%s etag=%s fetch_ms=%.1f send_ms=%.1f worker=%s",
+            short_id(task_id),
+            short_id(offer_id),
+            result.part_number or "-",
+            result.etag or "-",
+            result.fetch_ms,
+            result.send_ms,
+            short_id(worker.worker_id),
+        )
+        await self._send_result(
+            worker,
+            task_id,
+            offer_id,
+            success=True,
+            etag=result.etag,
+            transfer_context=transfer_context,
+            cached=False,
+        )
+        _log_embedded_task_done(
+            task_id=str(task_id),
+            offer_id=str(offer_id),
+            transfer_context=transfer_context,
+            etag=result.etag or "",
+            cached=False,
+            path="cloudflare_worker",
+            hash_source="response_etag",
+            fetch_ms=result.fetch_ms,
+            send_ms=result.send_ms,
+        )
+        logger.info(
+            "_workers | cf_transfer step=done task=%s offer=%s part=%s etag=%s",
+            short_id(task_id),
+            short_id(offer_id),
+            result.part_number or "-",
+            result.etag or "-",
+        )
 
     async def _handle_predefined_etag_offer(
         self,

@@ -262,6 +262,33 @@ class OrchestratorSettings(BaseSettings):
         ),
     )
     worker_gateway_mode: str = Field(default="in_process", env="WORKER_GATEWAY_MODE")
+    # Optional Cloudflare Worker that streams source→dest and returns etag.
+    # Default for WORKER_N when WORKER_N_CF_TRANSFER_ENABLED is unset.
+    # Per-worker: WORKER_1_CF_TRANSFER_ENABLED=true|false (URL still shared below).
+    cf_transfer_enabled: bool = Field(
+        default=False,
+        env="CF_TRANSFER_ENABLED",
+        description=(
+            "Default CF transfer enable for embedded WORKER_N "
+            "(override with WORKER_N_CF_TRANSFER_ENABLED)"
+        ),
+    )
+    cf_transfer_worker_url: Optional[str] = Field(
+        default=None,
+        env="CF_TRANSFER_WORKER_URL",
+        description="Cloudflare Worker URL for embedded transfer delegation",
+    )
+    cf_transfer_worker_timeout: float = Field(
+        default=120.0,
+        env="CF_TRANSFER_WORKER_TIMEOUT",
+        description="Timeout seconds for CF_TRANSFER_WORKER_URL POST",
+    )
+    # When true, embedded worker sends BeamCore task_accept before CF transfer.
+    cf_transfer_send_accept: bool = Field(
+        default=True,
+        env="CF_TRANSFER_SEND_ACCEPT",
+        description="Embedded worker sends task_accept before CF transfer",
+    )
     global_gateway_url: Optional[str] = Field(default=None, env="GLOBAL_GATEWAY_URL")
     pool_coordinator_ipc: Optional[str] = Field(
         default=None,

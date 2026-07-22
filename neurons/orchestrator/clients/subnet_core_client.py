@@ -848,6 +848,58 @@ class SubnetCoreClient:
         logger.info("Orchestrator ready=%s set on BeamCore (uid=%s)", confirmed, response.get("uid"))
         return confirmed == requested_ready
 
+    async def send_task_accept(
+        self,
+        task_id: str,
+        worker_id: str,
+        offer_id: Optional[str] = None,
+        worker_version: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Accept an offer on BeamCore as the given embedded/external worker."""
+        resolved_offer = offer_id or task_id
+        if not task_id or not worker_id:
+            return {
+                "type": "task_accept_ack",
+                "task_id": task_id,
+                "offer_id": resolved_offer,
+                "accepted": False,
+                "reason": "missing_task_or_worker_id",
+            }
+        message: Dict[str, Any] = {
+            "task_id": task_id,
+            "offer_id": resolved_offer,
+            "worker_id": worker_id,
+        }
+        if worker_version:
+            message["worker_version"] = worker_version
+        try:
+            ack = await self._send_nats_request(
+                "task_accept",
+                message,
+                timeout=max(REQUEST_TIMEOUT, 8.0),
+            )
+            if not isinstance(ack, dict):
+                raise RuntimeError("invalid_task_accept_ack")
+            if "accepted" not in ack and ack.get("type") == "task_accept_ack":
+                # Some BeamCore builds omit accepted=true on success.
+                ack = {**ack, "accepted": True}
+            return ack
+        except Exception as exc:
+            logger.warning(
+                "send_task_accept send error: task=%s offer=%s worker=%s err=%s",
+                task_id,
+                resolved_offer,
+                worker_id,
+                exc,
+            )
+            return {
+                "type": "task_accept_ack",
+                "task_id": task_id,
+                "offer_id": resolved_offer,
+                "accepted": False,
+                "reason": "beamcore_accept_forward_failed",
+            }
+
     async def send_task_result_strict(self, payload: dict) -> Dict[str, Any]:
         task_id = payload.get("task_id")
         offer_id = payload.get("offer_id") or task_id
