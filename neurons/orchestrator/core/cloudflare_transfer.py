@@ -115,11 +115,11 @@ async def call_cloudflare_transfer_worker(
     task_id: str,
     offer_id: str,
     timeout_sec: float = 120.0,
+    client: Optional[httpx.AsyncClient] = None,
 ) -> CloudflareTransferResult:
     """POST offer JSON to Cloudflare Worker; return etag / timings."""
     dest_url = str(offer.get("dest_url") or "")
     part_number = part_number_from_dest_url(dest_url)
-    chunk_size = offer.get("chunk_size")
     url = str(worker_url or "").strip()
     if not url:
         return CloudflareTransferResult(
@@ -128,27 +128,29 @@ async def call_cloudflare_transfer_worker(
             part_number=part_number,
         )
 
-    _log_step(
-        "start",
-        task_id=str(task_id),
-        offer_id=str(offer_id),
-        part=part_number or "-",
-        bytes=chunk_size,
-        worker_url=url,
-    )
-
     started = time.perf_counter()
+    owns_client = client is None
+    http_client = client
+    response: Optional[httpx.Response] = None
+    wall_ms = 0.0
     try:
-        _log_step(
-            "post_worker",
-            task_id=str(task_id),
-            offer_id=str(offer_id),
-            part=part_number or "-",
-            timeout_s=timeout_sec,
+        if owns_client:
+            http_client = httpx.AsyncClient(timeout=httpx.Timeout(timeout_sec))
+        assert http_client is not None
+        response = await http_client.post(
+            url,
+            json=offer,
+            timeout=httpx.Timeout(timeout_sec),
         )
-        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_sec)) as client:
-            response = await client.post(url, json=offer)
         wall_ms = (time.perf_counter() - started) * 1000
+        body_text = response.text
+        data: Optional[dict] = None
+        try:
+            parsed = response.json()
+            if isinstance(parsed, dict):
+                data = parsed
+        except Exception:
+            data = None
     except Exception as exc:
         wall_ms = (time.perf_counter() - started) * 1000
         _log_step(
@@ -165,15 +167,17 @@ async def call_cloudflare_transfer_worker(
             part_number=part_number,
             wall_ms=round(wall_ms, 1),
         )
+    finally:
+        if owns_client and http_client is not None:
+            await http_client.aclose()
 
-    body_text = response.text
-    data: Optional[dict] = None
-    try:
-        parsed = response.json()
-        if isinstance(parsed, dict):
-            data = parsed
-    except Exception:
-        data = None
+    if response is None:
+        return CloudflareTransferResult(
+            success=False,
+            error="cf_transfer_no_response",
+            part_number=part_number,
+            wall_ms=round(wall_ms, 1),
+        )
 
     timings = (data or {}).get("timings_ms") if data else None
     if not isinstance(timings, dict):
@@ -193,7 +197,6 @@ async def call_cloudflare_transfer_worker(
     fetch_ms = _timing("source_fetch", "fetch_ms")
     send_ms = _timing("stream_upload", "upload_attempt", "send_ms")
     json_parse_ms = _timing("json_parse")
-    worker_total_ms = _timing("total_execution", "total_execution_ms")
 
     if response.status_code != 200 or not data or not data.get("success"):
         error = None
@@ -226,18 +229,6 @@ async def call_cloudflare_transfer_worker(
 
     response_part = str(data.get("part_number") or "").strip() or part_number
     etag = normalize_etag(str(data.get("etag") or "") or None)
-    _log_step(
-        "worker_ok",
-        task_id=str(task_id),
-        offer_id=str(offer_id),
-        part=response_part or "-",
-        etag=etag or "-",
-        fetch_ms=f"{fetch_ms:.1f}",
-        send_ms=f"{send_ms:.1f}",
-        worker_total_ms=f"{worker_total_ms:.1f}",
-        wall_ms=f"{wall_ms:.1f}",
-        json_parse_ms=f"{json_parse_ms:.1f}",
-    )
     return CloudflareTransferResult(
         success=True,
         etag=etag,

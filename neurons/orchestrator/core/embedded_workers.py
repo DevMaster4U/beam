@@ -50,9 +50,21 @@ def _log_embedded_task_offer(
     beamcore_worker_id: str = "",
 ) -> None:
     # hash/etag are only known after upload — logged on task_done, not here.
+    # CF path: keep offer log short (no signed URLs / no task_offer_info dump).
     chunk_id = chunk_id_from_transfer_context(transfer_context)
-    src = str(transfer_context.get("source_url") or "")
-    dest = str(transfer_context.get("dest_url") or "")
+    if path == "cloudflare_worker":
+        fields = [
+            f"{_WORKERS_LOG} task_offer task={short_id(task_id)}",
+            f"offer={short_id(offer_id)}",
+            f"worker_slot={worker_slot}",
+            f"chunk_id={chunk_id if chunk_id is not None else '?'}",
+            f"range={transfer_context_range_label(transfer_context)}",
+            f"path={path}",
+        ]
+        logger.info(" ".join(fields))
+        return
+
+    src, dest = transfer_context_urls(transfer_context)
     fields = [
         f"{_WORKERS_LOG} task_offer task={task_id}",
         f"offer={offer_id}",
@@ -432,7 +444,6 @@ class EmbeddedWorkerPool:
         self._hybrid_used_ips: set[str] = set()
         self._cf_urls: List[str] = []
         self._cf_rr_index = 0
-        self._cf_rr_lock = asyncio.Lock()
 
     @property
     def worker_count(self) -> int:
@@ -469,18 +480,15 @@ class EmbeddedWorkerPool:
     def _cf_transfer_active(self, worker: Optional["EmbeddedWorker"] = None) -> bool:
         return bool(self._cf_url_pool(worker))
 
-    async def _pick_cf_transfer_url(
-        self, worker: Optional["EmbeddedWorker"] = None
-    ) -> str:
-        """Round-robin pick from the worker's CF URL pool."""
+    def _pick_cf_transfer_url(self, worker: Optional["EmbeddedWorker"] = None) -> str:
+        """Round-robin pick from the worker's CF URL pool (sync — no await gap)."""
         urls = self._cf_url_pool(worker)
         if not urls:
             return ""
         if len(urls) == 1:
             return urls[0]
-        async with self._cf_rr_lock:
-            idx = self._cf_rr_index % len(urls)
-            self._cf_rr_index += 1
+        idx = self._cf_rr_index % len(urls)
+        self._cf_rr_index += 1
         return urls[idx]
 
     def _spread_used_ips(self, batch_used_ips: set[str]) -> set[str]:
@@ -1079,7 +1087,7 @@ class EmbeddedWorkerPool:
                 )
 
             if transfer.uses_predefined_etag_early_submit(transfer_context):
-                cf_url = await self._pick_cf_transfer_url(worker)
+                cf_url = self._pick_cf_transfer_url(worker)
                 if cf_url:
                     await self._handle_cloudflare_transfer_offer(
                         worker,
@@ -1224,7 +1232,7 @@ class EmbeddedWorkerPool:
         *,
         worker_url: str,
     ) -> None:
-        """CF Worker does transfer only; embedded worker owns task_accept + task_result."""
+        """CF Worker does transfer only; embedded worker owns task_result."""
         transfer = get_transfer_module()
         timeout_sec = float(self.settings.cf_transfer_worker_timeout or 120.0)
 
@@ -1254,18 +1262,6 @@ class EmbeddedWorkerPool:
             )
             return
 
-        logger.info(
-            "_workers | cf_transfer step=offer_accepted task=%s offer=%s "
-            "worker_slot=%s beamcore_worker=%s path=cloudflare_worker "
-            "cf_worker_url=%s note=accept_and_result_via_embedded",
-            short_id(task_id),
-            short_id(offer_id),
-            worker.slot,
-            short_id(worker.worker_id),
-            worker_url,
-        )
-
-        accept_ack = {"accepted": True, "reason": "cf_transfer_send_accept_disabled"}
         if bool(getattr(self.settings, "cf_transfer_send_accept", False)):
             accept_ack = await self._send_accept(worker, str(task_id), str(offer_id))
             if not bool(accept_ack.get("accepted", False)):
@@ -1290,13 +1286,6 @@ class EmbeddedWorkerPool:
                     transfer_context=transfer_context,
                 )
                 return
-        else:
-            logger.info(
-                "_workers | task_accept step=skipped task=%s offer=%s "
-                "reason=CF_TRANSFER_SEND_ACCEPT=false",
-                short_id(task_id),
-                short_id(offer_id),
-            )
 
         result = await call_cloudflare_transfer_worker(
             worker_url=worker_url,
@@ -1304,6 +1293,7 @@ class EmbeddedWorkerPool:
             task_id=str(task_id),
             offer_id=str(offer_id),
             timeout_sec=timeout_sec,
+            client=self.http_client,
         )
 
         if not result.success:
@@ -1315,14 +1305,6 @@ class EmbeddedWorkerPool:
                 offer_id=str(offer_id),
                 reason=reason,
                 etag=result.etag or "",
-            )
-            logger.info(
-                "_workers | cf_transfer step=submit_fail task=%s offer=%s "
-                "part=%s reason=%s",
-                short_id(task_id),
-                short_id(offer_id),
-                result.part_number or "-",
-                reason.replace("\n", " ")[:200],
             )
             await self._send_result(
                 worker,
@@ -1336,17 +1318,6 @@ class EmbeddedWorkerPool:
             )
             return
 
-        logger.info(
-            "_workers | cf_transfer step=submit_result task=%s offer=%s "
-            "part=%s etag=%s fetch_ms=%.1f send_ms=%.1f worker=%s",
-            short_id(task_id),
-            short_id(offer_id),
-            result.part_number or "-",
-            result.etag or "-",
-            result.fetch_ms,
-            result.send_ms,
-            short_id(worker.worker_id),
-        )
         await self._send_result(
             worker,
             task_id,
@@ -1366,13 +1337,6 @@ class EmbeddedWorkerPool:
             hash_source="response_etag",
             fetch_ms=result.fetch_ms,
             send_ms=result.send_ms,
-        )
-        logger.info(
-            "_workers | cf_transfer step=done task=%s offer=%s part=%s etag=%s",
-            short_id(task_id),
-            short_id(offer_id),
-            result.part_number or "-",
-            result.etag or "-",
         )
 
     async def _handle_predefined_etag_offer(
