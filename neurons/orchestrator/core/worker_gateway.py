@@ -434,13 +434,16 @@ class WorkerGateway:
             },
         )
         logger.info(
-            "_workers | reassigned task=%s offer=%s from=%s to=%s reason=%s attempted=%d",
-            short_id(task_id),
-            short_id(offer_id),
-            short_id(worker_id),
-            short_id(next_worker),
+            "_workers | reassigned task=%s offer=%s from=%s to=%s reason=%s attempted=%d "
+            "src=%s dest=%s",
+            task_id,
+            offer_id,
+            worker_id,
+            next_worker,
             msg.get("error"),
             len(attempted),
+            offer.get("source_url") or "-",
+            offer.get("dest_url") or "-",
         )
         return True
 
@@ -463,6 +466,26 @@ class WorkerGateway:
                 offer_id = offer.get("offer_id") or offer.get("task_id")
                 if offer_id:
                     self.mark_worker_busy(worker_id, str(offer_id))
+            offer_id = str(offer.get("offer_id") or offer.get("task_id") or "")
+            logger.info(
+                "_workers | task_offer_full worker=%s task=%s offer=%s "
+                "src=%s dest=%s chunk_size=%s range=%s etag_required=%s "
+                "transfer_id=%s offer_json=%s",
+                short_id(worker_id),
+                offer.get("task_id"),
+                offer.get("offer_id"),
+                offer.get("source_url") or "-",
+                offer.get("dest_url") or "-",
+                offer.get("chunk_size"),
+                (
+                    (offer.get("source_headers") or {}).get("Range")
+                    or (offer.get("source_headers") or {}).get("range")
+                    or "-"
+                ),
+                offer.get("etag_required"),
+                offer.get("transfer_id") or "-",
+                json.dumps(offer, separators=(",", ":"), default=str),
+            )
             return True
         except Exception as exc:
             logger.warning("deliver_task_offer send failed for %s: %s", worker_id, exc)

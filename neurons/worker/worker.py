@@ -2451,6 +2451,59 @@ def resolve_task_path(
     return "miss"
 
 
+def format_full_task_info(
+    task: Optional[dict] = None,
+    transfer_context: Optional[dict] = None,
+) -> str:
+    """Serialize full task/transfer fields for logs (URLs not redacted)."""
+    payload: dict[str, Any] = {}
+    preferred = (
+        "task_id",
+        "offer_id",
+        "transfer_id",
+        "source_url",
+        "dest_url",
+        "chunk_size",
+        "chunk_hash",
+        "chunk_hashes",
+        "etag_required",
+        "deadline_us",
+        "source_headers",
+        "dest_headers",
+        "signed_url_flow",
+        "minimum_worker_version",
+        "total_size",
+        "total_bytes",
+        "file_size",
+        "worker_id",
+        "batch_id",
+    )
+    if isinstance(task, dict):
+        for key in preferred:
+            if key in task and task[key] is not None:
+                payload[key] = task[key]
+        for key, value in task.items():
+            if key in payload or key == "type":
+                continue
+            payload[key] = value
+    if isinstance(transfer_context, dict):
+        payload["transfer_context"] = {
+            "source_url": transfer_context.get("source_url"),
+            "dest_url": transfer_context.get("dest_url"),
+            "range_start": transfer_context.get("range_start"),
+            "range_end": transfer_context.get("range_end"),
+            "chunk_size": transfer_context.get("chunk_size"),
+            "total_size": transfer_context.get("total_size"),
+            "etag_required": transfer_context.get("etag_required"),
+            "transfer_id": transfer_context.get("transfer_id"),
+            "signed_url_flow": transfer_context.get("signed_url_flow"),
+            "minimum_worker_version": transfer_context.get("minimum_worker_version"),
+            "source_headers": transfer_context.get("source_headers"),
+            "dest_headers": transfer_context.get("dest_headers"),
+        }
+    return json.dumps(payload, separators=(",", ":"), default=str)
+
+
 def log_task_start(
     log_prefix: str,
     task_id: str,
@@ -2459,8 +2512,9 @@ def log_task_start(
     *,
     state: Optional["WorkerState"] = None,
     estimated_bytes: int = 0,
+    task: Optional[dict] = None,
 ) -> None:
-    """Detailed task-offer / start log (path, cache flags, chunk, capacity)."""
+    """Detailed task-offer / start log (full URLs + path/cache/capacity)."""
     try:
         range_start = int(transfer_context["range_start"])
         range_end = int(transfer_context["range_end"])
@@ -2470,18 +2524,20 @@ def log_task_start(
     chunk_id = chunk_id_from_transfer_context(transfer_context)
     path = resolve_task_path(transfer_context)
     cache_hit = has_predefined_etag_chunk_data(transfer_context)
+    source_url = str(transfer_context.get("source_url") or "")
+    dest_url = str(transfer_context.get("dest_url") or "")
     fields = [
-        f"{log_prefix} task_start task={task_label(task_id)}",
-        f"offer={task_label(offer_id)}",
+        f"{log_prefix} task_start task={task_id}",
+        f"offer={offer_id}",
         f"chunk_id={chunk_id if chunk_id is not None else '?'}",
-        f"src={redact_url(str(transfer_context.get('source_url') or ''))}",
-        f"dest={redact_url(str(transfer_context.get('dest_url') or ''))}",
         f"range={range_label}",
         f"path={path}",
         f"cache_hit={str(cache_hit).lower()}",
         f"use_cache={str(WORKER_USE_CACHE_FILE).lower()}",
         f"early_submit={str(WORKER_PREDEFINED_ETAG_EARLY_SUBMIT).lower()}",
         f"verify_hash={str(WORKER_VERIFY_CHUNK_HASH).lower()}",
+        f"etag_required={str(bool(transfer_context.get('etag_required'))).lower()}",
+        f"transfer_id={transfer_context.get('transfer_id') or '-'}",
     ]
     if state is not None:
         fields.append(
@@ -2491,6 +2547,12 @@ def log_task_start(
             f"reserve={estimated_bytes}"
         )
     print(" ".join(fields))
+    print(f"{log_prefix} task_start_src task={task_id} src={source_url}")
+    print(f"{log_prefix} task_start_dest task={task_id} dest={dest_url}")
+    print(
+        f"{log_prefix} task_info task={task_id} offer={offer_id} "
+        f"{format_full_task_info(task, transfer_context)}"
+    )
 
 
 def predefined_etag_early_submit_skip_reasons(transfer_context: dict) -> list[str]:
@@ -2519,12 +2581,16 @@ def predefined_etag_early_submit_skip_reasons(transfer_context: dict) -> list[st
     return reasons
 
 
-def format_task_offer_log(offer: dict) -> str:
-    """Serialize a task offer for logs with signed URLs redacted."""
+def format_task_offer_log(offer: dict, *, full_urls: bool = False) -> str:
+    """Serialize a task offer for logs.
+
+    By default signed URLs are redacted; pass full_urls=True for complete URLs.
+    """
     payload = dict(offer)
-    for key in ("source_url", "dest_url"):
-        if key in payload:
-            payload[key] = redact_url(str(payload[key]))
+    if not full_urls:
+        for key in ("source_url", "dest_url"):
+            if key in payload:
+                payload[key] = redact_url(str(payload[key]))
     return json.dumps(payload, separators=(",", ":"), default=str)
 
 
@@ -2543,7 +2609,7 @@ def log_predefined_etag_fast_path_skipped(
     print(
         f"{log_prefix} Predefined ETag fast path skipped "
         f"task={task_label(task_id)} offer={task_label(offer_id)} "
-        f"reasons={'; '.join(reasons)} offer_msg={format_task_offer_log(offer)}"
+        f"reasons={'; '.join(reasons)} offer_msg={format_task_offer_log(offer, full_urls=True)}"
     )
 
 
@@ -2615,8 +2681,10 @@ def _log_task_done(
         transfer_context, used_cache=cached, send_ms=send_ms
     )
     chunk_id = chunk_id_from_transfer_context(transfer_context)
+    source_url = str(transfer_context.get("source_url") or "")
+    dest_url = str(transfer_context.get("dest_url") or "")
     print(
-        f"{log_prefix} task_done task={task_label(task_id)} offer={task_label(offer_id)} "
+        f"{log_prefix} task_done task={task_id} offer={offer_id} "
         f"chunk_id={chunk_id if chunk_id is not None else '?'} "
         f"range={transfer_context.get('range_start')}-{transfer_context.get('range_end')} "
         f"bytes={bytes_count} path={path_label} cached={str(cached).lower()} "
@@ -2628,6 +2696,12 @@ def _log_task_done(
         f"verify_hash={str(WORKER_VERIFY_CHUNK_HASH).lower()} "
         f"load_ms={load_ms:.1f} hash_ms={hash_ms:.1f} etag_ms={etag_ms:.1f} "
         f"fetch_ms={fetch_ms:.1f} send_ms={send_ms:.1f} wall_ms={total_ms:.1f} mbps={mbps:.1f}"
+    )
+    print(f"{log_prefix} task_done_src task={task_id} src={source_url}")
+    print(f"{log_prefix} task_done_dest task={task_id} dest={dest_url}")
+    print(
+        f"{log_prefix} task_done_info task={task_id} offer={offer_id} "
+        f"{format_full_task_info(None, transfer_context)}"
     )
 
 
@@ -4283,6 +4357,7 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
         transfer_context,
         state=state,
         estimated_bytes=estimated_bytes,
+        task=task,
     )
 
     log_predefined_etag_fast_path_skipped(
