@@ -264,7 +264,10 @@ class OrchestratorSettings(BaseSettings):
     worker_gateway_mode: str = Field(default="in_process", env="WORKER_GATEWAY_MODE")
     # Optional Cloudflare Worker that streams source→dest and returns etag.
     # Default for WORKER_N when WORKER_N_CF_TRANSFER_ENABLED is unset.
-    # Per-worker: WORKER_1_CF_TRANSFER_ENABLED=true|false (URL still shared below).
+    # Per-worker: WORKER_1_CF_TRANSFER_ENABLED=true|false
+    # URLs: CF_TRANSFER_WORKER_URLS (preferred) and/or CF_TRANSFER_WORKER_URL
+    # (comma/space separated). Round-robin across the pool.
+    # Optional per-slot override: WORKER_N_CF_TRANSFER_WORKER_URL(S)
     cf_transfer_enabled: bool = Field(
         default=False,
         env="CF_TRANSFER_ENABLED",
@@ -276,16 +279,22 @@ class OrchestratorSettings(BaseSettings):
     cf_transfer_worker_url: Optional[str] = Field(
         default=None,
         env="CF_TRANSFER_WORKER_URL",
-        description="Cloudflare Worker URL for embedded transfer delegation",
+        description="Cloudflare Worker URL(s); comma-separated OK (legacy single/list)",
+    )
+    cf_transfer_worker_urls: Optional[str] = Field(
+        default=None,
+        env="CF_TRANSFER_WORKER_URLS",
+        description="Comma/space-separated Cloudflare Worker URL pool (round-robin)",
     )
     cf_transfer_worker_timeout: float = Field(
         default=120.0,
         env="CF_TRANSFER_WORKER_TIMEOUT",
-        description="Timeout seconds for CF_TRANSFER_WORKER_URL POST",
+        description="Timeout seconds for CF transfer Worker POST",
     )
     # When true, embedded worker sends BeamCore task_accept before CF transfer.
+    # Default false: orch NATS identity cannot publish task_accept (permissions).
     cf_transfer_send_accept: bool = Field(
-        default=True,
+        default=False,
         env="CF_TRANSFER_SEND_ACCEPT",
         description="Embedded worker sends task_accept before CF transfer",
     )
@@ -486,6 +495,15 @@ class OrchestratorSettings(BaseSettings):
         if not self.client_pre_approved_hotkeys:
             return []
         return [h.strip() for h in self.client_pre_approved_hotkeys.split(",") if h.strip()]
+
+    def get_cf_transfer_worker_urls(self) -> List[str]:
+        """Global CF Worker URL pool from CF_TRANSFER_WORKER_URLS + CF_TRANSFER_WORKER_URL."""
+        from core.cloudflare_transfer import parse_cf_transfer_urls
+
+        return parse_cf_transfer_urls(
+            self.cf_transfer_worker_urls,
+            self.cf_transfer_worker_url,
+        )
 
     def get_client_admin_hotkeys(self) -> List[str]:
         """Parse client admin hotkeys from comma-separated string."""

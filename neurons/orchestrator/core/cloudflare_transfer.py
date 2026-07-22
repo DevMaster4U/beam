@@ -8,9 +8,10 @@ submits task_result to BeamCore (same as embedded worker success path).
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
@@ -18,6 +19,40 @@ import httpx
 from core.relay_log import short_id
 
 logger = logging.getLogger(__name__)
+
+_URL_SPLIT_RE = re.compile(r"[\s,;]+")
+
+
+def parse_cf_transfer_urls(*parts: Optional[str]) -> list[str]:
+    """Parse one or more CF Worker URL strings (comma/space/semicolon separated)."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        if part is None:
+            continue
+        text = str(part).strip()
+        if not text:
+            continue
+        for token in _URL_SPLIT_RE.split(text):
+            url = token.strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            out.append(url)
+    return out
+
+
+def merge_cf_transfer_urls(*groups: Iterable[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for url in group:
+            clean = str(url or "").strip()
+            if not clean or clean in seen:
+                continue
+            seen.add(clean)
+            out.append(clean)
+    return out
 
 
 @dataclass

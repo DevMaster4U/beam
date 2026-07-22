@@ -23,7 +23,10 @@ import bittensor as bt
 import httpx
 
 from core.config import OrchestratorSettings
-from core.cloudflare_transfer import call_cloudflare_transfer_worker
+from core.cloudflare_transfer import (
+    call_cloudflare_transfer_worker,
+    parse_cf_transfer_urls,
+)
 from core.relay_log import (
     chunk_id_from_transfer_context,
     short_id,
@@ -197,6 +200,7 @@ class EmbeddedWorkerConfig:
     initial_order: int = 0
     max_concurrent_tasks: int = 4
     cf_transfer_enabled: bool = False
+    cf_transfer_worker_urls: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -211,6 +215,7 @@ class EmbeddedWorker:
     initial_order: int = 0
     max_concurrent_tasks: int = 4
     cf_transfer_enabled: bool = False
+    cf_transfer_worker_urls: List[str] = field(default_factory=list)
     http_client: Optional[httpx.AsyncClient] = None
     active_offer_ids: Set[str] = field(default_factory=set)
 
@@ -278,6 +283,11 @@ def parse_embedded_worker_configs(settings: OrchestratorSettings) -> List[Embedd
                 getattr(settings, "cf_transfer_enabled", False)
             )
 
+        cf_transfer_worker_urls = parse_cf_transfer_urls(
+            os.environ.get(f"WORKER_{idx}_CF_TRANSFER_WORKER_URLS", ""),
+            os.environ.get(f"WORKER_{idx}_CF_TRANSFER_WORKER_URL", ""),
+        )
+
         configs.append(
             EmbeddedWorkerConfig(
                 slot=idx,
@@ -286,6 +296,7 @@ def parse_embedded_worker_configs(settings: OrchestratorSettings) -> List[Embedd
                 initial_order=initial_order,
                 max_concurrent_tasks=max_concurrent,
                 cf_transfer_enabled=cf_transfer_enabled,
+                cf_transfer_worker_urls=cf_transfer_worker_urls,
             )
         )
         idx += 1
@@ -419,6 +430,9 @@ class EmbeddedWorkerPool:
         self._worker_gateway: Optional[Any] = None
         # Cross-batch IP spread for in_process hybrid (BeamCore often sends offers=1).
         self._hybrid_used_ips: set[str] = set()
+        self._cf_urls: List[str] = []
+        self._cf_rr_index = 0
+        self._cf_rr_lock = asyncio.Lock()
 
     @property
     def worker_count(self) -> int:
@@ -430,18 +444,44 @@ class EmbeddedWorkerPool:
         if gateway is None:
             self._hybrid_used_ips.clear()
 
-    def _cf_transfer_url(self, worker: Optional["EmbeddedWorker"] = None) -> str:
-        """Return CF worker URL when this embedded worker has CF transfer enabled."""
+    def _cf_url_pool(self, worker: Optional["EmbeddedWorker"] = None) -> List[str]:
+        """CF Worker URLs for this slot (per-slot override, else global pool)."""
         if worker is not None and not bool(getattr(worker, "cf_transfer_enabled", False)):
-            return ""
+            return []
         if worker is None and not any(
             bool(getattr(w, "cf_transfer_enabled", False)) for w in self.workers
         ):
-            return ""
-        return (self.settings.cf_transfer_worker_url or "").strip()
+            return []
+        slot_urls = (
+            list(getattr(worker, "cf_transfer_worker_urls", None) or [])
+            if worker is not None
+            else []
+        )
+        if slot_urls:
+            return slot_urls
+        return list(self._cf_urls)
+
+    def _cf_transfer_url(self, worker: Optional["EmbeddedWorker"] = None) -> str:
+        """Compatibility: first URL when CF is active for this worker."""
+        urls = self._cf_url_pool(worker)
+        return urls[0] if urls else ""
 
     def _cf_transfer_active(self, worker: Optional["EmbeddedWorker"] = None) -> bool:
-        return bool(self._cf_transfer_url(worker))
+        return bool(self._cf_url_pool(worker))
+
+    async def _pick_cf_transfer_url(
+        self, worker: Optional["EmbeddedWorker"] = None
+    ) -> str:
+        """Round-robin pick from the worker's CF URL pool."""
+        urls = self._cf_url_pool(worker)
+        if not urls:
+            return ""
+        if len(urls) == 1:
+            return urls[0]
+        async with self._cf_rr_lock:
+            idx = self._cf_rr_index % len(urls)
+            self._cf_rr_index += 1
+        return urls[idx]
 
     def _spread_used_ips(self, batch_used_ips: set[str]) -> set[str]:
         """IPs already used in this batch plus recent cross-batch hybrid assignments."""
@@ -471,28 +511,38 @@ class EmbeddedWorkerPool:
             limits=httpx.Limits(max_connections=64, max_keepalive_connections=32),
         )
 
-        cf_url = (self.settings.cf_transfer_worker_url or "").strip()
+        self._cf_urls = list(self.settings.get_cf_transfer_worker_urls())
         cf_slots = [cfg.slot for cfg in configs if cfg.cf_transfer_enabled]
+        slot_overrides = {
+            cfg.slot: cfg.cf_transfer_worker_urls
+            for cfg in configs
+            if cfg.cf_transfer_enabled and cfg.cf_transfer_worker_urls
+        }
         if cf_slots:
-            if cf_url:
+            if self._cf_urls or slot_overrides:
                 logger.info(
-                    "Embedded CF transfer ENABLED slots=%s url=%s timeout_s=%.1f "
-                    "send_accept=%s",
+                    "Embedded CF transfer ENABLED slots=%s urls=%s "
+                    "slot_url_overrides=%s timeout_s=%.1f send_accept=%s",
                     cf_slots,
-                    cf_url,
+                    self._cf_urls,
+                    {k: v for k, v in slot_overrides.items()},
                     float(self.settings.cf_transfer_worker_timeout or 120.0),
-                    str(bool(getattr(self.settings, "cf_transfer_send_accept", True))).lower(),
+                    str(
+                        bool(getattr(self.settings, "cf_transfer_send_accept", False))
+                    ).lower(),
                 )
             else:
                 logger.warning(
-                    "CF transfer enabled for slots=%s but CF_TRANSFER_WORKER_URL is empty; "
+                    "CF transfer enabled for slots=%s but no CF_TRANSFER_WORKER_URL(S); "
                     "those slots will use normal local transfer",
                     cf_slots,
                 )
-        elif cf_url:
+        elif self._cf_urls:
             logger.info(
-                "CF_TRANSFER_WORKER_URL is set but no WORKER_N_CF_TRANSFER_ENABLED "
-                "(and CF_TRANSFER_ENABLED=false); using normal local transfer"
+                "CF_TRANSFER_WORKER_URL(S) set (%s urls) but no "
+                "WORKER_N_CF_TRANSFER_ENABLED (and CF_TRANSFER_ENABLED=false); "
+                "using normal local transfer",
+                len(self._cf_urls),
             )
 
         for cfg in configs:
@@ -537,15 +587,20 @@ class EmbeddedWorkerPool:
                 initial_order=cfg.initial_order,
                 max_concurrent_tasks=cfg.max_concurrent_tasks,
                 cf_transfer_enabled=cfg.cf_transfer_enabled,
+                cf_transfer_worker_urls=list(cfg.cf_transfer_worker_urls),
                 http_client=worker_client,
             )
             self.workers.append(worker)
             logger.info(
-                "Embedded worker ready slot=%s worker_id=%s hotkey=%s cf_transfer=%s",
+                "Embedded worker ready slot=%s worker_id=%s hotkey=%s "
+                "cf_transfer=%s cf_urls=%s",
                 cfg.slot,
                 short_id(worker_id),
                 hotkey[:16],
                 str(bool(cfg.cf_transfer_enabled)).lower(),
+                cfg.cf_transfer_worker_urls
+                if cfg.cf_transfer_worker_urls
+                else (self._cf_urls if cfg.cf_transfer_enabled else []),
             )
 
         logger.info(
@@ -1024,7 +1079,7 @@ class EmbeddedWorkerPool:
                 )
 
             if transfer.uses_predefined_etag_early_submit(transfer_context):
-                cf_url = self._cf_transfer_url(worker)
+                cf_url = await self._pick_cf_transfer_url(worker)
                 if cf_url:
                     await self._handle_cloudflare_transfer_offer(
                         worker,
@@ -1202,15 +1257,16 @@ class EmbeddedWorkerPool:
         logger.info(
             "_workers | cf_transfer step=offer_accepted task=%s offer=%s "
             "worker_slot=%s beamcore_worker=%s path=cloudflare_worker "
-            "note=accept_and_result_via_embedded",
+            "cf_worker_url=%s note=accept_and_result_via_embedded",
             short_id(task_id),
             short_id(offer_id),
             worker.slot,
             short_id(worker.worker_id),
+            worker_url,
         )
 
         accept_ack = {"accepted": True, "reason": "cf_transfer_send_accept_disabled"}
-        if bool(getattr(self.settings, "cf_transfer_send_accept", True)):
+        if bool(getattr(self.settings, "cf_transfer_send_accept", False)):
             accept_ack = await self._send_accept(worker, str(task_id), str(offer_id))
             if not bool(accept_ack.get("accepted", False)):
                 reason = str(

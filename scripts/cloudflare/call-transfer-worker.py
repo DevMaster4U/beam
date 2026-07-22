@@ -26,6 +26,7 @@ if str(_ORCH) not in sys.path:
 
 from core.cloudflare_transfer import (  # noqa: E402
     call_cloudflare_transfer_worker,
+    parse_cf_transfer_urls,
     part_number_from_dest_url,
 )
 
@@ -44,18 +45,29 @@ def _load_task(path: str) -> dict:
 
 async def _amain(args: argparse.Namespace) -> int:
     task = _load_task(args.task)
-    worker_url = (
-        args.worker_url
-        or os.environ.get("CF_TRANSFER_WORKER_URL")
-        or ""
-    ).strip()
-    if not worker_url:
-        print("need --worker-url or CF_TRANSFER_WORKER_URL", file=sys.stderr)
+    urls = parse_cf_transfer_urls(
+        args.worker_url,
+        os.environ.get("CF_TRANSFER_WORKER_URLS"),
+        os.environ.get("CF_TRANSFER_WORKER_URL"),
+    )
+    if not urls:
+        print(
+            "need --worker-url or CF_TRANSFER_WORKER_URL(S)",
+            file=sys.stderr,
+        )
         return 2
 
     task_id = str(task.get("task_id") or "manual")
     offer_id = str(task.get("offer_id") or task_id)
     part = part_number_from_dest_url(str(task.get("dest_url") or ""))
+    # Round-robin across the pool when testing multiple URLs.
+    worker_url = urls[0]
+    if len(urls) > 1:
+        # Stable-ish pick by offer/task id so repeats are reproducible.
+        seed = sum(ord(c) for c in (offer_id or task_id))
+        worker_url = urls[seed % len(urls)]
+        print(f"pool={len(urls)} urls picked={worker_url}")
+
     print(f"POST {worker_url} task={task_id} offer={offer_id} part={part or '-'}")
 
     result = await call_cloudflare_transfer_worker(
@@ -83,7 +95,7 @@ def main() -> int:
     parser.add_argument(
         "--worker-url",
         default="",
-        help="Cloudflare Worker URL (default CF_TRANSFER_WORKER_URL)",
+        help="CF Worker URL(s), comma-separated (default CF_TRANSFER_WORKER_URLS/URL)",
     )
     parser.add_argument("--timeout", type=float, default=120.0)
     return asyncio.run(_amain(parser.parse_args()))
