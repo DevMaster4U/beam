@@ -3397,6 +3397,53 @@ def release_ws_capacity(
     state.active_ws_task_ids.discard(task_id)
 
 
+def clear_worker_ws_queue(state: WorkerState, *, reason: str) -> dict[str, int]:
+    """Clear local WS task queue/capacity (e.g. after orchestrator restart reconnect).
+
+    Cancels in-flight WS task handlers and drops reserved slots so a reconnect
+    starts with a clean capacity budget. Restarting the orchestrator forces
+    workers to reconnect and run this path.
+    """
+    cancelled = 0
+    for handle in list(state.ws_task_handles):
+        if not handle.done():
+            handle.cancel()
+            cancelled += 1
+
+    pending_acks = 0
+    for _key, future in list(state.pending_task_results.items()):
+        if not future.done():
+            future.set_result(
+                TaskSummaryAck(
+                    received=False,
+                    status="rejected",
+                    reason=f"queue_cleared:{reason}",
+                )
+            )
+            pending_acks += 1
+    state.pending_task_results.clear()
+
+    stats = {
+        "cancelled_tasks": cancelled,
+        "pending_acks": pending_acks,
+        "slots": int(state.reserved_ws_slots),
+        "active_ids": len(state.active_ws_task_ids),
+        "reserved_bytes": int(state.reserved_bytes),
+    }
+    state.active_ws_task_ids.clear()
+    state.reserved_ws_slots = 0
+    state.reserved_bytes = 0
+    state.active_tasks = 0
+
+    print(
+        f"[Worker] [WS] Cleared worker queue reason={reason} "
+        f"cancelled={stats['cancelled_tasks']} pending_acks={stats['pending_acks']} "
+        f"slots={stats['slots']} active_ids={stats['active_ids']} "
+        f"reserved_bytes={stats['reserved_bytes']}"
+    )
+    return stats
+
+
 async def execute_transfer(
     state: WorkerState,
     task_id: str,
@@ -4354,6 +4401,9 @@ async def websocket_loop(state: WorkerState):
 
                             if msg_type == "connected":
                                 print("[Worker] [WS] Server confirmed connection")
+                                # Orch restart / reconnect: drop stale in-flight queue so
+                                # reserved slots cannot stay stuck at queue_full.
+                                clear_worker_ws_queue(state, reason="gateway_connected")
                                 await ws_send_worker_hello(websocket, state)
 
                             elif msg_type == "task_offer":
@@ -4395,6 +4445,7 @@ async def websocket_loop(state: WorkerState):
 
                     except ConnectionClosed as e:
                         print(f"[Worker] [WS] Connection closed: {e.code} {e.reason}")
+                        clear_worker_ws_queue(state, reason="gateway_disconnected")
                         break
 
         except InvalidStatus as e:

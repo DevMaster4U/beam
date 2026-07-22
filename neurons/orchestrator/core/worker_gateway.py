@@ -140,10 +140,13 @@ class WorkerGateway:
         was_empty = len(self._sessions) == 0
         self._sessions[worker_id] = ws
         profile = self._get_profile(worker_id)
+        # Fresh session after orch restart / reconnect: drop stale busy marks so
+        # scheduling capacity matches the worker's cleared local queue.
+        profile.active_offer_ids.clear()
         if ip.strip():
             profile.ip = ip.strip()
         logger.info(
-            "Worker connected: %s version=%s ip=%s (%d/%d)",
+            "Worker connected: %s version=%s ip=%s (%d/%d) queue_cleared=true",
             worker_id,
             profile.worker_version or "?",
             profile.ip or "?",
