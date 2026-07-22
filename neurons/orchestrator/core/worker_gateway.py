@@ -107,6 +107,9 @@ class WorkerGateway:
         self._terminal_result_order = deque()
         # offer_id → transfer_context-like dict for completion logs
         self._offer_contexts: Dict[str, dict] = {}
+        # offer_id → full task_offer payload for capacity-reject reassignment
+        self._pending_offers: Dict[str, dict] = {}
+        self._offer_attempted_workers: Dict[str, Set[str]] = {}
 
     def set_upstream(self, upstream: object) -> None:
         self._upstream = upstream
@@ -335,6 +338,112 @@ class WorkerGateway:
                 etag,
             )
 
+    def _remember_pending_offer(self, worker_id: str, offer: dict) -> None:
+        """Keep offer payload so queue_full can re-deliver to another worker."""
+        offer_id = str(offer.get("offer_id") or offer.get("task_id") or "").strip()
+        if not offer_id:
+            return
+        # Store a shallow copy so later mutations cannot corrupt redelivery.
+        self._pending_offers[offer_id] = dict(offer)
+        attempted = self._offer_attempted_workers.setdefault(offer_id, set())
+        attempted.add(str(worker_id))
+        while len(self._pending_offers) > 5000:
+            expired = next(iter(self._pending_offers))
+            self._pending_offers.pop(expired, None)
+            self._offer_attempted_workers.pop(expired, None)
+
+    def _clear_pending_offer(self, offer_id: Optional[str]) -> None:
+        if not offer_id:
+            return
+        key = str(offer_id)
+        self._pending_offers.pop(key, None)
+        self._offer_attempted_workers.pop(key, None)
+
+    @staticmethod
+    def _is_capacity_reject_error(error: object) -> bool:
+        text = str(error or "").strip().lower()
+        return text.startswith("queue_full") or text.startswith("memory_budget")
+
+    async def _maybe_reassign_on_capacity_reject(
+        self, worker_id: str, msg: dict
+    ) -> bool:
+        """If worker rejected for queue/memory, re-deliver offer to another worker.
+
+        Returns True when the offer was handed off (do not relay failure upstream).
+        """
+        if bool(msg.get("success")):
+            return False
+        if not self._is_capacity_reject_error(msg.get("error")):
+            return False
+
+        task_id = msg.get("task_id")
+        offer_id = str(msg.get("offer_id") or task_id or "").strip()
+        if not offer_id:
+            return False
+
+        offer = self._pending_offers.get(offer_id)
+        if not offer:
+            logger.warning(
+                "capacity reject without pending offer: task=%s offer=%s worker=%s error=%s",
+                short_id(task_id),
+                short_id(offer_id),
+                short_id(worker_id),
+                msg.get("error"),
+            )
+            return False
+
+        attempted = self._offer_attempted_workers.setdefault(offer_id, set())
+        attempted.add(str(worker_id))
+        # Free this worker's busy mark before selecting a replacement.
+        self.mark_worker_idle(worker_id, offer_id)
+
+        next_worker = self.select_worker_round_robin(exclude_worker_ids=attempted)
+        if not next_worker:
+            logger.warning(
+                "capacity reject: no alternate worker task=%s offer=%s from=%s "
+                "attempted=%d error=%s",
+                short_id(task_id),
+                short_id(offer_id),
+                short_id(worker_id),
+                len(attempted),
+                msg.get("error"),
+            )
+            return False
+
+        delivered = await self.deliver_task_offer(next_worker, offer)
+        if not delivered:
+            logger.warning(
+                "capacity reject re-deliver failed: task=%s offer=%s from=%s to=%s",
+                short_id(task_id),
+                short_id(offer_id),
+                short_id(worker_id),
+                short_id(next_worker),
+            )
+            return False
+
+        # Settle the rejecting worker so it stops waiting for task_result_ack.
+        await self._send_to_worker(
+            worker_id,
+            {
+                "type": "task_result_ack",
+                "task_id": task_id,
+                "offer_id": offer_id,
+                "received": True,
+                "status": "late_superseded",
+                "reason": f"reassigned_after_capacity:{msg.get('error')}",
+            },
+        )
+        logger.info(
+            "_workers | reassigned task=%s offer=%s from=%s to=%s reason=%s attempted=%d",
+            short_id(task_id),
+            short_id(offer_id),
+            short_id(worker_id),
+            short_id(next_worker),
+            msg.get("error"),
+            len(attempted),
+        )
+        return True
+
     async def deliver_task_offer(
         self,
         worker_id: str,
@@ -349,6 +458,7 @@ class WorkerGateway:
         try:
             await ws.send_text(json.dumps({"type": "task_offer", **offer}))
             self._remember_offer_context(offer)
+            self._remember_pending_offer(worker_id, offer)
             if mark_busy:
                 offer_id = offer.get("offer_id") or offer.get("task_id")
                 if offer_id:
@@ -611,12 +721,16 @@ class WorkerGateway:
                 f"task={short_id(msg.get('task_id'))} offer={short_id(msg.get('offer_id') or msg.get('task_id'))} "
                 f"success={msg.get('success')} bytes={msg.get('bytes_transferred')}"
             )
+            offer_id = msg.get("offer_id") or msg.get("task_id")
+            if await self._maybe_reassign_on_capacity_reject(worker_id, msg):
+                # Busy mark already cleared inside reassignment; do not fail upstream.
+                return
             self._log_external_task_result(worker_id, msg)
             await self._relay_task_result(worker_id, msg)
+            self._clear_pending_offer(str(offer_id) if offer_id else None)
             transfer_mbps = msg.get("transfer_mbps")
             if transfer_mbps is not None:
                 self._get_profile(worker_id).observe_transfer(transfer_mbps)
-            offer_id = msg.get("offer_id") or msg.get("task_id")
             self.mark_worker_idle(worker_id, str(offer_id) if offer_id else None)
         else:
             logger.debug("Unhandled worker message type %s from %s", msg_type, worker_id)
