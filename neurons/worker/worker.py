@@ -622,7 +622,12 @@ async def upload_buffered_predefined_etag(
     log_prefix: str = "[Worker]",
     quiet: bool = False,
 ) -> tuple[float, Optional[str]]:
-    """PUT/POST a buffered predefined-etag chunk; returns (send_ms, etag from response)."""
+    """PUT/POST a buffered predefined-etag chunk; returns (send_ms, etag from response).
+
+    Callers that pass a one-shot stream should wrap retries themselves (see
+    ``stream_cache_upload_to_dest``). Bytes/bytearray bodies may be retried by the
+    caller by invoking this function again.
+    """
     is_object_storage = is_object_storage_presigned_url(destination_url)
     body_len = len(body) if isinstance(body, (bytes, bytearray)) else int(expected_max_bytes or 0)
     byte_to = (
@@ -1726,6 +1731,7 @@ async def stream_cache_upload_to_dest(
     range_start = int(transfer_context["range_start"])
     dest_headers = transfer_context.get("dest_headers") or {}
     source_url = str(transfer_context.get("source_url") or "")
+    dest_url = str(transfer_context["dest_url"])
 
     async def body_stream():
         if PREDEFINED_ETAG_MAX_SPEED_MBPS > 0:
@@ -1737,46 +1743,59 @@ async def stream_cache_upload_to_dest(
             async for part in _iter_predefined_etag_range_chunks(transfer_context):
                 yield part
 
-    client = state.http_client
+    async def _put_once(client: httpx.AsyncClient) -> tuple[float, Optional[str]]:
+        return await upload_buffered_predefined_etag(
+            client,
+            destination_url=dest_url,
+            body=body_stream(),
+            chunk_hash=chunk_hash or "",
+            transfer_id=str(transfer_context.get("transfer_id") or task_id or ""),
+            chunk_index=0,
+            upload_offset=range_start,
+            expected_max_bytes=chunk_size,
+            total_size=chunk_size,
+            extra_dest_headers=dest_headers or None,
+            task_id=task_id,
+            offer_id=offer_id,
+            source_url=source_url,
+            log_prefix=log_prefix,
+            quiet=True,
+        )
+
     try:
-        if client is not None:
-            send_ms, etag = await upload_buffered_predefined_etag(
-                client,
-                destination_url=transfer_context["dest_url"],
-                body=body_stream(),
-                chunk_hash=chunk_hash or "",
-                transfer_id=str(transfer_context.get("transfer_id") or task_id or ""),
-                chunk_index=0,
-                upload_offset=range_start,
-                expected_max_bytes=chunk_size,
-                total_size=chunk_size,
-                extra_dest_headers=dest_headers or None,
-                task_id=task_id,
-                offer_id=offer_id,
-                source_url=source_url,
-                log_prefix=log_prefix,
-                quiet=True,
-            )
-        else:
-            async with httpx.AsyncClient(timeout=SEND_TIMEOUT) as tmp_client:
-                send_ms, etag = await upload_buffered_predefined_etag(
-                    tmp_client,
-                    destination_url=transfer_context["dest_url"],
-                    body=body_stream(),
-                    chunk_hash=chunk_hash or "",
-                    transfer_id=str(transfer_context.get("transfer_id") or task_id or ""),
-                    chunk_index=0,
-                    upload_offset=range_start,
-                    expected_max_bytes=chunk_size,
-                    total_size=chunk_size,
-                    extra_dest_headers=dest_headers or None,
-                    task_id=task_id,
-                    offer_id=offer_id,
-                    source_url=source_url,
-                    log_prefix=log_prefix,
-                    quiet=True,
+        client = state.http_client
+        last_error: Optional[BaseException] = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                if client is not None:
+                    send_ms, etag = await _put_once(client)
+                else:
+                    async with httpx.AsyncClient(timeout=SEND_TIMEOUT) as tmp_client:
+                        send_ms, etag = await _put_once(tmp_client)
+                return True, send_ms, etag, None
+            except Exception as exc:
+                last_error = exc
+                can_retry = is_retryable(exc) and attempt < MAX_RETRIES - 1
+                if is_object_storage_presigned_url(dest_url) and (
+                    not can_retry or attempt == MAX_RETRIES - 1
+                ):
+                    print(
+                        "[Worker] Object storage upload failed "
+                        f"task={task_label(task_id)} offer={task_label(offer_id)} "
+                        f"chunk=0 error={exception_detail(exc)}"
+                        f"{http_status_detail(exc)}"
+                        f"{format_route_context(object_storage_route_context(dest_url))}"
+                    )
+                if not can_retry:
+                    return False, 0.0, None, exception_detail(exc)
+                print(
+                    "[Worker] Transfer retry "
+                    f"task={task_label(task_id)} offer={task_label(offer_id)} "
+                    f"chunk=0 attempt={attempt + 1}/{MAX_RETRIES} "
+                    f"error={exception_detail(exc)}{http_status_detail(exc)}"
                 )
-        return True, send_ms, etag, None
+                await asyncio.sleep(RETRY_BACKOFF * (2**attempt))
+        return False, 0.0, None, exception_detail(last_error or Exception("upload_failed"))
     except Exception as exc:
         return False, 0.0, None, exception_detail(exc)
 
