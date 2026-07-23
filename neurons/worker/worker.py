@@ -2544,7 +2544,8 @@ def log_task_start(
     estimated_bytes: int = 0,
     task: Optional[dict] = None,
 ) -> None:
-    """Detailed task-offer / start log (full URLs + path/cache/capacity)."""
+    """Short task_start log (no signed URLs / no task_info dump)."""
+    del task  # kept for call-site compatibility
     try:
         range_start = int(transfer_context["range_start"])
         range_end = int(transfer_context["range_end"])
@@ -2554,20 +2555,13 @@ def log_task_start(
     chunk_id = chunk_id_from_transfer_context(transfer_context)
     path = resolve_task_path(transfer_context)
     cache_hit = has_predefined_etag_chunk_data(transfer_context)
-    source_url = str(transfer_context.get("source_url") or "")
-    dest_url = str(transfer_context.get("dest_url") or "")
     fields = [
-        f"{log_prefix} task_start task={task_id}",
-        f"offer={offer_id}",
+        f"{log_prefix} task_start task={task_label(task_id)}",
+        f"offer={task_label(offer_id)}",
         f"chunk_id={chunk_id if chunk_id is not None else '?'}",
         f"range={range_label}",
         f"path={path}",
         f"cache_hit={str(cache_hit).lower()}",
-        f"use_cache={str(WORKER_USE_CACHE_FILE).lower()}",
-        f"early_submit={str(WORKER_PREDEFINED_ETAG_EARLY_SUBMIT).lower()}",
-        f"verify_hash={str(WORKER_VERIFY_CHUNK_HASH).lower()}",
-        f"etag_required={str(bool(transfer_context.get('etag_required'))).lower()}",
-        f"transfer_id={transfer_context.get('transfer_id') or '-'}",
     ]
     if state is not None:
         fields.append(
@@ -2577,12 +2571,6 @@ def log_task_start(
             f"reserve={estimated_bytes}"
         )
     print(" ".join(fields))
-    print(f"{log_prefix} task_start_src task={task_id} src={source_url}")
-    print(f"{log_prefix} task_start_dest task={task_id} dest={dest_url}")
-    print(
-        f"{log_prefix} task_info task={task_id} offer={offer_id} "
-        f"{format_full_task_info(task, transfer_context)}"
-    )
 
 
 def predefined_etag_early_submit_skip_reasons(transfer_context: dict) -> list[str]:
@@ -2711,27 +2699,16 @@ def _log_task_done(
         transfer_context, used_cache=cached, send_ms=send_ms
     )
     chunk_id = chunk_id_from_transfer_context(transfer_context)
-    source_url = str(transfer_context.get("source_url") or "")
-    dest_url = str(transfer_context.get("dest_url") or "")
     print(
-        f"{log_prefix} task_done task={task_id} offer={offer_id} "
+        f"{log_prefix} task_done task={task_label(task_id)} offer={task_label(offer_id)} "
         f"chunk_id={chunk_id if chunk_id is not None else '?'} "
         f"range={transfer_context.get('range_start')}-{transfer_context.get('range_end')} "
         f"bytes={bytes_count} path={path_label} cached={str(cached).lower()} "
         f"hash_source={hash_source or '-'} "
         f"hash={chunk_hash or '-'} etag_real={etag_real or '-'} "
         f"etag_local={etag_local or '-'} "
-        f"use_cache={str(WORKER_USE_CACHE_FILE).lower()} "
-        f"early_submit={str(WORKER_PREDEFINED_ETAG_EARLY_SUBMIT).lower()} "
-        f"verify_hash={str(WORKER_VERIFY_CHUNK_HASH).lower()} "
         f"load_ms={load_ms:.1f} hash_ms={hash_ms:.1f} etag_ms={etag_ms:.1f} "
         f"fetch_ms={fetch_ms:.1f} send_ms={send_ms:.1f} wall_ms={total_ms:.1f} mbps={mbps:.1f}"
-    )
-    print(f"{log_prefix} task_done_src task={task_id} src={source_url}")
-    print(f"{log_prefix} task_done_dest task={task_id} dest={dest_url}")
-    print(
-        f"{log_prefix} task_done_info task={task_id} offer={offer_id} "
-        f"{format_full_task_info(None, transfer_context)}"
     )
 
 
