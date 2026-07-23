@@ -1515,11 +1515,22 @@ async def prewarm_for_transfer(
 
 
 def is_retryable(error: Exception) -> bool:
-    """Check if an error is retryable."""
-    if isinstance(error, (asyncio.TimeoutError, httpx.TimeoutException)):
+    """Check if an error is retryable.
+
+    Includes httpx transport failures (ReadError/ConnectError/WriteError/…) which
+    commonly appear under concurrent R2 PUTs when the peer resets mid-upload.
+    """
+    if isinstance(error, (asyncio.TimeoutError, TimeoutError)):
+        return True
+    # TimeoutException is a TransportError; listed first for clarity.
+    if isinstance(error, httpx.TimeoutException):
+        return True
+    if isinstance(error, httpx.TransportError):
         return True
     if isinstance(error, httpx.HTTPStatusError):
         return error.response.status_code >= 500
+    if isinstance(error, (ConnectionError, BrokenPipeError)):
+        return True
     return False
 
 

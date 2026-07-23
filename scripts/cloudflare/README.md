@@ -2,7 +2,7 @@
 
 JavaScript Cloudflare Worker:
 
-`GET` → version/health · `POST` → source GET (full body) → dest PUT → `etag`
+`GET` → version/health · `POST` → `fetch_and_send_chunk` (stream source GET → dest PUT) → `etag`
 
 ## Files
 
@@ -18,17 +18,17 @@ JavaScript Cloudflare Worker:
 
 ```bash
 curl -sS https://still-base-8f94.<account>.workers.dev/
-# {"ok":true,"name":"beam-cf-transfer","version":"1.1.0","mode":"fetch_then_put","updated_at":"2026-07-22"}
+# {"ok":true,"name":"beam-cf-transfer","version":"1.2.0","mode":"fetch_and_send_chunk","updated_at":"2026-07-23"}
 ```
 
-Also returns header `X-Beam-Worker-Version: 1.1.0`.
+Also returns header `X-Beam-Worker-Version: 1.2.0`.
 
 Check a pool (uses `CF_TRANSFER_WORKER_URLS` if set):
 
 ```bash
 export CF_TRANSFER_WORKER_URLS='https://w1.workers.dev,https://w2.workers.dev,https://w3.workers.dev'
 python3 scripts/cloudflare/check-worker-versions.py
-python3 scripts/cloudflare/check-worker-versions.py --expect 1.1.0
+python3 scripts/cloudflare/check-worker-versions.py --expect 1.2.0
 ```
 
 ## Update multiple Workers
@@ -52,7 +52,7 @@ export CLOUDFLARE_API_TOKEN='...'
 
 ```bash
 export CF_TRANSFER_WORKER_URLS='https://w1.workers.dev,https://w2.workers.dev'
-python3 scripts/cloudflare/check-worker-versions.py --expect 1.1.0
+python3 scripts/cloudflare/check-worker-versions.py --expect 1.2.0
 ```
 
 Orch env (round-robin):
@@ -65,7 +65,9 @@ WORKER_1_CF_TRANSFER_ENABLED=true
 
 ## Timing model
 
-1. Download full source body → `fetch_ms`
-2. PUT buffer → `send_ms`
+Same as Python `fetch_and_send_chunk` (concurrent stream):
 
-~40 MiB chunks fit Worker memory (128 MiB).
+1. Source GET stream fully consumed → `fetch_ms`
+2. Dest PUT start → response → `send_ms` (overlaps fetch)
+
+Uses `TransformStream` + streamed PUT body (no full-buffer RAM copy).
