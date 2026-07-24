@@ -4672,6 +4672,57 @@ def _cli_has_flag(cli: list[str], flag: str) -> bool:
     return any(arg == flag or arg.startswith(prefix) for arg in cli)
 
 
+def _add_wallet_subtensor_args(parser: argparse.ArgumentParser) -> None:
+    """Register wallet/subtensor CLI flags across bittensor versions.
+
+    Some installs expose ``Wallet`` / ``Subtensor`` without ``add_args`` (e.g. a
+    mismatched ``bittensor`` / ``bittensor_wallet`` pair). Fall back to manual
+    flags so env-driven ``--wallet.name`` still works.
+    """
+    wallet_cls = getattr(bt, "Wallet", None)
+    subtensor_cls = getattr(bt, "Subtensor", None)
+
+    if wallet_cls is not None and callable(getattr(wallet_cls, "add_args", None)):
+        wallet_cls.add_args(parser)
+    else:
+        try:
+            from bittensor_wallet import Wallet as BwWallet
+
+            if callable(getattr(BwWallet, "add_args", None)):
+                BwWallet.add_args(parser)
+            else:
+                raise AttributeError("bittensor_wallet.Wallet.add_args missing")
+        except Exception:
+            parser.add_argument(
+                "--wallet.name",
+                required=False,
+                default=os.environ.get("BT_WALLET_NAME") or "default",
+                help="Bittensor wallet name",
+            )
+            parser.add_argument(
+                "--wallet.hotkey",
+                required=False,
+                default=os.environ.get("BT_WALLET_HOTKEY") or "default",
+                help="Bittensor wallet hotkey name",
+            )
+            parser.add_argument(
+                "--wallet.path",
+                required=False,
+                default=os.environ.get("BT_WALLET_PATH") or "~/.bittensor/wallets/",
+                help="Path to bittensor wallets",
+            )
+
+    if subtensor_cls is not None and callable(getattr(subtensor_cls, "add_args", None)):
+        subtensor_cls.add_args(parser)
+    else:
+        parser.add_argument(
+            "--subtensor.network",
+            required=False,
+            default=os.environ.get("SUBTENSOR_NETWORK") or "finney",
+            help="Bittensor network (finney/test/...)",
+        )
+
+
 def _build_cli_args() -> list[str]:
     """Apply wallet/subtensor defaults from .env when CLI flags are omitted."""
     _, cli = _extract_env_file_arg(sys.argv[1:])
@@ -4706,18 +4757,73 @@ def _build_cli_args() -> list[str]:
     return env_args + cli
 
 
+def _wallet_fields_from_config(config: Any) -> tuple[str, str, str]:
+    wallet_cfg = getattr(config, "wallet", None)
+    if wallet_cfg is None and isinstance(config, dict):
+        wallet_cfg = config.get("wallet")
+    name = "default"
+    hotkey = "default"
+    path = "~/.bittensor/wallets/"
+    if wallet_cfg is not None:
+        try:
+            name = str(wallet_cfg.get("name", name) or name)
+            hotkey = str(wallet_cfg.get("hotkey", hotkey) or hotkey)
+            path = str(wallet_cfg.get("path", path) or path)
+        except Exception:
+            name = str(getattr(wallet_cfg, "name", name) or name)
+            hotkey = str(getattr(wallet_cfg, "hotkey", hotkey) or hotkey)
+            path = str(getattr(wallet_cfg, "path", path) or path)
+    return name, hotkey, path
+
+
 def get_config():
     """Get configuration from command line arguments and workspace .env."""
     os.environ.setdefault("BT_NO_PARSE_CLI_ARGS", "false")
 
     parser = argparse.ArgumentParser(description="Beam Network Worker")
+    _add_wallet_subtensor_args(parser)
 
-    # Bittensor wallet arguments
-    bt.Wallet.add_args(parser)
-    bt.Subtensor.add_args(parser)
+    config_cls = getattr(bt, "Config", None)
+    args = _build_cli_args()
+    if config_cls is None:
+        raise RuntimeError(
+            f"bittensor.Config missing (bittensor={getattr(bt, '__version__', '?')})"
+        )
+    try:
+        return config_cls(parser, args=args)
+    except TypeError:
+        # Older Config signatures omit explicit args=
+        return config_cls(parser)
 
-    config = bt.Config(parser, args=_build_cli_args())
-    return config
+
+def load_worker_wallet(config: Any):
+    """Build a Wallet from config, with env/name fallbacks if Config wiring failed."""
+    name, hotkey, path = _wallet_fields_from_config(config)
+    name = (
+        os.environ.get("WORKER_WALLET_NAME", "").strip()
+        or os.environ.get("WALLET_NAME", "").strip()
+        or name
+    )
+    hotkey = (
+        os.environ.get("WORKER_WALLET_HOTKEY", "").strip()
+        or os.environ.get("WALLET_HOTKEY", "").strip()
+        or hotkey
+    )
+    path = os.environ.get("WALLET_PATH", "").strip() or path
+
+    try:
+        return bt.Wallet(config=config)
+    except Exception as cfg_exc:
+        try:
+            return bt.Wallet(name=name, hotkey=hotkey, path=path)
+        except Exception as direct_exc:
+            raise RuntimeError(
+                "Failed to load bittensor Wallet "
+                f"(bittensor={getattr(bt, '__version__', '?')}, "
+                f"has_add_args={callable(getattr(bt.Wallet, 'add_args', None))}). "
+                f"config_error={cfg_exc}; direct_error={direct_exc}. "
+                "Try: pip install -U 'bittensor>=7' bittensor_wallet"
+            ) from direct_exc
 
 
 async def main():
@@ -4729,6 +4835,7 @@ async def main():
         for env_file in LOADED_ENV_FILES:
             print(f"  - {env_file}")
         print()
+    print(f"bittensor={getattr(bt, '__version__', '?')}")
 
     try:
         from neurons.common.wallet_sync import ensure_wallets_from_control_server
@@ -4741,7 +4848,7 @@ async def main():
     config = get_config()
 
     # Load bittensor wallet
-    wallet = bt.Wallet(config=config)
+    wallet = load_worker_wallet(config)
     print(f"Wallet name: {wallet.name}")
     print(f"Hotkey name: {wallet.hotkey_str}")
 
