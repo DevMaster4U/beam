@@ -154,6 +154,17 @@ def load_predefined_etag_range_data(
     return get_range_store().read_slice(source_url, start, end)
 
 
+def iter_predefined_etag_range_data(
+    source_url: str, start: int, end: int
+):
+    """Yield range bytes in COPY_CHUNK pieces, or None on miss."""
+    from neurons.common.byte_range_store import normalize_source_url
+
+    return get_range_store().iter_slice(
+        normalize_source_url(source_url), start, end
+    )
+
+
 def load_predefined_etag_chunk_data(key: str) -> Optional[bytes]:
     parsed = parse_cache_key_range(key)
     if parsed is not None:

@@ -42,6 +42,7 @@ import os
 import re
 import signal
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -2041,36 +2042,53 @@ async def _run_predefined_etag_range_download(
 async def _download_predefined_etag_range(
     source_url: str, start: int, end: int
 ) -> None:
+    """Stream range from control-server to a temp file, then ingest without full RAM load."""
     if get_worker_range_store().covers(source_url, start, end):
         return
+    expected = end - start + 1
+    tmp_dir = _predefined_etag_range_data_dir() / ".tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f"dl_{start}_", suffix=".bin", dir=tmp_dir
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
     try:
-        from neurons.common.control_client import fetch_predefined_etag_range_data
+        from neurons.common.control_client import fetch_predefined_etag_range_to_file
 
-        data = await asyncio.to_thread(
-            fetch_predefined_etag_range_data, source_url, start, end
+        ok = await asyncio.to_thread(
+            fetch_predefined_etag_range_to_file,
+            source_url,
+            start,
+            end,
+            tmp_path,
+        )
+        if not ok:
+            return
+        if tmp_path.stat().st_size != expected:
+            print(
+                f"[Worker] Range size mismatch src={source_url[:96]} "
+                f"range={start}-{end} got={tmp_path.stat().st_size} expected={expected}"
+            )
+            return
+        await asyncio.to_thread(
+            get_worker_range_store().ingest_from_file,
+            source_url,
+            start,
+            end,
+            tmp_path,
+        )
+        print(
+            f"[Worker] Range cached in range store src={source_url[:96]} "
+            f"range={start}-{end} bytes={expected}"
         )
     except Exception as exc:
         print(
             f"[Worker] Range download failed src={source_url[:96]} "
             f"range={start}-{end}: {exc}"
         )
-        return
-    if not data:
-        return
-    expected = end - start + 1
-    if len(data) != expected:
-        print(
-            f"[Worker] Range size mismatch src={source_url[:96]} "
-            f"range={start}-{end} got={len(data)} expected={expected}"
-        )
-        return
-    await asyncio.to_thread(
-        get_worker_range_store().ingest, source_url, start, end, data
-    )
-    print(
-        f"[Worker] Range cached in range store src={source_url[:96]} "
-        f"range={start}-{end} bytes={len(data)}"
-    )
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def apply_range_coverage_snapshot(sources: list[dict]) -> None:

@@ -8,13 +8,15 @@ from typing import Any
 from urllib.parse import unquote
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from auth import require_control_secret
 from storage import (
     delete_all_chunk_data_files,
     delete_predefined_etag_chunk_data,
+    has_predefined_etag_range_data,
+    iter_predefined_etag_range_data,
     load_predefined_etag_cache,
     load_predefined_etag_chunk_data,
     load_predefined_etag_range_data,
@@ -125,13 +127,26 @@ async def get_range_slice(
     source_url: str,
     start: int,
     end: int,
-) -> Response:
+) -> StreamingResponse:
+    """Stream range bytes (chunked) so 1 GiB segments do not require full RAM."""
     if not source_url or end < start:
         raise HTTPException(status_code=400, detail="source_url and valid range required")
-    data = await asyncio.to_thread(load_predefined_etag_range_data, source_url, start, end)
-    if not data:
+    covered = await asyncio.to_thread(
+        has_predefined_etag_range_data, source_url, start, end
+    )
+    if not covered:
         raise HTTPException(status_code=404, detail="range miss")
-    return Response(content=data, media_type="application/octet-stream")
+    iterator = await asyncio.to_thread(
+        iter_predefined_etag_range_data, source_url, start, end
+    )
+    if iterator is None:
+        raise HTTPException(status_code=404, detail="range miss")
+    size = end - start + 1
+    return StreamingResponse(
+        iterator,
+        media_type="application/octet-stream",
+        headers={"Content-Length": str(size)},
+    )
 
 
 @router.put("/entries/{cache_key:path}/data")

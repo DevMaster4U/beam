@@ -140,13 +140,22 @@ Expected after install: `net.ipv4.tcp_congestion_control = bbr`.
 
 Each active task uses about **two HTTP connections** (source GET + destination PUT). Default chunks are **4 MiB**. Uplink is usually the bottleneck.
 
+**Beam verified bandwidth** for a batch is the **last finished chunk’s Mbps** (the straggler), not average or sum. Stacking many concurrent tasks on few NICs often *lowers* verified score. Prefer **more distinct-IP workers** with **`WORKER_MAX_CONCURRENT_TASKS=1` or `2`** over high concurrency on one host.
+
+Warm local cache without OOM:
+
+```bash
+# Streams 1 GiB segments to disk (FETCH_CACHE_PARALLEL default 2)
+./scripts/fetch-cache-data.sh config/workers/worker1.env
+```
+
 Interactive helper:
 
 ```bash
 ./scripts/tune-worker-host.sh --link-mbps 500 --workers 2
 ```
 
-Rule of thumb (symmetric link, 4 MiB chunks):
+Rule of thumb (symmetric link, 4 MiB chunks) — use for raw throughput; for **verified** score, stay near 1–2 tasks/host:
 
 | Link (Mbps) | Total concurrent tasks (host) | Per worker instance (1 instance) |
 | ----------- | ----------------------------- | -------------------------------- |

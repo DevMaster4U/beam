@@ -6,6 +6,7 @@ import logging
 import os
 import hashlib
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote, urlparse, urlunparse
 
@@ -283,37 +284,130 @@ def fetch_predefined_etag_chunk_data(
         return None
 
 
+def fetch_predefined_etag_range_to_file(
+    source_url: str,
+    start: int,
+    end: int,
+    dest_path: str | Path,
+    config: Optional[ControlServerConfig] = None,
+    *,
+    chunk_size: int = 1024 * 1024,
+) -> bool:
+    """Stream a range from control-server to ``dest_path`` (no full-body RAM buffer).
+
+    Returns True when the file exists and matches ``end - start + 1`` bytes.
+    """
+    from neurons.common.byte_range_store import normalize_source_url
+
+    cfg = config or get_control_server_config()
+    source_url = normalize_source_url(source_url)
+    if not cfg.http_url or not cfg.secret or not source_url or end < start:
+        return False
+    expected = end - start + 1
+    dest = Path(dest_path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    url = f"{cfg.http_url}/cache/predefined-etag/ranges/data"
+    tmp = dest.with_suffix(dest.suffix + ".partial")
+    try:
+        with httpx.Client(timeout=CHUNK_DATA_TIMEOUT) as client:
+            with client.stream(
+                "GET",
+                url,
+                headers=_headers(cfg.secret),
+                params={"source_url": source_url, "start": start, "end": end},
+            ) as resp:
+                if resp.status_code == 404:
+                    return False
+                resp.raise_for_status()
+                written = 0
+                with tmp.open("wb") as out:
+                    for part in resp.iter_bytes(chunk_size):
+                        if not part:
+                            continue
+                        out.write(part)
+                        written += len(part)
+                        if written > expected:
+                            raise ValueError(
+                                f"range download exceeded expected size "
+                                f"got>={written} expected={expected}"
+                            )
+                if written != expected:
+                    raise ValueError(
+                        f"range download size mismatch got={written} expected={expected}"
+                    )
+        tmp.replace(dest)
+        return True
+    except Exception as exc:
+        logger.warning(
+            "Control server range stream failed src=%s range=%s-%s err=%s",
+            source_url[:96],
+            start,
+            end,
+            exc,
+        )
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+
 def fetch_predefined_etag_range_data(
     source_url: str,
     start: int,
     end: int,
     config: Optional[ControlServerConfig] = None,
 ) -> Optional[bytes]:
-    """Download a byte-range slice from the control-server continuous store."""
-    cfg = config or get_control_server_config()
-    if not cfg.http_url or not cfg.secret or not source_url or end < start:
-        return None
-    url = f"{cfg.http_url}/cache/predefined-etag/ranges/data"
-    try:
-        with httpx.Client(timeout=CHUNK_DATA_TIMEOUT) as client:
-            resp = client.get(
-                url,
-                headers=_headers(cfg.secret),
-                params={"source_url": source_url, "start": start, "end": end},
+    """Download a byte-range slice (streams to a temp file, then reads it back).
+
+    Prefer :func:`fetch_predefined_etag_range_to_file` + ``ingest_from_file`` for
+    large segments so peak RAM stays near the copy chunk size.
+    """
+    import tempfile
+
+    expected = end - start + 1
+    # Small ranges: keep a simple buffered GET for callers that need bytes.
+    if expected <= 8 * 1024 * 1024:
+        cfg = config or get_control_server_config()
+        if not cfg.http_url or not cfg.secret or not source_url or end < start:
+            return None
+        url = f"{cfg.http_url}/cache/predefined-etag/ranges/data"
+        try:
+            with httpx.Client(timeout=CHUNK_DATA_TIMEOUT) as client:
+                resp = client.get(
+                    url,
+                    headers=_headers(cfg.secret),
+                    params={"source_url": source_url, "start": start, "end": end},
+                )
+                if resp.status_code == 404:
+                    return None
+                resp.raise_for_status()
+                data = resp.content
+                if len(data) != expected:
+                    return None
+                return data
+        except Exception as exc:
+            logger.warning(
+                "Control server range fetch failed src=%s range=%s-%s err=%s",
+                source_url[:96],
+                start,
+                end,
+                exc,
             )
-            if resp.status_code == 404:
-                return None
-            resp.raise_for_status()
-            return resp.content
-    except Exception as exc:
-        logger.warning(
-            "Control server range fetch failed src=%s range=%s-%s err=%s",
-            source_url[:96],
-            start,
-            end,
-            exc,
+            return None
+
+    fd, tmp_name = tempfile.mkstemp(prefix="range_fetch_", suffix=".bin")
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        ok = fetch_predefined_etag_range_to_file(
+            source_url, start, end, tmp_path, config=config
         )
-        return None
+        if not ok:
+            return None
+        return tmp_path.read_bytes()
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def delete_predefined_etag_chunk_data_remote(

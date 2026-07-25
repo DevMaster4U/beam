@@ -479,6 +479,79 @@ class ByteRangeStore:
             shards.append(Segment(start=shard_start, end=shard_end, file=file_name))
         return shards
 
+    def _write_file_shards(
+        self,
+        directory: Path,
+        start: int,
+        end: int,
+        src_path: Path,
+    ) -> list[Segment]:
+        """Pack [start, end] from ``src_path`` into ≤1 GiB shards (streamed)."""
+        expected = end - start + 1
+        if src_path.stat().st_size != expected:
+            raise ValueError(
+                f"file size {src_path.stat().st_size} != range size {expected}"
+            )
+        bounds = shard_bounds(start, end, max_bytes=self.max_segment_bytes)
+        # Fast path: exact one shard → hardlink/rename instead of rewriting 1 GiB.
+        if len(bounds) == 1 and bounds[0] == (start, end):
+            file_name = _segment_filename(start, end)
+            out_path = directory / file_name
+            if out_path.resolve() != src_path.resolve():
+                fd, tmp_name = tempfile.mkstemp(
+                    prefix=".range_", suffix=".bin", dir=directory
+                )
+                os.close(fd)
+                tmp_path = Path(tmp_name)
+                try:
+                    try:
+                        os.link(src_path, tmp_path)
+                    except OSError:
+                        with src_path.open("rb") as src, tmp_path.open("wb") as out:
+                            while True:
+                                part = src.read(COPY_CHUNK)
+                                if not part:
+                                    break
+                                out.write(part)
+                    os.replace(tmp_path, out_path)
+                finally:
+                    tmp_path.unlink(missing_ok=True)
+            return [Segment(start=start, end=end, file=file_name)]
+
+        shards: list[Segment] = []
+        with src_path.open("rb") as src:
+            for shard_start, shard_end in bounds:
+                file_name = _segment_filename(shard_start, shard_end)
+                out_path = directory / file_name
+                offset = shard_start - start
+                length = shard_end - shard_start + 1
+                src.seek(offset)
+                fd, tmp_name = tempfile.mkstemp(
+                    prefix=".range_", suffix=".bin", dir=directory
+                )
+                os.close(fd)
+                tmp_path = Path(tmp_name)
+                try:
+                    remaining = length
+                    with tmp_path.open("wb") as out:
+                        while remaining > 0:
+                            part = src.read(min(COPY_CHUNK, remaining))
+                            if not part:
+                                break
+                            out.write(part)
+                            remaining -= len(part)
+                    if remaining:
+                        raise RuntimeError(
+                            f"short read packing {src_path} at offset {offset}"
+                        )
+                    os.replace(tmp_path, out_path)
+                finally:
+                    tmp_path.unlink(missing_ok=True)
+                shards.append(
+                    Segment(start=shard_start, end=shard_end, file=file_name)
+                )
+        return shards
+
     def _merge_group_locked(
         self,
         source_url: str,
@@ -749,9 +822,72 @@ class ByteRangeStore:
         *,
         merge: bool = True,
     ) -> Segment:
-        """Ingest range bytes from an existing file."""
-        data = path.read_bytes()
-        return self.ingest(source_url, start, end, data, merge=merge)
+        """Ingest range bytes from an on-disk file without loading it into RAM.
+
+        Streams through temp/shard writes and the existing merge packer so a
+        1 GiB segment download stays near COPY_CHUNK peak memory.
+        """
+        if end < start:
+            raise ValueError("invalid range: end < start")
+        src = Path(path)
+        if not src.is_file():
+            raise ValueError(f"ingest file missing: {src}")
+        expected = end - start + 1
+        size = src.stat().st_size
+        if size != expected:
+            raise ValueError(f"file size {size} != range size {expected}")
+
+        source_url = normalize_source_url(source_url)
+        digest = source_digest(source_url)
+        with self._source_lock(digest):
+            directory = self.source_dir(source_url)
+            directory.mkdir(parents=True, exist_ok=True)
+            segments = self._load_segments(source_url)
+            covering = self._covering_segments_locked(segments, start, end)
+            if covering:
+                return covering[0]
+
+            if not merge:
+                shards = self._write_file_shards(directory, start, end, src)
+                replaced = {(s.start, s.end) for s in shards}
+                kept = [s for s in segments if (s.start, s.end) not in replaced]
+                kept.extend(shards)
+                self._save_segments(source_url, kept)
+                return next(s for s in shards if s.start <= start <= s.end)
+
+            group = self._touching_group(segments, start, end)
+            if not group:
+                shards = self._write_file_shards(directory, start, end, src)
+                kept = list(segments)
+                kept.extend(shards)
+                self._save_segments(source_url, kept)
+                return next(s for s in shards if s.start <= start <= s.end)
+
+            # Materialize into store dir so merge can stream from pieces.
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=".ingest_", suffix=".bin", dir=directory
+            )
+            os.close(fd)
+            tmp_path = Path(tmp_name)
+            try:
+                with src.open("rb") as infile, tmp_path.open("wb") as outfile:
+                    while True:
+                        part = infile.read(COPY_CHUNK)
+                        if not part:
+                            break
+                        outfile.write(part)
+                new_seg = Segment(start=start, end=end, file=tmp_path.name)
+                group_files = [
+                    s for s in group if not (s.start == start and s.end == end)
+                ]
+                group_files.append(new_seg)
+                kept = [s for s in segments if s not in group]
+                shards = self._merge_group_locked(source_url, directory, group_files)
+                kept.extend(shards)
+                self._save_segments(source_url, kept)
+                return next(s for s in shards if s.start <= start <= s.end)
+            finally:
+                tmp_path.unlink(missing_ok=True)
 
     def coverage_report(
         self,
