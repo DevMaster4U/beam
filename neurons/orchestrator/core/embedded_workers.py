@@ -626,23 +626,34 @@ class EmbeddedWorkerPool:
         if not workers_pool:
             return None
 
+        from core.worker_gateway import ALLOW_BUSY_WORKER_REUSE, PREFER_IDLE_WORKERS
+
         pool_size = len(workers_pool)
         start = self._cursor % pool_size
         in_batch = batch_used_ips is not None or batch_assigned_counts is not None
         counts = batch_assigned_counts
+        prefer_idle = PREFER_IDLE_WORKERS
+        allow_busy_reuse = ALLOW_BUSY_WORKER_REUSE
 
         def _batch_count(worker_id: str) -> int:
             if counts is None:
                 return 0
             return int(counts.get(worker_id, 0))
 
+        def _load(worker: EmbeddedWorker) -> int:
+            return max(worker.active_count, _batch_count(worker.worker_id))
+
         def _eligible(
             worker: EmbeddedWorker,
             *,
             allow_used_ip: bool,
+            require_idle: bool,
             allow_reuse_worker: bool,
         ) -> bool:
             if not worker.has_capacity:
+                return False
+            load = _load(worker)
+            if require_idle and load > 0:
                 return False
             assigned = _batch_count(worker.worker_id)
             if counts is not None:
@@ -664,43 +675,92 @@ class EmbeddedWorkerPool:
         def _pick(
             *,
             allow_used_ip: bool,
+            require_idle: bool,
             allow_reuse_worker: bool,
         ) -> Optional[EmbeddedWorker]:
             # Spread load first (makespan), then RR offset.
-            candidates: list[tuple[int, int, int, EmbeddedWorker]] = []
+            candidates: list[tuple[int, int, int, int, EmbeddedWorker]] = []
             for offset in range(pool_size):
                 idx = (start + offset) % pool_size
                 worker = workers_pool[idx]
                 if not _eligible(
                     worker,
                     allow_used_ip=allow_used_ip,
+                    require_idle=require_idle,
                     allow_reuse_worker=allow_reuse_worker,
                 ):
                     continue
                 candidates.append(
                     (
+                        _load(worker),
                         _batch_count(worker.worker_id),
-                        worker.active_count,
+                        -worker.initial_order,
                         offset,
                         worker,
                     )
                 )
             if not candidates:
                 return None
-            candidates.sort(key=lambda item: (item[0], item[1], item[2]))
-            _bc, _active, offset, worker = candidates[0]
+            candidates.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+            _load_n, _bc, _neg_order, offset, worker = candidates[0]
             self._cursor = (start + offset + 1) % pool_size
             return worker
 
+        if prefer_idle:
+            worker = _pick(
+                allow_used_ip=False,
+                require_idle=True,
+                allow_reuse_worker=False,
+            )
+            if worker:
+                return worker
+            worker = _pick(
+                allow_used_ip=True,
+                require_idle=True,
+                allow_reuse_worker=False,
+            )
+            if worker:
+                return worker
+            if not allow_busy_reuse:
+                return None
+            worker = _pick(
+                allow_used_ip=False,
+                require_idle=False,
+                allow_reuse_worker=True,
+            )
+            if worker:
+                return worker
+            return _pick(
+                allow_used_ip=True,
+                require_idle=False,
+                allow_reuse_worker=True,
+            )
+
         if in_batch:
-            worker = _pick(allow_used_ip=False, allow_reuse_worker=False)
+            worker = _pick(
+                allow_used_ip=False,
+                require_idle=False,
+                allow_reuse_worker=False,
+            )
             if worker:
                 return worker
-            worker = _pick(allow_used_ip=True, allow_reuse_worker=False)
+            worker = _pick(
+                allow_used_ip=True,
+                require_idle=False,
+                allow_reuse_worker=False,
+            )
             if worker:
                 return worker
-            return _pick(allow_used_ip=True, allow_reuse_worker=True)
-        return _pick(allow_used_ip=True, allow_reuse_worker=True)
+            return _pick(
+                allow_used_ip=True,
+                require_idle=False,
+                allow_reuse_worker=True,
+            )
+        return _pick(
+            allow_used_ip=True,
+            require_idle=False,
+            allow_reuse_worker=True,
+        )
 
     @staticmethod
     def _log_task_failed(

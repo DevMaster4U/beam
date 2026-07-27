@@ -44,6 +44,20 @@ RESULT_TERMINAL_STATUSES = {
 }
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Prefer workers with zero in-flight tasks (protects first-wave Mbps).
+# When true and ORCH_ALLOW_BUSY_WORKER_REUSE=false, second-batch overflow waits
+# for an idle worker instead of stacking onto a busy first-wave worker.
+PREFER_IDLE_WORKERS = _env_bool("ORCH_PREFER_IDLE_WORKERS", True)
+ALLOW_BUSY_WORKER_REUSE = _env_bool("ORCH_ALLOW_BUSY_WORKER_REUSE", False)
+
+
 @dataclass
 class _WorkerProfile:
     worker_id: str
@@ -505,14 +519,17 @@ class WorkerGateway:
     ) -> Optional[str]:
         """Pick the next worker with capacity, matching global-gateway batch IP spread.
 
-        Goal: finish the batch ASAP (makespan = last task done). Within one
-        ``task_offer_batch`` (when batch sets are provided):
-          1. Prefer a fresh IP + worker not yet used in this batch
-          2. Then any IP, worker not yet used in this batch
-          3. Then reuse workers that still have ``active < max_concurrent_tasks``
+        Goal: protect first-wave single-stream Mbps (makespan of the first
+        assignment wave), then finish overflow when workers free.
 
-        Among eligible workers, prefer lower batch/in-flight load (more parallel
-        bandwidth), then higher observed Mbps (faster finish).
+        When ``ORCH_PREFER_IDLE_WORKERS`` is on (default):
+          1. Prefer idle workers (effective load 0) on a fresh IP
+          2. Then idle workers on any IP
+          3. Only if ``ORCH_ALLOW_BUSY_WORKER_REUSE`` is on, reuse busy workers
+             that still have ``active < max_concurrent_tasks``
+
+        Effective load is ``max(active_count, batch_assigned)`` so in-flight
+        work from prior NATS batches and this batch both count.
 
         When ``allow_used_ip`` is False, stop after step 1 (hybrid overflow).
         ``exclude_worker_ids`` skips workers already represented by the embedded pool.
@@ -526,6 +543,8 @@ class WorkerGateway:
         in_batch = batch_used_ips is not None or batch_assigned_workers is not None
         excluded = exclude_worker_ids or set()
         counts = batch_assigned_counts
+        prefer_idle = PREFER_IDLE_WORKERS
+        allow_busy_reuse = ALLOW_BUSY_WORKER_REUSE
 
         def _batch_count(worker_id: str) -> int:
             if counts is not None:
@@ -534,16 +553,25 @@ class WorkerGateway:
                 return 1
             return 0
 
+        def _load(worker_id: str) -> int:
+            profile = self._get_profile(worker_id)
+            # max(): deliver marks busy before batch_counts update on some paths
+            return max(profile.active_count, _batch_count(worker_id))
+
         def _eligible(
             worker_id: str,
             *,
             allow_ip_reuse: bool,
+            require_idle: bool,
             allow_worker_reuse: bool,
         ) -> bool:
             if worker_id in excluded:
                 return False
             profile = self._get_profile(worker_id)
             if not profile.has_capacity:
+                return False
+            load = _load(worker_id)
+            if require_idle and load > 0:
                 return False
             if not allow_worker_reuse and _batch_count(worker_id) > 0:
                 return False
@@ -560,64 +588,127 @@ class WorkerGateway:
         def _pick(
             *,
             allow_ip_reuse: bool,
+            require_idle: bool,
             allow_worker_reuse: bool,
         ) -> Optional[str]:
-            # (batch_n, active, -mbps, offset, worker_id) — spread then speed
-            candidates: list[tuple[int, int, float, int, str]] = []
+            # (load, batch_n, -mbps, -initial_order, offset, worker_id)
+            candidates: list[tuple[int, int, float, int, int, str]] = []
             for offset in range(pool_size):
                 idx = (start + offset) % pool_size
                 worker_id = connected[idx]
                 if not _eligible(
                     worker_id,
                     allow_ip_reuse=allow_ip_reuse,
+                    require_idle=require_idle,
                     allow_worker_reuse=allow_worker_reuse,
                 ):
                     continue
                 profile = self._get_profile(worker_id)
                 candidates.append(
                     (
+                        _load(worker_id),
                         _batch_count(worker_id),
-                        profile.active_count,
                         -profile.average_mbps,
+                        -profile.initial_order,
                         offset,
                         worker_id,
                     )
                 )
             if not candidates:
                 return None
-            candidates.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
-            _bc, _active, _neg_mbps, offset, worker_id = candidates[0]
+            candidates.sort(
+                key=lambda item: (item[0], item[1], item[2], item[3], item[4])
+            )
+            _load_n, _bc, _neg_mbps, _neg_order, offset, worker_id = candidates[0]
             idx = (start + offset) % pool_size
             self._cursor = (idx + 1) % pool_size
             profile = self._get_profile(worker_id)
             logger.debug(
                 "selected worker %s round_robin ip=%s active=%d/%d "
-                "batch_n=%d mbps=%.1f cursor=%d pool=%d batch_ips=%s reuse_worker=%s",
+                "load=%d batch_n=%d mbps=%.1f cursor=%d pool=%d batch_ips=%s "
+                "require_idle=%s reuse_worker=%s",
                 worker_id,
                 profile.ip or "?",
                 profile.active_count,
                 profile.max_concurrent_tasks,
-                _batch_count(worker_id),
+                _load_n,
+                _bc,
                 profile.average_mbps,
                 self._cursor,
                 pool_size,
                 ",".join(sorted(batch_used_ips)) if batch_used_ips else "-",
+                require_idle,
                 allow_worker_reuse,
             )
             return worker_id
 
+        def _pick_idle(
+            *,
+            allow_ip_reuse: bool,
+        ) -> Optional[str]:
+            return _pick(
+                allow_ip_reuse=allow_ip_reuse,
+                require_idle=True,
+                allow_worker_reuse=False,
+            )
+
+        def _pick_busy(
+            *,
+            allow_ip_reuse: bool,
+        ) -> Optional[str]:
+            return _pick(
+                allow_ip_reuse=allow_ip_reuse,
+                require_idle=False,
+                allow_worker_reuse=True,
+            )
+
+        if prefer_idle:
+            # Always exhaust idle workers (any IP) before stacking on busy ones.
+            worker_id = _pick_idle(allow_ip_reuse=False)
+            if worker_id:
+                return worker_id
+            if allow_used_ip:
+                worker_id = _pick_idle(allow_ip_reuse=True)
+                if worker_id:
+                    return worker_id
+            if not allow_busy_reuse:
+                return None
+            worker_id = _pick_busy(allow_ip_reuse=False)
+            if worker_id:
+                return worker_id
+            if allow_used_ip:
+                return _pick_busy(allow_ip_reuse=True)
+            return None
+
+        # Legacy: unused-in-batch first, then reuse capacity.
         if in_batch:
-            worker_id = _pick(allow_ip_reuse=False, allow_worker_reuse=False)
+            worker_id = _pick(
+                allow_ip_reuse=False,
+                require_idle=False,
+                allow_worker_reuse=False,
+            )
             if worker_id:
                 return worker_id
             if not allow_used_ip:
                 return None
-            worker_id = _pick(allow_ip_reuse=True, allow_worker_reuse=False)
+            worker_id = _pick(
+                allow_ip_reuse=True,
+                require_idle=False,
+                allow_worker_reuse=False,
+            )
             if worker_id:
                 return worker_id
-            return _pick(allow_ip_reuse=True, allow_worker_reuse=True)
+            return _pick(
+                allow_ip_reuse=True,
+                require_idle=False,
+                allow_worker_reuse=True,
+            )
 
-        return _pick(allow_ip_reuse=True, allow_worker_reuse=True)
+        return _pick(
+            allow_ip_reuse=True,
+            require_idle=False,
+            allow_worker_reuse=True,
+        )
 
     def get_workers_round_robin(self, n: int = 1) -> list[str]:
         """Return up to n worker_ids with batch-aware round-robin (IP + capacity)."""
@@ -664,8 +755,11 @@ class WorkerGateway:
             )
             if not worker_id:
                 logger.warning(
-                    "No local worker with capacity for batch offer task=%s",
+                    "No local worker with capacity for batch offer task=%s "
+                    "(prefer_idle=%s allow_busy_reuse=%s)",
                     offer.get("task_id"),
+                    PREFER_IDLE_WORKERS,
+                    ALLOW_BUSY_WORKER_REUSE,
                 )
                 failed += 1
                 continue
