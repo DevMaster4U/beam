@@ -406,6 +406,11 @@ class EmbeddedWorkerPool:
         self._hybrid_used_ips: set[str] = set()
         self._cf_urls: List[str] = []
         self._cf_rr_index = 0
+        # Offers waiting for an idle embedded (or external) worker.
+        self._overflow: list[dict[str, Any]] = []
+        self._overflow_ids: Set[str] = set()
+        self._overflow_drain_pending = False
+        self._overflow_drain_running = False
 
     @property
     def worker_count(self) -> int:
@@ -868,6 +873,7 @@ class EmbeddedWorkerPool:
     async def deliver_task_offer_batch(self, batch_id: str, offers: list[dict]) -> tuple[int, int]:
         delivered = 0
         failed = 0
+        queued = 0
         batch_used_ips: set[str] = set()
         batch_assigned_counts: dict[str, int] = defaultdict(int)
         batch_gateway_assigned: set[str] = set()
@@ -966,6 +972,14 @@ class EmbeddedWorkerPool:
 
             if worker is None:
                 reason = "no_worker_capacity"
+                if self._enqueue_overflow(
+                    offer=offer,
+                    transfer_context=transfer_context,
+                    path=path,
+                    batch_id=batch_id,
+                ):
+                    queued += 1
+                    continue
                 logger.warning(
                     "No worker capacity for batch=%s task=%s offer=%s",
                     short_id(batch_id, 12),
@@ -1021,14 +1035,161 @@ class EmbeddedWorkerPool:
 
         await asyncio.sleep(0)
 
+        if queued:
+            logger.info(
+                "Embedded batch overflow queued=%s delivered=%s failed=%s pending=%s batch=%s",
+                queued,
+                delivered,
+                failed,
+                len(self._overflow),
+                short_id(batch_id, 12),
+            )
+            self._schedule_overflow_drain()
+
         logger.debug(
-            "Embedded batch queued: batch=%s offers=%s delivered=%s failed=%s",
+            "Embedded batch queued: batch=%s offers=%s delivered=%s failed=%s overflow=%s",
             short_id(batch_id, 12),
             len(offers),
             delivered,
             failed,
+            queued,
         )
         return delivered, failed
+
+    def _enqueue_overflow(
+        self,
+        *,
+        offer: dict,
+        transfer_context: dict,
+        path: str,
+        batch_id: str,
+    ) -> bool:
+        from core.worker_gateway import OVERFLOW_QUEUE_ENABLED, OVERFLOW_QUEUE_MAX
+
+        if not OVERFLOW_QUEUE_ENABLED:
+            return False
+        # Prefer gateway overflow when hybrid external workers exist.
+        gateway = self._worker_gateway
+        if gateway is not None and hasattr(gateway, "_enqueue_overflow"):
+            if gateway._enqueue_overflow(offer):
+                gateway._schedule_overflow_drain()
+                return True
+        offer_id = str(offer.get("offer_id") or offer.get("task_id") or "").strip()
+        if not offer_id:
+            return False
+        if offer_id in self._overflow_ids:
+            return True
+        if OVERFLOW_QUEUE_MAX > 0 and len(self._overflow) >= OVERFLOW_QUEUE_MAX:
+            logger.warning(
+                "embedded overflow queue full (%d); cannot hold offer=%s",
+                OVERFLOW_QUEUE_MAX,
+                short_id(offer_id),
+            )
+            return False
+        self._overflow.append(
+            {
+                "offer": dict(offer),
+                "transfer_context": dict(transfer_context),
+                "path": path,
+                "batch_id": batch_id,
+            }
+        )
+        self._overflow_ids.add(offer_id)
+        logger.info(
+            "_workers | embedded_overflow_enqueue task=%s offer=%s pending=%d",
+            short_id(offer.get("task_id")),
+            short_id(offer_id),
+            len(self._overflow),
+        )
+        return True
+
+    def _schedule_overflow_drain(self) -> None:
+        from core.worker_gateway import OVERFLOW_QUEUE_ENABLED
+
+        if not OVERFLOW_QUEUE_ENABLED or not self._overflow:
+            return
+        self._overflow_drain_pending = True
+        if self._overflow_drain_running:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._overflow_drain_running = True
+        loop.create_task(self._overflow_drain_loop(), name="embedded-overflow-drain")
+
+    async def _overflow_drain_loop(self) -> None:
+        try:
+            while self._overflow_drain_pending:
+                self._overflow_drain_pending = False
+                await self._drain_overflow_queue()
+        finally:
+            self._overflow_drain_running = False
+            if self._overflow_drain_pending and self._overflow:
+                self._schedule_overflow_drain()
+
+    async def _drain_overflow_queue(self) -> int:
+        delivered = 0
+        while self._overflow:
+            item = self._overflow[0]
+            offer = item["offer"]
+            transfer_context = item["transfer_context"]
+            path = str(item.get("path") or "standard")
+            offer_id = str(offer.get("offer_id") or offer.get("task_id") or "")
+            task_id = str(offer.get("task_id") or offer_id)
+
+            worker = self._select_worker()
+            if worker is None:
+                gateway = self._worker_gateway
+                if gateway is not None and hasattr(gateway, "select_worker_round_robin"):
+                    ext_id = gateway.select_worker_round_robin(
+                        exclude_worker_ids={w.worker_id for w in self.workers},
+                    )
+                    if ext_id and await gateway.deliver_task_offer(ext_id, offer):
+                        self._overflow.pop(0)
+                        self._overflow_ids.discard(offer_id)
+                        delivered += 1
+                        continue
+                break
+
+            self._overflow.pop(0)
+            self._overflow_ids.discard(offer_id)
+            if (
+                path == "predefined_etag"
+                and self._cf_transfer_active(worker)
+            ):
+                path = "cloudflare_worker"
+            _log_embedded_task_offer(
+                task_id=task_id,
+                offer_id=offer_id,
+                worker_slot=worker.slot,
+                transfer_context=transfer_context,
+                path=path,
+            )
+            task = asyncio.create_task(
+                self._handle_offer(
+                    worker,
+                    offer,
+                    transfer_context,
+                    path=path,
+                )
+            )
+            self._task_handles.add(task)
+            task.add_done_callback(
+                lambda t, tid=task_id, oid=offer_id: self._log_offer_task_done(
+                    t, task_id=tid, offer_id=oid
+                )
+            )
+            task.add_done_callback(self._task_handles.discard)
+            delivered += 1
+            logger.info(
+                "_workers | embedded_overflow_deliver task=%s offer=%s worker=%s pending=%d",
+                short_id(task_id),
+                short_id(offer_id),
+                short_id(worker.worker_id),
+                len(self._overflow),
+            )
+        return delivered
 
     async def _handle_offer(
         self,
@@ -1128,6 +1289,7 @@ class EmbeddedWorkerPool:
             raise
         finally:
             worker.active_offer_ids.discard(str(offer_id or ""))
+            self._schedule_overflow_drain()
 
     def _reserve_capacity(self, worker: EmbeddedWorker, estimated_bytes: int) -> Optional[str]:
         transfer = get_transfer_module()

@@ -56,6 +56,13 @@ def _env_bool(name: str, default: bool) -> bool:
 # for an idle worker instead of stacking onto a busy first-wave worker.
 PREFER_IDLE_WORKERS = _env_bool("ORCH_PREFER_IDLE_WORKERS", True)
 ALLOW_BUSY_WORKER_REUSE = _env_bool("ORCH_ALLOW_BUSY_WORKER_REUSE", False)
+# Hold undelivered offers locally and push when a worker becomes idle
+# (instead of failing / relying on BeamCore reassignment).
+OVERFLOW_QUEUE_ENABLED = _env_bool("ORCH_OVERFLOW_QUEUE_ENABLED", True)
+try:
+    OVERFLOW_QUEUE_MAX = max(0, int(os.environ.get("ORCH_OVERFLOW_QUEUE_MAX", "2000")))
+except ValueError:
+    OVERFLOW_QUEUE_MAX = 2000
 
 
 @dataclass
@@ -124,6 +131,11 @@ class WorkerGateway:
         # offer_id → full task_offer payload for capacity-reject reassignment
         self._pending_offers: Dict[str, dict] = {}
         self._offer_attempted_workers: Dict[str, Set[str]] = {}
+        # Offers waiting for an idle worker (prefer-idle overflow).
+        self._overflow_offers: deque = deque()
+        self._overflow_offer_ids: Set[str] = set()
+        self._overflow_drain_pending = False
+        self._overflow_drain_running = False
 
     def set_upstream(self, upstream: object) -> None:
         self._upstream = upstream
@@ -172,6 +184,7 @@ class WorkerGateway:
         )
         if was_empty and self._on_ready_change:
             self._on_ready_change(True)
+        self._schedule_overflow_drain()
         return True
 
     def note_worker_version(self, worker_id: str, worker_version: str) -> None:
@@ -217,6 +230,98 @@ class WorkerGateway:
             profile.active_offer_ids.discard(str(offer_id))
         else:
             profile.active_offer_ids.clear()
+        self._schedule_overflow_drain()
+
+    def _offer_key(self, offer: dict) -> str:
+        return str(offer.get("offer_id") or offer.get("task_id") or "").strip()
+
+    def _enqueue_overflow(self, offer: dict) -> bool:
+        """Queue offer for later delivery when an idle worker appears."""
+        if not OVERFLOW_QUEUE_ENABLED:
+            return False
+        if not isinstance(offer, dict):
+            return False
+        offer_id = self._offer_key(offer)
+        if not offer_id:
+            return False
+        if offer_id in self._overflow_offer_ids:
+            return True
+        if OVERFLOW_QUEUE_MAX > 0 and len(self._overflow_offers) >= OVERFLOW_QUEUE_MAX:
+            logger.warning(
+                "overflow queue full (%d); cannot hold task=%s offer=%s",
+                OVERFLOW_QUEUE_MAX,
+                short_id(offer.get("task_id")),
+                short_id(offer_id),
+            )
+            return False
+        payload = dict(offer)
+        self._overflow_offers.append(payload)
+        self._overflow_offer_ids.add(offer_id)
+        # Keep payload for capacity-reject / drain redelivery.
+        self._pending_offers[offer_id] = payload
+        self._offer_attempted_workers.setdefault(offer_id, set())
+        self._remember_offer_context(payload)
+        logger.info(
+            "_workers | overflow_enqueue task=%s offer=%s pending=%d",
+            short_id(offer.get("task_id")),
+            short_id(offer_id),
+            len(self._overflow_offers),
+        )
+        return True
+
+    def _schedule_overflow_drain(self) -> None:
+        if not OVERFLOW_QUEUE_ENABLED or not self._overflow_offers:
+            return
+        self._overflow_drain_pending = True
+        if self._overflow_drain_running:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._overflow_drain_running = True
+        loop.create_task(self._overflow_drain_loop(), name="overflow-drain")
+
+    async def _overflow_drain_loop(self) -> None:
+        try:
+            while self._overflow_drain_pending:
+                self._overflow_drain_pending = False
+                await self._drain_overflow_queue()
+        finally:
+            self._overflow_drain_running = False
+            if self._overflow_drain_pending and self._overflow_offers:
+                self._schedule_overflow_drain()
+
+    async def _drain_overflow_queue(self) -> int:
+        """Deliver queued offers to idle workers. Returns number delivered."""
+        delivered = 0
+        while self._overflow_offers:
+            offer = self._overflow_offers[0]
+            offer_id = self._offer_key(offer)
+            attempted = set(self._offer_attempted_workers.get(offer_id) or set())
+            worker_id = self.select_worker_round_robin(exclude_worker_ids=attempted)
+            if not worker_id:
+                break
+            self._overflow_offers.popleft()
+            if offer_id:
+                self._overflow_offer_ids.discard(offer_id)
+            ok = await self.deliver_task_offer(worker_id, offer)
+            if ok:
+                delivered += 1
+                logger.info(
+                    "_workers | overflow_deliver task=%s offer=%s worker=%s pending=%d",
+                    short_id(offer.get("task_id")),
+                    short_id(offer_id),
+                    short_id(worker_id),
+                    len(self._overflow_offers),
+                )
+            else:
+                # Put back and stop; worker may have disconnected mid-send.
+                if offer_id and offer_id not in self._overflow_offer_ids:
+                    self._overflow_offers.appendleft(offer)
+                    self._overflow_offer_ids.add(offer_id)
+                break
+        return delivered
 
     def disconnect(self, worker_id: str) -> None:
         self._sessions.pop(worker_id, None)
@@ -413,6 +518,29 @@ class WorkerGateway:
 
         next_worker = self.select_worker_round_robin(exclude_worker_ids=attempted)
         if not next_worker:
+            if self._enqueue_overflow(offer):
+                logger.info(
+                    "capacity reject: overflow queued task=%s offer=%s from=%s "
+                    "attempted=%d pending=%d",
+                    short_id(task_id),
+                    short_id(offer_id),
+                    short_id(worker_id),
+                    len(attempted),
+                    len(self._overflow_offers),
+                )
+                await self._send_to_worker(
+                    worker_id,
+                    {
+                        "type": "task_result_ack",
+                        "task_id": task_id,
+                        "offer_id": offer_id,
+                        "received": True,
+                        "status": "late_superseded",
+                        "reason": f"queued_after_capacity:{msg.get('error')}",
+                    },
+                )
+                self._schedule_overflow_drain()
+                return True
             logger.warning(
                 "capacity reject: no alternate worker task=%s offer=%s from=%s "
                 "attempted=%d error=%s",
@@ -736,9 +864,14 @@ class WorkerGateway:
         return selected
 
     async def deliver_task_offer_batch(self, offers: list[dict]) -> tuple[int, int]:
-        """Deliver a task offer batch with global-gateway-style worker selection."""
+        """Deliver a task offer batch with global-gateway-style worker selection.
+
+        When no idle worker is available, offers are held in the local overflow
+        queue and delivered as workers free (not rejected upstream).
+        """
         delivered = 0
         failed = 0
+        queued = 0
         batch_used_ips: set[str] = set()
         batch_assigned_workers: set[str] = set()
         batch_assigned_counts: dict[str, int] = {}
@@ -754,14 +887,18 @@ class WorkerGateway:
                 batch_assigned_counts=batch_assigned_counts,
             )
             if not worker_id:
-                logger.warning(
-                    "No local worker with capacity for batch offer task=%s "
-                    "(prefer_idle=%s allow_busy_reuse=%s)",
-                    offer.get("task_id"),
-                    PREFER_IDLE_WORKERS,
-                    ALLOW_BUSY_WORKER_REUSE,
-                )
-                failed += 1
+                if self._enqueue_overflow(offer):
+                    queued += 1
+                else:
+                    logger.warning(
+                        "No local worker with capacity for batch offer task=%s "
+                        "(prefer_idle=%s allow_busy_reuse=%s overflow=%s)",
+                        offer.get("task_id"),
+                        PREFER_IDLE_WORKERS,
+                        ALLOW_BUSY_WORKER_REUSE,
+                        OVERFLOW_QUEUE_ENABLED,
+                    )
+                    failed += 1
                 continue
 
             if await self.deliver_task_offer(worker_id, offer):
@@ -774,12 +911,26 @@ class WorkerGateway:
                 if ip:
                     batch_used_ips.add(ip)
             else:
-                failed += 1
-                logger.warning(
-                    "Failed to forward task offer to local worker: worker=%s task=%s",
-                    worker_id,
-                    offer.get("task_id"),
-                )
+                # Send failed — keep offer for another worker when one frees.
+                if self._enqueue_overflow(offer):
+                    queued += 1
+                else:
+                    failed += 1
+                    logger.warning(
+                        "Failed to forward task offer to local worker: worker=%s task=%s",
+                        worker_id,
+                        offer.get("task_id"),
+                    )
+
+        if queued:
+            logger.info(
+                "_workers | batch overflow queued=%s delivered=%s failed=%s pending=%s",
+                queued,
+                delivered,
+                failed,
+                len(self._overflow_offers),
+            )
+            self._schedule_overflow_drain()
 
         return delivered, failed
 
