@@ -4417,7 +4417,19 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
             )
             return False
 
+        # Free the WS slot BEFORE task_result. Orch delivers the next queued offer
+        # as soon as it sees task_done; if we still hold the slot until after ack,
+        # that push gets queue_full and overflow hops across workers (multi-ms delay).
+        def _release_before_result() -> None:
+            nonlocal reserved_capacity
+            if reserved_capacity:
+                release_ws_capacity(
+                    state, task_key, estimated_bytes, reserved_capacity
+                )
+                reserved_capacity = False
+
         if uses_predefined_etag_early_submit(transfer_context):
+            _release_before_result()
             return await _handle_ws_task_predefined_etag_early_result(
                 state,
                 websocket,
@@ -4446,6 +4458,7 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
                 task_id=task_id,
                 offer_id=offer_id,
             )
+        _release_before_result()
         finalized = await _finalize_ws_task(
             websocket,
             state,

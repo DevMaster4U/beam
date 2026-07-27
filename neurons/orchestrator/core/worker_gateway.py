@@ -617,11 +617,33 @@ class WorkerGateway:
         text = str(error or "").strip().lower()
         return text.startswith("queue_full") or text.startswith("memory_budget")
 
+    def _schedule_capacity_retry(self, worker_id: str, *, delay_s: float = 0.05) -> None:
+        """Retry overflow to the same worker after a brief yield (slot race)."""
+        wid = str(worker_id)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        async def _retry() -> None:
+            try:
+                await asyncio.sleep(max(0.01, delay_s))
+            except asyncio.CancelledError:
+                return
+            self._clear_worker_dispatch_block(wid)
+            if self._overflow_offers:
+                self._overflow_prefer_worker = wid
+                self._schedule_overflow_drain()
+
+        loop.create_task(_retry(), name=f"capacity-retry-{wid[:8]}")
+
     async def _maybe_reassign_on_capacity_reject(
         self, worker_id: str, msg: dict
     ) -> bool:
-        """If worker rejected for queue/memory, park offer on overflow until a
-        worker finishes successfully (do not hop immediately — that storms).
+        """If worker rejected for queue/memory, re-queue and retry same worker.
+
+        Do not hop across every finishing worker — that adds multi-ms delay and
+        storms. Brief defer lets the worker finish releasing its WS slot.
         """
         if bool(msg.get("success")):
             return False
@@ -646,14 +668,14 @@ class WorkerGateway:
 
         attempted = self._offer_attempted_workers.setdefault(offer_id, set())
         attempted.add(str(worker_id))
-        # Do not re-dispatch immediately — park and wait for a real free worker.
         self.mark_worker_idle(worker_id, offer_id, drain_overflow=False)
-        self._block_worker_dispatch(worker_id, cooldown_s=1.0)
+        # Short block so concurrent drains skip this worker until deferred retry.
+        self._block_worker_dispatch(worker_id, cooldown_s=0.05)
 
         if self._enqueue_overflow(offer):
             logger.info(
                 "capacity reject: re-queued task=%s offer=%s from=%s "
-                "attempted=%d pending=%d (wait for task_done)",
+                "attempted=%d pending=%d (retry same worker)",
                 short_id(task_id),
                 short_id(offer_id),
                 short_id(worker_id),
@@ -671,6 +693,7 @@ class WorkerGateway:
                     "reason": f"queued_after_capacity:{msg.get('error')}",
                 },
             )
+            self._schedule_capacity_retry(worker_id, delay_s=0.05)
             return True
 
         logger.warning(
@@ -1069,17 +1092,26 @@ class WorkerGateway:
             )
             offer_id = msg.get("offer_id") or msg.get("task_id")
             if await self._maybe_reassign_on_capacity_reject(worker_id, msg):
-                # Offer re-queued; wait for a later task_done to dispatch.
+                # Offer re-queued; deferred retry handles re-deliver.
                 return
             self._log_external_task_result(worker_id, msg)
-            await self._relay_task_result(worker_id, msg)
-            self._clear_pending_offer(str(offer_id) if offer_id else None)
             transfer_mbps = msg.get("transfer_mbps")
             if transfer_mbps is not None:
                 self._get_profile(worker_id).observe_transfer(transfer_mbps)
-            # Successful (or non-capacity) result: worker is free for next queued offer.
+
+            # 1) Free slot + deliver next queued offer to this worker FIRST
+            # 2) Then relay/submit task_result upstream (BeamCore)
             self._clear_worker_dispatch_block(worker_id)
-            self.mark_worker_idle(worker_id, str(offer_id) if offer_id else None)
+            self.mark_worker_idle(
+                worker_id,
+                str(offer_id) if offer_id else None,
+                drain_overflow=False,
+            )
+            self._overflow_prefer_worker = worker_id
+            await self._drain_overflow_queue()
+
+            self._clear_pending_offer(str(offer_id) if offer_id else None)
+            await self._relay_task_result(worker_id, msg)
         else:
             logger.debug("Unhandled worker message type %s from %s", msg_type, worker_id)
 
