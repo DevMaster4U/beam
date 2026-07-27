@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Manage one worker instance via systemd (beam-worker@<instance>.service).
 #
-# First-time setup (AWS EC2 / Ubuntu):
+# First-time setup (Ubuntu worker host):
+#   ./scripts/setup-worker-host.sh --create-wallet --write-env --install-systemd
+# Or EC2 / multi-role host:
 #   ./scripts/setup-ec2.sh
 #   sudo ./scripts/install-systemd.sh --enable
 #   sudo ./scripts/install-systemd.sh --enable-workers

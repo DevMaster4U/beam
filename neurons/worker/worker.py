@@ -295,6 +295,19 @@ MAX_CONCURRENT_TASKS = max(1, int(os.environ.get("WORKER_MAX_CONCURRENT_TASKS", 
 MAX_QUEUED_WS_TASKS = max(
     1, int(os.environ.get("WORKER_MAX_QUEUED_WS_TASKS", str(MAX_CONCURRENT_TASKS)))
 )
+# Orch scheduling capacity (worker_hello.max_concurrent_tasks). Default = queue
+# depth so the gateway may deliver up to N offers while this process still runs
+# only MAX_CONCURRENT_TASKS at a time (one-by-one when CONCURRENT=1).
+_advertised = os.environ.get("WORKER_ADVERTISED_MAX_TASKS", "").strip()
+try:
+    if _advertised:
+        ADVERTISED_MAX_TASKS = max(1, int(_advertised))
+    else:
+        ADVERTISED_MAX_TASKS = max(MAX_CONCURRENT_TASKS, MAX_QUEUED_WS_TASKS)
+except ValueError:
+    ADVERTISED_MAX_TASKS = max(MAX_CONCURRENT_TASKS, MAX_QUEUED_WS_TASKS)
+# Keep local accept limit at least as large as what we advertise to orch.
+MAX_QUEUED_WS_TASKS = max(MAX_QUEUED_WS_TASKS, ADVERTISED_MAX_TASKS)
 MAX_IN_FLIGHT_BYTES = max(
     DEFAULT_CHUNK_SIZE_BYTES,
     int(os.environ.get("WORKER_MAX_IN_FLIGHT_BYTES", str(256 * 1024 * 1024))),
@@ -3859,7 +3872,9 @@ async def ws_send_worker_hello(websocket, state: WorkerState) -> bool:
             "worker_version": WORKER_VERSION,
             "ip": ip,
             "claimed_bandwidth_mbps": 100,
-            "max_concurrent_tasks": MAX_CONCURRENT_TASKS,
+            # Orch uses this as delivery capacity (active < N). Execution
+            # parallelism is still limited by MAX_CONCURRENT_TASKS / semaphore.
+            "max_concurrent_tasks": ADVERTISED_MAX_TASKS,
             "initial_order": WORKER_INITIAL_ORDER,
         }
         await ws_send_json(websocket, state, msg)
@@ -4794,6 +4809,46 @@ def _wallet_fields_from_config(config: Any) -> tuple[str, str, str]:
     return name, hotkey, path
 
 
+def _config_network(config: Any, default: str = "finney") -> str:
+    st = getattr(config, "subtensor", None)
+    if st is None and isinstance(config, dict):
+        st = config.get("subtensor")
+    if st is None:
+        return default
+    if isinstance(st, dict):
+        return str(st.get("network", default) or default)
+    if hasattr(st, "get"):
+        try:
+            return str(st.get("network", default) or default)
+        except Exception:
+            pass
+    return str(getattr(st, "network", default) or default)
+
+
+def _config_from_argparse(parsed: argparse.Namespace) -> Any:
+    """Build a Config-like namespace for bittensor>=11 (no bt.Config)."""
+    from types import SimpleNamespace
+
+    def _arg(dotted: str, fallback: str) -> str:
+        val = getattr(parsed, dotted, None)
+        if val is None or str(val).strip() == "":
+            return fallback
+        return str(val)
+
+    wallet = SimpleNamespace(
+        name=_arg("wallet.name", "default"),
+        hotkey=_arg("wallet.hotkey", "default"),
+        path=_arg("wallet.path", "~/.bittensor/wallets/"),
+    )
+    subtensor = SimpleNamespace(
+        network=_arg("subtensor.network", "finney"),
+    )
+    # Mimic legacy Config mapping API used by callers.
+    subtensor.get = lambda key, default=None: getattr(subtensor, key, default)  # type: ignore[attr-defined]
+    wallet.get = lambda key, default=None: getattr(wallet, key, default)  # type: ignore[attr-defined]
+    return SimpleNamespace(wallet=wallet, subtensor=subtensor)
+
+
 def get_config():
     """Get configuration from command line arguments and workspace .env."""
     os.environ.setdefault("BT_NO_PARSE_CLI_ARGS", "false")
@@ -4804,9 +4859,8 @@ def get_config():
     config_cls = getattr(bt, "Config", None)
     args = _build_cli_args()
     if config_cls is None:
-        raise RuntimeError(
-            f"bittensor.Config missing (bittensor={getattr(bt, '__version__', '?')})"
-        )
+        # bittensor 11+: Config removed — argparse + SimpleNamespace.
+        return _config_from_argparse(parser.parse_args(args))
     try:
         return config_cls(parser, args=args)
     except TypeError:
@@ -4829,19 +4883,21 @@ def load_worker_wallet(config: Any):
     )
     path = os.environ.get("WALLET_PATH", "").strip() or path
 
+    # bittensor 11: Wallet(name=, hotkey=, path=) only — no config=/add_args.
+    try:
+        return bt.Wallet(name=name, hotkey=hotkey, path=path)
+    except TypeError:
+        pass
     try:
         return bt.Wallet(config=config)
     except Exception as cfg_exc:
-        try:
-            return bt.Wallet(name=name, hotkey=hotkey, path=path)
-        except Exception as direct_exc:
-            raise RuntimeError(
-                "Failed to load bittensor Wallet "
-                f"(bittensor={getattr(bt, '__version__', '?')}, "
-                f"has_add_args={callable(getattr(bt.Wallet, 'add_args', None))}). "
-                f"config_error={cfg_exc}; direct_error={direct_exc}. "
-                "Try: pip install -U 'bittensor>=7' bittensor_wallet"
-            ) from direct_exc
+        raise RuntimeError(
+            "Failed to load bittensor Wallet "
+            f"(bittensor={getattr(bt, '__version__', '?')}, "
+            f"name={name!r} hotkey={hotkey!r} path={path!r}). "
+            f"error={cfg_exc}. "
+            "Try: pip install -U 'bittensor>=10.4.0' bittensor-wallet"
+        ) from cfg_exc
 
 
 async def main():
@@ -4879,7 +4935,7 @@ async def main():
         sys.exit(1)
 
     # Determine API URL based on network
-    network = config.subtensor.get("network", "finney")
+    network = _config_network(config, "finney")
     if network not in ("finney", "mainnet"):
         api_url = os.environ.get("CORE_SERVER_URL")
         if not api_url:
@@ -4903,7 +4959,8 @@ async def main():
     else:
         print("Worker gateway URL: MISSING")
     print(
-        f"Worker limits: concurrency={MAX_CONCURRENT_TASKS}, "
+        f"Worker limits: execute={MAX_CONCURRENT_TASKS}, "
+        f"queue/advertised={ADVERTISED_MAX_TASKS}, "
         f"ws_queue={MAX_QUEUED_WS_TASKS}, "
         f"in_flight={MAX_IN_FLIGHT_BYTES // (1024 * 1024)} MiB"
     )

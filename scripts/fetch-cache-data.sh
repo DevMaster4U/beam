@@ -42,7 +42,7 @@ Environment (from env-file or shell):
   CONTROL_SERVER_URL      HTTP base (derived from WS if omitted)
   CONTROL_SERVER_SECRET   Shared secret
   LOG_DIR                 Default: ${ROOT}/logs
-  FETCH_CACHE_PARALLEL    Concurrent segment downloads (default: 2)
+  FETCH_CACHE_PARALLEL    Concurrent segment downloads (default: 1)
 EOF
 }
 
@@ -157,9 +157,9 @@ if skip_chunks:
 
 store = ByteRangeStore(range_dir)
 try:
-    parallel = max(1, int(os.environ.get("FETCH_CACHE_PARALLEL", "2")))
+    parallel = max(1, int(os.environ.get("FETCH_CACHE_PARALLEL", "1")))
 except ValueError:
-    parallel = 2
+    parallel = 1
 
 jobs: list[tuple[str, int, int]] = []
 skipped = 0
@@ -178,9 +178,11 @@ for src in sources:
             continue
         jobs.append((source_url, start, end))
 
+# Banner must appear — if you only see "Downloading ranges into …" with no
+# mode=stream line, you are running the old OOM-prone script.
 print(
     f"Downloading ranges into {range_dir} "
-    f"(pending={len(jobs)} skipped_covered={skipped} parallel={parallel})"
+    f"mode=stream pending={len(jobs)} skipped_covered={skipped} parallel={parallel}"
 )
 
 
