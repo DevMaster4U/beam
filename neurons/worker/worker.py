@@ -413,6 +413,15 @@ TASK_RESULT_TERMINAL_STATUSES = TASK_RESULT_ACK_STATUSES - {"retry"}
 WORKER_PREDEFINED_ETAG_EARLY_SUBMIT = _env_bool("WORKER_PREDEFINED_ETAG_EARLY_SUBMIT", True)
 # true: use local range_data/cache when coverage exists; false: always fetch from source.
 WORKER_USE_CACHE_FILE = _env_bool("WORKER_USE_CACHE_FILE", True)
+# Log disk vs network breakdown for cache→PUT (diagnose rotating slow workers).
+WORKER_UPLOAD_PERF_LOG = _env_bool("WORKER_UPLOAD_PERF_LOG", True)
+# When >0, always emit upload_perf; when set, also tag slow runs below this Mbps.
+try:
+    WORKER_UPLOAD_PERF_SLOW_MBPS = float(
+        os.environ.get("WORKER_UPLOAD_PERF_SLOW_MBPS", "150")
+    )
+except ValueError:
+    WORKER_UPLOAD_PERF_SLOW_MBPS = 150.0
 # true: compute sha256 and verify against offer chunk_hash/chunk_hashes when present.
 WORKER_VERIFY_CHUNK_HASH = _env_bool("WORKER_VERIFY_CHUNK_HASH", True)
 PREDEFINED_ETAG_MAX_PARALLEL = max(
@@ -1716,6 +1725,126 @@ async def _iter_predefined_etag_range_chunks(transfer_context: dict):
             yield part
 
 
+def _cache_range_layout(transfer_context: dict) -> dict:
+    """Describe how a cached range is stored (segment count / 1GiB cross)."""
+    gib = 1 << 30
+    source, start, end = _transfer_byte_range(transfer_context)
+    cross_gib = (start // gib) != (end // gib)
+    layout: dict = {
+        "backend": "miss",
+        "seg_n": 0,
+        "cross_gib": cross_gib,
+        "gib_span": f"{start // gib}-{end // gib}",
+        "files": "-",
+    }
+    if not source:
+        return layout
+    store = get_worker_range_store()
+    if store.covers(source, start, end):
+        covering = store.find_covering_segments(source, start, end)
+        if covering:
+            names: list[str] = []
+            for seg in covering:
+                path = store.segment_path(source, seg)
+                names.append(path.name)
+            layout.update(
+                {
+                    "backend": "range_store",
+                    "seg_n": len(covering),
+                    "files": ",".join(names),
+                }
+            )
+            return layout
+    path = predefined_etag_chunk_data_path(transfer_context)
+    if path.is_file() and path.stat().st_size > 0:
+        layout.update(
+            {
+                "backend": "legacy_file",
+                "seg_n": 1,
+                "files": path.name,
+            }
+        )
+    return layout
+
+
+def _log_upload_perf(
+    *,
+    log_prefix: str,
+    task_id: Optional[str],
+    offer_id: Optional[str],
+    transfer_context: dict,
+    state: Optional["WorkerState"],
+    send_ms: float,
+    bytes_sent: int,
+    parts: int,
+    disk_ms: float,
+    net_wait_ms: float,
+    first_byte_ms: Optional[float],
+    layout: dict,
+    ok: bool,
+    error: Optional[str] = None,
+    attempt: int = 1,
+) -> None:
+    """One-line disk vs network breakdown for cache_stream PUTs."""
+    if not WORKER_UPLOAD_PERF_LOG:
+        return
+    mbps = transfer_mbps(bytes_sent, send_ms) if send_ms > 0 else 0.0
+    disk_mbps = transfer_mbps(bytes_sent, disk_ms) if disk_ms > 0 else 0.0
+    # Bound guess: if disk could have fed much faster than PUT, network/R2 dominates.
+    if send_ms <= 0:
+        bound = "unknown"
+    elif disk_ms <= 0:
+        bound = "network"
+    elif disk_ms >= send_ms * 0.6:
+        bound = "disk"
+    elif (net_wait_ms / max(send_ms, 1e-6)) >= 0.5:
+        bound = "network"
+    else:
+        bound = "mixed"
+    slow = (
+        WORKER_UPLOAD_PERF_SLOW_MBPS > 0 and mbps > 0 and mbps < WORKER_UPLOAD_PERF_SLOW_MBPS
+    )
+    dest_host = "-"
+    try:
+        dest_host = str(
+            object_storage_route_context(str(transfer_context.get("dest_url") or "")).get(
+                "destination_host"
+            )
+            or "-"
+        )
+    except Exception:
+        dest_host = "-"
+    dest_path = "-"
+    try:
+        dest_url = str(transfer_context.get("dest_url") or "")
+        parts_url = urlsplit(dest_url)
+        segs = [s for s in parts_url.path.split("/") if s]
+        dest_path = "/".join(segs[-3:]) if segs else "-"
+    except Exception:
+        dest_path = "-"
+    worker_ip = (state.worker_ip if state is not None else None) or "-"
+    in_flight = "-"
+    if state is not None:
+        in_flight = f"{len(state.active_ws_task_ids)}/{MAX_CONCURRENT_TASKS}"
+    chunk_id = chunk_id_from_transfer_context(transfer_context)
+    print(
+        f"{log_prefix} upload_perf task={task_label(task_id)} offer={task_label(offer_id)} "
+        f"chunk_id={chunk_id if chunk_id is not None else '?'} "
+        f"ok={str(ok).lower()} slow={str(slow).lower()} bound={bound} "
+        f"mbps={mbps:.1f} send_ms={send_ms:.1f} "
+        f"first_byte_ms={(first_byte_ms if first_byte_ms is not None else -1):.1f} "
+        f"disk_ms={disk_ms:.1f} disk_mbps={disk_mbps:.1f} "
+        f"net_wait_ms={net_wait_ms:.1f} "
+        f"bytes={bytes_sent} parts={parts} attempt={attempt} "
+        f"cache={layout.get('backend')} seg_n={layout.get('seg_n')} "
+        f"cross_gib={str(layout.get('cross_gib')).lower()} "
+        f"gib_span={layout.get('gib_span')} files={layout.get('files')} "
+        f"worker_ip={worker_ip} in_flight={in_flight} "
+        f"dest_host={dest_host} dest={dest_path}"
+        + (f" error={error}" if error else "")
+    )
+
+
 async def _hash_cache_stream(
     transfer_context: dict,
     *,
@@ -1729,6 +1858,27 @@ async def _hash_cache_stream(
     if algo == "md5":
         return f'"{digest}"'
     return digest
+
+
+def _sync_iter_predefined_etag_range_chunks(transfer_context: dict):
+    """Sync iterator over cached range bytes (for timed disk reads during PUT)."""
+    source, start, end = _transfer_byte_range(transfer_context)
+    store = get_worker_range_store()
+    if source and store.covers(source, start, end):
+        iterator = store.iter_slice(
+            source, start, end, chunk_size=FETCH_STREAM_CHUNK_SIZE
+        )
+        if iterator is not None:
+            yield from iterator
+            return
+    path = predefined_etag_chunk_data_path(transfer_context)
+    if path.is_file() and path.stat().st_size > 0:
+        with path.open("rb") as handle:
+            while True:
+                part = handle.read(FETCH_STREAM_CHUNK_SIZE)
+                if not part:
+                    break
+                yield part
 
 
 async def stream_cache_upload_to_dest(
@@ -1746,18 +1896,48 @@ async def stream_cache_upload_to_dest(
     dest_headers = transfer_context.get("dest_headers") or {}
     source_url = str(transfer_context.get("source_url") or "")
     dest_url = str(transfer_context["dest_url"])
+    layout = _cache_range_layout(transfer_context)
+    perf = {
+        "bytes": 0,
+        "parts": 0,
+        "disk_ms": 0.0,
+        "net_wait_ms": 0.0,
+        "first_byte_ms": None,
+    }
+    put_t0: dict[str, Optional[float]] = {"t": None}
 
     async def body_stream():
-        if PREDEFINED_ETAG_MAX_SPEED_MBPS > 0:
-            bytes_per_sec = PREDEFINED_ETAG_MAX_SPEED_MBPS * 1_000_000 / 8
-            async for part in _iter_predefined_etag_range_chunks(transfer_context):
-                yield part
+        rate_limited = PREDEFINED_ETAG_MAX_SPEED_MBPS > 0
+        bytes_per_sec = (
+            PREDEFINED_ETAG_MAX_SPEED_MBPS * 1_000_000 / 8 if rate_limited else 0.0
+        )
+        sync_parts = _sync_iter_predefined_etag_range_chunks(transfer_context)
+        while True:
+            t_read0 = time.perf_counter()
+            try:
+                part = next(sync_parts)
+            except StopIteration:
+                break
+            # Time spent reading this chunk from disk/segment files.
+            perf["disk_ms"] += (time.perf_counter() - t_read0) * 1000
+            if put_t0["t"] is not None and perf["first_byte_ms"] is None:
+                perf["first_byte_ms"] = (time.perf_counter() - put_t0["t"]) * 1000
+            perf["bytes"] += len(part)
+            perf["parts"] += 1
+            t_yield = time.perf_counter()
+            yield part
+            # Time until httpx asks for the next chunk ≈ network/R2 backpressure.
+            perf["net_wait_ms"] += (time.perf_counter() - t_yield) * 1000
+            if rate_limited and bytes_per_sec > 0:
                 await asyncio.sleep(len(part) / bytes_per_sec)
-        else:
-            async for part in _iter_predefined_etag_range_chunks(transfer_context):
-                yield part
 
     async def _put_once(client: httpx.AsyncClient) -> tuple[float, Optional[str]]:
+        put_t0["t"] = time.perf_counter()
+        perf["bytes"] = 0
+        perf["parts"] = 0
+        perf["disk_ms"] = 0.0
+        perf["net_wait_ms"] = 0.0
+        perf["first_byte_ms"] = None
         return await upload_buffered_predefined_etag(
             client,
             destination_url=dest_url,
@@ -1786,9 +1966,28 @@ async def stream_cache_upload_to_dest(
                 else:
                     async with httpx.AsyncClient(timeout=SEND_TIMEOUT) as tmp_client:
                         send_ms, etag = await _put_once(tmp_client)
+                _log_upload_perf(
+                    log_prefix=log_prefix,
+                    task_id=task_id,
+                    offer_id=offer_id,
+                    transfer_context=transfer_context,
+                    state=state,
+                    send_ms=send_ms,
+                    bytes_sent=int(perf["bytes"] or chunk_size),
+                    parts=int(perf["parts"]),
+                    disk_ms=float(perf["disk_ms"]),
+                    net_wait_ms=float(perf["net_wait_ms"]),
+                    first_byte_ms=perf["first_byte_ms"],
+                    layout=layout,
+                    ok=True,
+                    attempt=attempt + 1,
+                )
                 return True, send_ms, etag, None
             except Exception as exc:
                 last_error = exc
+                send_ms_fail = 0.0
+                if put_t0["t"] is not None:
+                    send_ms_fail = (time.perf_counter() - put_t0["t"]) * 1000
                 can_retry = is_retryable(exc) and attempt < MAX_RETRIES - 1
                 if is_object_storage_presigned_url(dest_url) and (
                     not can_retry or attempt == MAX_RETRIES - 1
@@ -1801,6 +2000,23 @@ async def stream_cache_upload_to_dest(
                         f"{format_route_context(object_storage_route_context(dest_url))}"
                     )
                 if not can_retry:
+                    _log_upload_perf(
+                        log_prefix=log_prefix,
+                        task_id=task_id,
+                        offer_id=offer_id,
+                        transfer_context=transfer_context,
+                        state=state,
+                        send_ms=send_ms_fail,
+                        bytes_sent=int(perf["bytes"] or 0),
+                        parts=int(perf["parts"]),
+                        disk_ms=float(perf["disk_ms"]),
+                        net_wait_ms=float(perf["net_wait_ms"]),
+                        first_byte_ms=perf["first_byte_ms"],
+                        layout=layout,
+                        ok=False,
+                        error=exception_detail(exc),
+                        attempt=attempt + 1,
+                    )
                     return False, 0.0, None, exception_detail(exc)
                 print(
                     "[Worker] Transfer retry "
