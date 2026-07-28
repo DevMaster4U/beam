@@ -639,6 +639,13 @@ class Orchestrator:
         """Stop the Orchestrator."""
         self._running = False
 
+        # Persist dest×worker Mbps before tearing down connections / cwd changes.
+        if hasattr(self.worker_gateway, "flush_dest_worker_stats"):
+            try:
+                self.worker_gateway.flush_dest_worker_stats()
+            except Exception as exc:
+                logger.warning("dest affinity flush on stop failed: %s", exc)
+
         for task in self._background_tasks:
             task.cancel()
             try:

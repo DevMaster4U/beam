@@ -11,8 +11,11 @@ import os
 from collections import deque
 import json
 import logging
+import time
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable, Dict, Optional, Set
+from pathlib import Path
+from typing import Callable, Dict, Optional, Set
+from urllib.parse import urlsplit
 
 from core.relay_log import (
     chunk_id_from_transfer_context,
@@ -75,6 +78,209 @@ try:
     )
 except ValueError:
     OVERFLOW_BUSY_MAX_PER_WORKER = 5
+
+# Prefer free workers that historically upload faster to this dest_group
+# (backup/primary/…). Improves makespan / prism last-upload timing.
+DEST_AFFINITY_ENABLED = _env_bool("ORCH_DEST_AFFINITY", True)
+try:
+    DEST_AFFINITY_EMA = min(
+        1.0, max(0.05, float(os.environ.get("ORCH_DEST_AFFINITY_EMA", "0.35")))
+    )
+except ValueError:
+    DEST_AFFINITY_EMA = 0.35
+try:
+    DEST_AFFINITY_MIN_SAMPLES = max(
+        1, int(os.environ.get("ORCH_DEST_AFFINITY_MIN_SAMPLES", "1"))
+    )
+except ValueError:
+    DEST_AFFINITY_MIN_SAMPLES = 1
+_DEST_STATS_PATH_RAW = os.environ.get(
+    "ORCH_DEST_AFFINITY_STATS_PATH",
+    "logs/orchestrators/dest_worker_stats.json",
+).strip()
+
+
+def _resolve_stats_path(raw: str) -> Optional[Path]:
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    else:
+        path = path.resolve()
+    return path
+
+
+DEST_AFFINITY_STATS_PATH = _resolve_stats_path(_DEST_STATS_PATH_RAW)
+_DEST_SEED_CSV_RAW = os.environ.get(
+    "ORCH_DEST_AFFINITY_SEED_CSV",
+    "logs/orchestrators/orch5_worker_dest_avg.csv",
+).strip()
+DEST_AFFINITY_SEED_CSV = _resolve_stats_path(_DEST_SEED_CSV_RAW) if _DEST_SEED_CSV_RAW else None
+try:
+    DEST_AFFINITY_SAVE_INTERVAL_S = max(
+        1.0, float(os.environ.get("ORCH_DEST_AFFINITY_SAVE_INTERVAL_S", "10"))
+    )
+except ValueError:
+    DEST_AFFINITY_SAVE_INTERVAL_S = 10.0
+# Batch-assign free workers↔offers to minimize expected last completion
+# (makespan), not greedy max-Mbps per offer. Binary-search + matching.
+DEST_AFFINITY_MAKESPAN = _env_bool("ORCH_DEST_AFFINITY_MAKESPAN", True)
+_DEFAULT_OFFER_BYTES = 64.0 * 1024 * 1024
+
+
+def dest_group_from_url(dest_url: object) -> str:
+    """Extract destinations/<group>/… → group (e.g. backup, primary)."""
+    text = str(dest_url or "").strip()
+    if not text:
+        return ""
+    try:
+        parts = [p for p in urlsplit(text).path.split("/") if p]
+        if "destinations" in parts:
+            i = parts.index("destinations")
+            if i + 1 < len(parts):
+                return parts[i + 1]
+    except Exception:
+        return ""
+    return ""
+
+
+def dest_group_from_offer(offer: dict) -> str:
+    if not isinstance(offer, dict):
+        return ""
+    return dest_group_from_url(offer.get("dest_url"))
+
+
+def transfer_mbps_from_result(msg: dict) -> Optional[float]:
+    """Prefer transfer_mbps; else derive from bytes_transferred / send_ms."""
+    if not isinstance(msg, dict):
+        return None
+    raw = msg.get("transfer_mbps")
+    if raw is not None:
+        try:
+            mbps = float(raw)
+            if mbps > 0:
+                return mbps
+        except (TypeError, ValueError):
+            pass
+    try:
+        nbytes = float(msg.get("bytes_transferred") or 0.0)
+        send_ms = float(msg.get("send_ms") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if nbytes <= 0 or send_ms <= 0:
+        return None
+    return (nbytes * 8.0) / (send_ms / 1000.0) / 1_000_000.0
+
+
+def offer_byte_size(offer: dict) -> float:
+    """Best-effort payload size from range fields / Range header."""
+    if not isinstance(offer, dict):
+        return _DEFAULT_OFFER_BYTES
+    start = offer.get("range_start")
+    end = offer.get("range_end")
+    if start is None or end is None:
+        headers = offer.get("source_headers") or {}
+        if isinstance(headers, dict):
+            range_hdr = str(headers.get("Range") or headers.get("range") or "")
+            if range_hdr.lower().startswith("bytes="):
+                try:
+                    start_s, end_s = range_hdr.split("=", 1)[1].split("-", 1)
+                    start = int(start_s)
+                    end = int(end_s)
+                except (TypeError, ValueError):
+                    start, end = None, None
+    try:
+        if start is not None and end is not None:
+            size = float(int(end) - int(start) + 1)
+            if size > 0:
+                return size
+    except (TypeError, ValueError):
+        pass
+    return _DEFAULT_OFFER_BYTES
+
+
+def expected_transfer_seconds(nbytes: float, mbps: float) -> float:
+    """Wall seconds for nbytes at mbps (megabits/sec)."""
+    rate = max(float(mbps), 1.0)
+    return (max(float(nbytes), 1.0) * 8.0) / (rate * 1_000_000.0)
+
+
+def min_makespan_assignment(
+    costs: list[list[float]],
+) -> tuple[list[int], float]:
+    """Assign each task to a distinct worker minimizing max cost (makespan).
+
+    ``costs[t][w]`` = expected seconds. Returns (task→worker index, makespan).
+    Requires ``len(tasks) <= len(workers)``. Hungarian minimizes sum; this is the
+    bottleneck/makespan analogue (binary search + bipartite matching).
+    """
+    n_tasks = len(costs)
+    if n_tasks == 0:
+        return [], 0.0
+    n_workers = len(costs[0]) if costs else 0
+    if n_workers < n_tasks:
+        raise ValueError("min_makespan_assignment needs workers >= tasks")
+
+    thresholds = sorted({float(c) for row in costs for c in row})
+    if not thresholds:
+        return [-1] * n_tasks, 0.0
+
+    def _matching(limit: float) -> Optional[list[int]]:
+        match_w = [-1] * n_workers
+
+        def dfs(task: int, seen: list[bool]) -> bool:
+            for w in range(n_workers):
+                if costs[task][w] > limit or seen[w]:
+                    continue
+                seen[w] = True
+                if match_w[w] < 0 or dfs(match_w[w], seen):
+                    match_w[w] = task
+                    return True
+            return False
+
+        for t in range(n_tasks):
+            if not dfs(t, [False] * n_workers):
+                return None
+        assign = [-1] * n_tasks
+        for w, t in enumerate(match_w):
+            if t >= 0:
+                assign[t] = w
+        return assign
+
+    best_assign: Optional[list[int]] = None
+    best_t = thresholds[-1]
+    lo, hi = 0, len(thresholds) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        limit = thresholds[mid]
+        assign = _matching(limit)
+        if assign is not None:
+            best_assign = assign
+            best_t = limit
+            hi = mid - 1
+        else:
+            lo = mid + 1
+
+    if best_assign is None:
+        # Should not happen if finite costs; fall back to greedy by row min.
+        best_assign = []
+        used: set[int] = set()
+        makespan = 0.0
+        for t in range(n_tasks):
+            order = sorted(range(n_workers), key=lambda w: costs[t][w])
+            pick = next((w for w in order if w not in used), -1)
+            best_assign.append(pick)
+            if pick >= 0:
+                used.add(pick)
+                makespan = max(makespan, costs[t][pick])
+        return best_assign, makespan
+
+    makespan = 0.0
+    for t, w in enumerate(best_assign):
+        if w >= 0:
+            makespan = max(makespan, costs[t][w])
+    return best_assign, makespan
 
 
 @dataclass
@@ -153,6 +359,11 @@ class WorkerGateway:
         # Workers that recently returned queue_full — skip until success or cooldown.
         self._dispatch_blocked: Set[str] = set()
         self._dispatch_unblock_tasks: Dict[str, asyncio.Task] = {}
+        # dest_group → worker_id → {ema, n, updated_at}
+        self._dest_worker_stats: Dict[str, Dict[str, dict]] = {}
+        self._dest_stats_dirty = False
+        self._dest_stats_last_save = 0.0
+        self._load_dest_worker_stats()
 
     def set_upstream(self, upstream: object) -> None:
         self._upstream = upstream
@@ -179,6 +390,386 @@ class WorkerGateway:
             self._profiles[worker_id] = profile
         return profile
 
+    def _load_dest_worker_stats(self) -> None:
+        """Load dest_group→worker Mbps history from JSON (or CSV seed)."""
+        path = DEST_AFFINITY_STATS_PATH
+        loaded = 0
+        source = ""
+        if path is not None and path.is_file():
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                loaded = self._ingest_dest_stats_dict(raw)
+                source = str(path)
+            except Exception as exc:
+                logger.warning(
+                    "dest affinity stats load failed path=%s: %s", path, exc
+                )
+        if loaded == 0 and DEST_AFFINITY_SEED_CSV is not None:
+            loaded = self._load_dest_worker_stats_from_csv(DEST_AFFINITY_SEED_CSV)
+            if loaded:
+                source = str(DEST_AFFINITY_SEED_CSV)
+                self._dest_stats_dirty = True
+                self._maybe_save_dest_worker_stats(force=True)
+
+        if loaded:
+            logger.info(
+                "dest affinity loaded %d worker×dest rows from %s",
+                loaded,
+                source or "?",
+            )
+        elif path is not None:
+            logger.info(
+                "dest affinity stats empty (will create on uploads) path=%s",
+                path,
+            )
+
+    def _ingest_dest_stats_dict(self, raw: object) -> int:
+        if not isinstance(raw, dict):
+            return 0
+        loaded = 0
+        for dest_group, workers in raw.items():
+            if not isinstance(dest_group, str) or not isinstance(workers, dict):
+                continue
+            group = dest_group.strip()
+            if not group or group == "?":
+                continue
+            bucket = self._dest_worker_stats.setdefault(group, {})
+            for worker_id, entry in workers.items():
+                if not isinstance(worker_id, str) or not isinstance(entry, dict):
+                    continue
+                wid = worker_id.strip()
+                if not wid:
+                    continue
+                try:
+                    ema = float(entry.get("ema") or entry.get("avg_mbps") or 0.0)
+                    n = int(entry.get("n") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if ema <= 0 or n <= 0:
+                    continue
+                bucket[wid] = {
+                    "ema": ema,
+                    "n": n,
+                    "updated_at": float(entry.get("updated_at") or 0.0),
+                }
+                loaded += 1
+        return loaded
+
+    def _load_dest_worker_stats_from_csv(self, csv_path: Path) -> int:
+        """Seed from analyze-orch-log --avg-by-worker-dest CSV (may use short ids)."""
+        if csv_path is None or not csv_path.is_file():
+            return 0
+        try:
+            text = csv_path.read_text(encoding="utf-8")
+        except Exception as exc:
+            logger.warning(
+                "dest affinity CSV seed failed path=%s: %s", csv_path, exc
+            )
+            return 0
+        lines = text.splitlines()
+        if not lines:
+            return 0
+        loaded = 0
+        for line in lines[1:]:
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 4:
+                continue
+            wid, group, n_s, avg_s = parts[0], parts[1], parts[2], parts[3]
+            if not wid or not group or group == "?":
+                continue
+            try:
+                n = int(float(n_s))
+                ema = float(avg_s)
+            except (TypeError, ValueError):
+                continue
+            if n <= 0 or ema <= 0:
+                continue
+            bucket = self._dest_worker_stats.setdefault(group, {})
+            bucket[wid] = {"ema": ema, "n": n, "updated_at": 0.0}
+            loaded += 1
+        return loaded
+
+    def _remap_dest_stats_worker_id(self, worker_id: str) -> None:
+        """Promote short/prefix CSV keys to the live full worker_id."""
+        wid = str(worker_id or "").strip()
+        if not wid:
+            return
+        for _group, bucket in self._dest_worker_stats.items():
+            if wid in bucket:
+                continue
+            matches = [
+                k
+                for k in list(bucket.keys())
+                if k != wid and (wid.startswith(k) or k.startswith(wid))
+            ]
+            if len(matches) != 1:
+                continue
+            bucket[wid] = bucket.pop(matches[0])
+            self._dest_stats_dirty = True
+
+    def _lookup_dest_entry(self, dest_group: str, worker_id: str) -> Optional[dict]:
+        bucket = self._dest_worker_stats.get(dest_group) or {}
+        entry = bucket.get(worker_id)
+        if entry is not None:
+            return entry
+        for key, ent in bucket.items():
+            if worker_id.startswith(key) or key.startswith(worker_id):
+                return ent
+        return None
+
+    def _maybe_save_dest_worker_stats(self, *, force: bool = False) -> None:
+        path = DEST_AFFINITY_STATS_PATH
+        if path is None:
+            return
+        # force=True (orch stop/restart): always write current snapshot.
+        if not force and not self._dest_stats_dirty:
+            return
+        now = time.time()
+        if (
+            not force
+            and (now - self._dest_stats_last_save) < DEST_AFFINITY_SAVE_INTERVAL_S
+        ):
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = json.dumps(self._dest_worker_stats, indent=2, sort_keys=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(payload, encoding="utf-8")
+            tmp.replace(path)
+            self._dest_stats_dirty = False
+            self._dest_stats_last_save = now
+            rows = sum(len(v) for v in self._dest_worker_stats.values())
+            if force:
+                logger.info(
+                    "dest affinity flushed %d worker×dest rows → %s",
+                    rows,
+                    path,
+                )
+            else:
+                logger.debug("dest affinity saved path=%s rows=%d", path, rows)
+        except Exception as exc:
+            logger.warning("dest affinity stats save failed path=%s: %s", path, exc)
+
+    def flush_dest_worker_stats(self) -> None:
+        """Persist dest_group→worker history (call on orch stop/restart)."""
+        self._dest_stats_dirty = True
+        self._maybe_save_dest_worker_stats(force=True)
+
+    def observe_dest_transfer(
+        self,
+        dest_group: str,
+        worker_id: str,
+        transfer_mbps: Optional[float],
+    ) -> None:
+        """Update EMA Mbps for (dest_group, worker) after a successful upload."""
+        if not DEST_AFFINITY_ENABLED:
+            return
+        group = str(dest_group or "").strip()
+        wid = str(worker_id or "").strip()
+        if not group or not wid or transfer_mbps is None:
+            return
+        try:
+            mbps = float(transfer_mbps)
+        except (TypeError, ValueError):
+            return
+        if mbps <= 0:
+            return
+        self._remap_dest_stats_worker_id(wid)
+        bucket = self._dest_worker_stats.setdefault(group, {})
+        entry = bucket.get(wid)
+        if entry is None:
+            bucket[wid] = {"ema": mbps, "n": 1, "updated_at": time.time()}
+        else:
+            prev = float(entry.get("ema") or mbps)
+            n = int(entry.get("n") or 0) + 1
+            entry["ema"] = (DEST_AFFINITY_EMA * mbps) + ((1.0 - DEST_AFFINITY_EMA) * prev)
+            entry["n"] = n
+            entry["updated_at"] = time.time()
+        self._dest_stats_dirty = True
+        self._maybe_save_dest_worker_stats()
+
+    def dest_worker_mbps(self, dest_group: str, worker_id: str) -> float:
+        """Historical Mbps for worker on dest_group; falls back to global avg."""
+        group = str(dest_group or "").strip()
+        wid = str(worker_id or "").strip()
+        if DEST_AFFINITY_ENABLED and group and wid:
+            entry = self._lookup_dest_entry(group, wid)
+            if entry is not None:
+                try:
+                    n = int(entry.get("n") or 0)
+                    ema = float(entry.get("ema") or 0.0)
+                except (TypeError, ValueError):
+                    n, ema = 0, 0.0
+                if n >= DEST_AFFINITY_MIN_SAMPLES and ema > 0:
+                    return ema
+        return self._get_profile(wid).average_mbps
+
+    def _free_workers_for_affinity_wave(self) -> list[str]:
+        """Idle, unblocked workers — prefer one per IP for the concurrent wave."""
+        used_ips: set[str] = set()
+        unique: list[str] = []
+        extras: list[str] = []
+        for wid in self._ordered_connected_worker_ids():
+            if not self._worker_is_free(wid):
+                continue
+            ip = self._get_profile(wid).ip.strip()
+            if ip and ip in used_ips:
+                extras.append(wid)
+                continue
+            if ip:
+                used_ips.add(ip)
+            unique.append(wid)
+        # First wave: unique IPs. Same-IP free workers join a later drain.
+        return unique if unique else extras
+
+    def _offer_expected_seconds(self, offer: dict, worker_id: str) -> float:
+        dest_g = dest_group_from_offer(offer)
+        mbps = self.dest_worker_mbps(dest_g, worker_id) if dest_g else (
+            self._get_profile(worker_id).average_mbps
+        )
+        if mbps <= 0:
+            mbps = 50.0  # cold-start prior — avoid infinite cost
+        return expected_transfer_seconds(offer_byte_size(offer), mbps)
+
+    def _assign_offers_min_makespan(
+        self,
+        offers: list[dict],
+        workers: list[str],
+    ) -> tuple[list[str], float]:
+        """Map offers → workers minimizing expected last completion time."""
+        if not offers or not workers:
+            return [], 0.0
+        n = min(len(offers), len(workers))
+        offers_n = offers[:n]
+        # Use the full free pool so matching can leave slow workers idle when
+        # there are more workers than offers in this wave.
+        workers_n = list(workers)
+        costs = [
+            [self._offer_expected_seconds(offer, wid) for wid in workers_n]
+            for offer in offers_n
+        ]
+        assign_idx, makespan = min_makespan_assignment(costs)
+        out: list[str] = []
+        for w_i in assign_idx:
+            if w_i < 0 or w_i >= len(workers_n):
+                out.append("")
+            else:
+                out.append(workers_n[w_i])
+        return out, makespan
+
+    async def _drain_affinity_makespan_wave(
+        self,
+        *,
+        batch_used_ips: set[str],
+        batch_assigned_counts: dict[str, int],
+    ) -> int:
+        """Assign next free-worker wave via min-makespan (last-done objective)."""
+        if not DEST_AFFINITY_ENABLED or not DEST_AFFINITY_MAKESPAN:
+            return 0
+        if not self._overflow_offers:
+            return 0
+
+        free = self._free_workers_for_affinity_wave()
+        if not free:
+            return 0
+
+        n = min(len(free), len(self._overflow_offers))
+        # Need ≥2 free workers for combinatorial assignment to matter.
+        if n <= 1:
+            return 0
+
+        offers = [self._overflow_offers[i] for i in range(n)]
+        worker_ids, makespan = self._assign_offers_min_makespan(offers, free)
+        if len(worker_ids) != n or any(not w for w in worker_ids):
+            return 0
+        # Guard against duplicate worker assignment (should not happen).
+        if len(set(worker_ids)) != n:
+            logger.warning(
+                "makespan assignment has duplicate workers; falling back to greedy"
+            )
+            return 0
+
+        for _ in range(n):
+            offer = self._overflow_offers.popleft()
+            oid = self._offer_key(offer)
+            if oid:
+                self._overflow_offer_ids.discard(oid)
+
+        # Parallel WS sends — serial await added ~N×RTT delay on first wave.
+        async def _deliver_one(
+            offer: dict, worker_id: str
+        ) -> tuple[dict, str, bool]:
+            ok = await self.deliver_task_offer(worker_id, offer)
+            return offer, worker_id, ok
+
+        results = await asyncio.gather(
+            *[_deliver_one(o, w) for o, w in zip(offers, worker_ids)],
+            return_exceptions=True,
+        )
+
+        delivered = 0
+        undelivered: list[dict] = []
+        for item, fallback in zip(results, zip(offers, worker_ids)):
+            offer_fb, worker_fb = fallback
+            if isinstance(item, BaseException):
+                logger.warning(
+                    "makespan deliver crashed worker=%s: %s",
+                    short_id(worker_fb),
+                    item,
+                )
+                undelivered.append(offer_fb)
+                continue
+            offer, worker_id, ok = item
+            if not ok:
+                undelivered.append(offer)
+                continue
+            delivered += 1
+            batch_assigned_counts[worker_id] = (
+                batch_assigned_counts.get(worker_id, 0) + 1
+            )
+            ip = self._get_profile(worker_id).ip.strip()
+            if ip:
+                batch_used_ips.add(ip)
+            profile = self._get_profile(worker_id)
+            dest_group = dest_group_from_offer(offer)
+            dest_mbps = (
+                self.dest_worker_mbps(dest_group, worker_id) if dest_group else 0.0
+            )
+            exp_s = self._offer_expected_seconds(offer, worker_id)
+            logger.info(
+                "_workers | queue_deliver task=%s offer=%s worker=%s "
+                "active=%d pending=%d pressure=%s dest_group=%s dest_mbps=%.1f "
+                "assign=makespan exp_s=%.2f makespan_s=%.2f",
+                short_id(offer.get("task_id")),
+                short_id(self._offer_key(offer)),
+                short_id(worker_id),
+                profile.active_count,
+                len(self._overflow_offers) + len(undelivered),
+                False,
+                dest_group or "-",
+                dest_mbps,
+                exp_s,
+                makespan,
+            )
+
+        for offer in reversed(undelivered):
+            oid = self._offer_key(offer)
+            if oid and oid not in self._overflow_offer_ids:
+                self._overflow_offers.appendleft(offer)
+                self._overflow_offer_ids.add(oid)
+            elif not oid:
+                self._overflow_offers.appendleft(offer)
+
+        if undelivered:
+            logger.warning(
+                "_workers | makespan_wave partial delivered=%d requeued=%d "
+                "pending=%d",
+                delivered,
+                len(undelivered),
+                len(self._overflow_offers),
+            )
+        return delivered
+
     def connect(self, worker_id: str, ws: object, *, ip: str = "") -> bool:
         if self.is_full() and worker_id not in self._sessions:
             logger.warning("Worker cap reached (%d); rejecting %s", MAX_WORKERS, worker_id)
@@ -191,6 +782,7 @@ class WorkerGateway:
         profile.active_offer_ids.clear()
         if ip.strip():
             profile.ip = ip.strip()
+        self._remap_dest_stats_worker_id(worker_id)
         logger.info(
             "Worker connected: %s version=%s ip=%s (%d/%d) queue_cleared=true",
             worker_id,
@@ -379,6 +971,22 @@ class WorkerGateway:
         self._overflow_prefer_worker = None
         batch_used_ips: set[str] = set()
         batch_assigned_counts: dict[str, int] = {}
+        # Workers that failed deliver this drain — skip, try other free workers.
+        deliver_failed: set[str] = set()
+
+        # First: batch-assign free workers to head offers minimizing expected
+        # last completion (makespan). Greedy max-Mbps per offer can leave a
+        # bad worker×dest for the straggler — that hurts prism score.
+        pending0 = len(self._overflow_offers)
+        pressure0 = (
+            OVERFLOW_BUSY_THRESHOLD > 0 and pending0 > OVERFLOW_BUSY_THRESHOLD
+        )
+        if not pressure0:
+            wave = await self._drain_affinity_makespan_wave(
+                batch_used_ips=batch_used_ips,
+                batch_assigned_counts=batch_assigned_counts,
+            )
+            delivered += wave
 
         while self._overflow_offers:
             pending = len(self._overflow_offers)
@@ -387,11 +995,11 @@ class WorkerGateway:
             )
             offer = self._overflow_offers[0]
             offer_id = self._offer_key(offer)
-            # Only skip temporarily blocked workers (recent queue_full).
-            # Do NOT permanently exclude prior attempts — once free, retry is fine.
-            excluded = set(self._dispatch_blocked)
+            dest_group = dest_group_from_offer(offer)
+            excluded = set(self._dispatch_blocked) | deliver_failed
 
             worker_id: Optional[str] = None
+            use_prefer = False
             if prefer and prefer not in excluded and (
                 self._worker_is_free(prefer)
                 or (
@@ -401,6 +1009,19 @@ class WorkerGateway:
                     < OVERFLOW_BUSY_MAX_PER_WORKER
                 )
             ):
+                free_n = sum(
+                    1
+                    for wid in self._sessions
+                    if wid not in deliver_failed and self._worker_is_free(wid)
+                )
+                if (
+                    not DEST_AFFINITY_ENABLED
+                    or not dest_group
+                    or free_n <= 1
+                    or pressure
+                ):
+                    use_prefer = True
+            if use_prefer:
                 worker_id = prefer
                 prefer = None
             else:
@@ -411,6 +1032,7 @@ class WorkerGateway:
                     exclude_worker_ids=excluded,
                     force_allow_busy=pressure,
                     assign_cap=OVERFLOW_BUSY_MAX_PER_WORKER if pressure else None,
+                    dest_group=dest_group or None,
                 )
 
             if not worker_id:
@@ -440,21 +1062,36 @@ class WorkerGateway:
                 if ip:
                     batch_used_ips.add(ip)
                 profile = self._get_profile(worker_id)
+                dest_mbps = (
+                    self.dest_worker_mbps(dest_group, worker_id) if dest_group else 0.0
+                )
                 logger.info(
                     "_workers | queue_deliver task=%s offer=%s worker=%s "
-                    "active=%d pending=%d pressure=%s",
+                    "active=%d pending=%d pressure=%s dest_group=%s dest_mbps=%.1f "
+                    "assign=greedy",
                     short_id(offer.get("task_id")),
                     short_id(offer_id),
                     short_id(worker_id),
                     profile.active_count,
                     len(self._overflow_offers),
                     pressure,
+                    dest_group or "-",
+                    dest_mbps,
                 )
             else:
+                # Re-queue and keep draining to other free workers (do not abort).
                 if offer_id and offer_id not in self._overflow_offer_ids:
                     self._overflow_offers.appendleft(offer)
                     self._overflow_offer_ids.add(offer_id)
-                break
+                deliver_failed.add(worker_id)
+                logger.warning(
+                    "_workers | deliver_fail task=%s offer=%s worker=%s "
+                    "requeued; trying other free workers",
+                    short_id(offer.get("task_id")),
+                    short_id(offer_id),
+                    short_id(worker_id),
+                )
+                continue
         return delivered
 
     def disconnect(self, worker_id: str) -> None:
@@ -467,6 +1104,7 @@ class WorkerGateway:
             self._on_ready_change(False)
 
     async def stop(self) -> None:
+        self.flush_dest_worker_stats()
         if not self._result_forward_tasks:
             return
         tasks = list(self._result_forward_tasks.values())
@@ -764,6 +1402,7 @@ class WorkerGateway:
         batch_assigned_counts: Optional[dict[str, int]] = None,
         force_allow_busy: bool = False,
         assign_cap: Optional[int] = None,
+        dest_group: Optional[str] = None,
     ) -> Optional[str]:
         """Pick the next worker with capacity, matching global-gateway batch IP spread.
 
@@ -775,6 +1414,10 @@ class WorkerGateway:
           2. Then idle workers on any IP
           3. Only if ``ORCH_ALLOW_BUSY_WORKER_REUSE`` / ``force_allow_busy``,
              reuse busy workers that still have capacity
+
+        When ``ORCH_DEST_AFFINITY`` is on and ``dest_group`` is set, among
+        equally-idle eligible workers prefer higher historical Mbps for that
+        destination group (falls back to global average until samples exist).
 
         ``assign_cap`` (overflow pressure mode): require ``load < assign_cap``
         instead of hello ``max_concurrent_tasks`` so backlog can stack up to N
@@ -798,6 +1441,7 @@ class WorkerGateway:
         prefer_idle = PREFER_IDLE_WORKERS
         allow_busy_reuse = ALLOW_BUSY_WORKER_REUSE or force_allow_busy
         cap = int(assign_cap) if assign_cap is not None and assign_cap > 0 else None
+        dest_g = str(dest_group or "").strip() if DEST_AFFINITY_ENABLED else ""
 
         def _batch_count(worker_id: str) -> int:
             if counts is not None:
@@ -816,6 +1460,11 @@ class WorkerGateway:
             if cap is not None:
                 return load < cap
             return self._get_profile(worker_id).has_capacity
+
+        def _score_mbps(worker_id: str) -> float:
+            if dest_g:
+                return self.dest_worker_mbps(dest_g, worker_id)
+            return self._get_profile(worker_id).average_mbps
 
         def _eligible(
             worker_id: str,
@@ -849,7 +1498,7 @@ class WorkerGateway:
             require_idle: bool,
             allow_worker_reuse: bool,
         ) -> Optional[str]:
-            # (load, batch_n, -mbps, -initial_order, offset, worker_id)
+            # (load, batch_n, -dest_mbps, -initial_order, offset, worker_id)
             candidates: list[tuple[int, int, float, int, int, str]] = []
             for offset in range(pool_size):
                 idx = (start + offset) % pool_size
@@ -866,7 +1515,7 @@ class WorkerGateway:
                     (
                         _load(worker_id),
                         _batch_count(worker_id),
-                        -profile.average_mbps,
+                        -_score_mbps(worker_id),
                         -profile.initial_order,
                         offset,
                         worker_id,
@@ -883,7 +1532,8 @@ class WorkerGateway:
             profile = self._get_profile(worker_id)
             logger.debug(
                 "selected worker %s round_robin ip=%s active=%d/%d "
-                "load=%d batch_n=%d mbps=%.1f cursor=%d pool=%d batch_ips=%s "
+                "load=%d batch_n=%d mbps=%.1f dest_group=%s dest_mbps=%.1f "
+                "cursor=%d pool=%d batch_ips=%s "
                 "require_idle=%s reuse_worker=%s assign_cap=%s",
                 worker_id,
                 profile.ip or "?",
@@ -892,6 +1542,8 @@ class WorkerGateway:
                 _load_n,
                 _bc,
                 profile.average_mbps,
+                dest_g or "-",
+                -_neg_mbps,
                 self._cursor,
                 pool_size,
                 ",".join(sorted(batch_used_ips)) if batch_used_ips else "-",
@@ -1094,10 +1746,21 @@ class WorkerGateway:
             if await self._maybe_reassign_on_capacity_reject(worker_id, msg):
                 # Offer re-queued; deferred retry handles re-deliver.
                 return
-            self._log_external_task_result(worker_id, msg)
-            transfer_mbps = msg.get("transfer_mbps")
+            # Peek dest before _log_external_task_result pops offer context.
+            offer_key = str(offer_id) if offer_id else ""
+            ctx = self._offer_contexts.get(offer_key) or {}
+            dest_group = dest_group_from_url(ctx.get("dest_url"))
+            if not dest_group:
+                pending = self._pending_offers.get(offer_key) or {}
+                dest_group = dest_group_from_offer(pending)
+
+            transfer_mbps = transfer_mbps_from_result(msg)
             if transfer_mbps is not None:
                 self._get_profile(worker_id).observe_transfer(transfer_mbps)
+            if bool(msg.get("success")) and dest_group and transfer_mbps is not None:
+                self.observe_dest_transfer(dest_group, worker_id, transfer_mbps)
+
+            self._log_external_task_result(worker_id, msg)
 
             # 1) Free slot + deliver next queued offer to this worker FIRST
             # 2) Then relay/submit task_result upstream (BeamCore)
