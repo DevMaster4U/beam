@@ -1352,12 +1352,19 @@ class WorkerGateway:
         *,
         mark_busy: bool = True,
     ) -> bool:
+        # Local WS session, or outbound relay (coordinator/global pool).
         ws = self._sessions.get(worker_id)
-        if ws is None:
+        if ws is None and self._outbound_send is None:
             logger.warning("deliver_task_offer: worker %s not connected", worker_id)
             return False
         try:
-            await ws.send_text(json.dumps({"type": "task_offer", **offer}))
+            payload = {"type": "task_offer", **offer}
+            if ws is not None:
+                await ws.send_text(json.dumps(payload))
+            else:
+                result = self._outbound_send(worker_id, payload)
+                if asyncio.iscoroutine(result):
+                    await result
             self._remember_offer_context(offer)
             self._remember_pending_offer(worker_id, offer)
             if mark_busy:
