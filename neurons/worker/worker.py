@@ -422,6 +422,14 @@ try:
     )
 except ValueError:
     WORKER_UPLOAD_PERF_SLOW_MBPS = 150.0
+# Abort cache_stream PUT when cumulative net_wait_ms exceeds this (0 = disabled).
+# Orch reassigns the offer to another worker on error prefix slow_net_wait:.
+try:
+    WORKER_NET_WAIT_ABORT_MS = max(
+        0.0, float(os.environ.get("WORKER_NET_WAIT_ABORT_MS", "2000"))
+    )
+except ValueError:
+    WORKER_NET_WAIT_ABORT_MS = 2000.0
 # true: compute sha256 and verify against offer chunk_hash/chunk_hashes when present.
 WORKER_VERIFY_CHUNK_HASH = _env_bool("WORKER_VERIFY_CHUNK_HASH", True)
 PREDEFINED_ETAG_MAX_PARALLEL = max(
@@ -882,8 +890,18 @@ def task_label(task_id: Optional[str]) -> str:
     return task_id[:16] if task_id else "unknown"
 
 
+class SlowNetWaitAbort(Exception):
+    """Abort cache→dest PUT when network backpressure (net_wait_ms) is too high."""
+
+    def __init__(self, net_wait_ms: float) -> None:
+        self.net_wait_ms = float(net_wait_ms)
+        super().__init__(f"slow_net_wait:{self.net_wait_ms:.0f}")
+
+
 def exception_detail(error: Exception) -> str:
     """Return an exception string that is useful even when str(error) is empty."""
+    if isinstance(error, SlowNetWaitAbort):
+        return str(error)
     if isinstance(error, httpx.HTTPStatusError):
         request_url = str(error.request.url)
         redacted_url = redact_url(request_url)
@@ -1548,6 +1566,8 @@ def is_retryable(error: Exception) -> bool:
     Includes httpx transport failures (ReadError/ConnectError/WriteError/…) which
     commonly appear under concurrent R2 PUTs when the peer resets mid-upload.
     """
+    if isinstance(error, SlowNetWaitAbort):
+        return False
     if isinstance(error, (asyncio.TimeoutError, TimeoutError)):
         return True
     # TimeoutException is a TransportError; listed first for clarity.
@@ -1928,6 +1948,11 @@ async def stream_cache_upload_to_dest(
             yield part
             # Time until httpx asks for the next chunk ≈ network/R2 backpressure.
             perf["net_wait_ms"] += (time.perf_counter() - t_yield) * 1000
+            if (
+                WORKER_NET_WAIT_ABORT_MS > 0
+                and perf["net_wait_ms"] > WORKER_NET_WAIT_ABORT_MS
+            ):
+                raise SlowNetWaitAbort(perf["net_wait_ms"])
             if rate_limited and bytes_per_sec > 0:
                 await asyncio.sleep(len(part) / bytes_per_sec)
 

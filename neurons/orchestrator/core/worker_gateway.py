@@ -80,7 +80,7 @@ except ValueError:
     OVERFLOW_BUSY_MAX_PER_WORKER = 5
 
 # Prefer free workers that historically upload faster to this dest_group
-# (backup/primary/…). Improves makespan / prism last-upload timing.
+# (R2 host / destinations/<group>/…). Improves makespan / prism last-upload.
 DEST_AFFINITY_ENABLED = _env_bool("ORCH_DEST_AFFINITY", True)
 try:
     DEST_AFFINITY_EMA = min(
@@ -123,6 +123,36 @@ try:
     )
 except ValueError:
     DEST_AFFINITY_SAVE_INTERVAL_S = 10.0
+# Soft-ban workers that are slow on a dest bucket so select/makespan hop away.
+# Absolute floor (0=off) and/or relative to best EMA in that bucket (0=off).
+try:
+    DEST_PENALTY_MBPS = max(
+        0.0, float(os.environ.get("ORCH_DEST_PENALTY_MBPS", "150"))
+    )
+except ValueError:
+    DEST_PENALTY_MBPS = 150.0
+try:
+    DEST_PENALTY_REL = min(
+        1.0, max(0.0, float(os.environ.get("ORCH_DEST_PENALTY_REL", "0.65")))
+    )
+except ValueError:
+    DEST_PENALTY_REL = 0.65
+try:
+    DEST_PENALTY_S = max(
+        0.0, float(os.environ.get("ORCH_DEST_PENALTY_S", "900"))
+    )
+except ValueError:
+    DEST_PENALTY_S = 900.0
+# Fallback effective Mbps only when forcing a penalty with no sample
+# (e.g. slow_net_wait abort). Normal penalties use the observed sample Mbps.
+try:
+    DEST_PENALTY_FALLBACK_MBPS = max(
+        1.0, float(os.environ.get("ORCH_DEST_PENALTY_FALLBACK_MBPS", "8"))
+    )
+except ValueError:
+    DEST_PENALTY_FALLBACK_MBPS = 8.0
+# Compat alias
+DEST_PENALTY_EFF_MBPS = DEST_PENALTY_FALLBACK_MBPS
 # Batch-assign free workers↔offers to minimize expected last completion
 # (makespan), not greedy max-Mbps per offer. Binary-search + matching.
 DEST_AFFINITY_MAKESPAN = _env_bool("ORCH_DEST_AFFINITY_MAKESPAN", True)
@@ -130,19 +160,35 @@ _DEFAULT_OFFER_BYTES = 64.0 * 1024 * 1024
 
 
 def dest_group_from_url(dest_url: object) -> str:
-    """Extract destinations/<group>/… → group (e.g. backup, primary)."""
+    """Affinity bucket key for a dest URL.
+
+    Prefer R2 account host (worker speed differs per endpoint). Fall back to
+    ``destinations/<group>`` path segment, then bare hostname.
+    """
     text = str(dest_url or "").strip()
     if not text:
         return ""
     try:
-        parts = [p for p in urlsplit(text).path.split("/") if p]
-        if "destinations" in parts:
-            i = parts.index("destinations")
-            if i + 1 < len(parts):
-                return parts[i + 1]
+        parsed = urlsplit(text)
+        host = (parsed.hostname or "").lower()
+        path_parts = [p for p in parsed.path.split("/") if p]
+        path_group = ""
+        if "destinations" in path_parts:
+            i = path_parts.index("destinations")
+            if i + 1 < len(path_parts):
+                path_group = path_parts[i + 1]
+        # …/<account>.r2.cloudflarestorage.com — account id is the real bucket.
+        if host.endswith(".r2.cloudflarestorage.com"):
+            account = host.split(".", 1)[0]
+            if account:
+                return account
+        if host and path_group:
+            return f"{host}/{path_group}"
+        if path_group:
+            return path_group
+        return host
     except Exception:
         return ""
-    return ""
 
 
 def dest_group_from_offer(offer: dict) -> str:
@@ -451,6 +497,8 @@ class WorkerGateway:
                     "ema": ema,
                     "n": n,
                     "updated_at": float(entry.get("updated_at") or 0.0),
+                    "penalty_until": float(entry.get("penalty_until") or 0.0),
+                    "penalty_mbps": float(entry.get("penalty_mbps") or 0.0),
                 }
                 loaded += 1
         return loaded
@@ -578,18 +626,160 @@ class WorkerGateway:
         bucket = self._dest_worker_stats.setdefault(group, {})
         entry = bucket.get(wid)
         if entry is None:
-            bucket[wid] = {"ema": mbps, "n": 1, "updated_at": time.time()}
+            entry = {"ema": mbps, "n": 1, "updated_at": time.time()}
+            bucket[wid] = entry
         else:
             prev = float(entry.get("ema") or mbps)
             n = int(entry.get("n") or 0) + 1
             entry["ema"] = (DEST_AFFINITY_EMA * mbps) + ((1.0 - DEST_AFFINITY_EMA) * prev)
             entry["n"] = n
             entry["updated_at"] = time.time()
+        self._maybe_apply_dest_penalty(group, wid, entry, mbps)
         self._dest_stats_dirty = True
         self._maybe_save_dest_worker_stats()
 
+    def _bucket_best_ema(self, dest_group: str) -> float:
+        bucket = self._dest_worker_stats.get(dest_group) or {}
+        best = 0.0
+        for entry in bucket.values():
+            if not isinstance(entry, dict):
+                continue
+            try:
+                ema = float(entry.get("ema") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if ema > best:
+                best = ema
+        return best
+
+    def _should_penalize_mbps(self, mbps: float, best_ema: float) -> bool:
+        if DEST_PENALTY_S <= 0:
+            return False
+        if DEST_PENALTY_MBPS > 0 and mbps < DEST_PENALTY_MBPS:
+            return True
+        if (
+            DEST_PENALTY_REL > 0
+            and best_ema > 0
+            and mbps < (best_ema * DEST_PENALTY_REL)
+        ):
+            return True
+        return False
+
+    def _maybe_apply_dest_penalty(
+        self,
+        dest_group: str,
+        worker_id: str,
+        entry: dict,
+        sample_mbps: float,
+    ) -> None:
+        """Soft-ban slow workers on this bucket using the observed sample Mbps."""
+        if DEST_PENALTY_S <= 0:
+            return
+        best = self._bucket_best_ema(dest_group)
+        now = time.time()
+        if self._should_penalize_mbps(sample_mbps, best):
+            until = now + DEST_PENALTY_S
+            prev_until = float(entry.get("penalty_until") or 0.0)
+            entry["penalty_until"] = max(prev_until, until)
+            # Penalty strength = observed Mbps (keep the slower sample if already set).
+            prev_pen = float(entry.get("penalty_mbps") or 0.0)
+            if prev_pen > 0 and prev_until > now:
+                entry["penalty_mbps"] = min(prev_pen, float(sample_mbps))
+            else:
+                entry["penalty_mbps"] = float(sample_mbps)
+            logger.info(
+                "dest penalty apply dest=%s worker=%s mbps=%.1f best=%.1f "
+                "until_in=%.0fs penalty_mbps=%.1f",
+                dest_group,
+                short_id(worker_id),
+                sample_mbps,
+                best,
+                entry["penalty_until"] - now,
+                entry["penalty_mbps"],
+            )
+        elif float(entry.get("penalty_until") or 0.0) > now:
+            # Fast sample clears an active penalty for this bucket.
+            entry["penalty_until"] = 0.0
+            entry["penalty_mbps"] = 0.0
+            logger.info(
+                "dest penalty clear dest=%s worker=%s mbps=%.1f best=%.1f",
+                dest_group,
+                short_id(worker_id),
+                sample_mbps,
+                best,
+            )
+
+    def penalize_dest_worker(
+        self,
+        dest_group: str,
+        worker_id: str,
+        *,
+        reason: str = "",
+        sample_mbps: Optional[float] = None,
+    ) -> None:
+        """Force a soft-ban for (dest_group, worker) — e.g. slow_net_wait abort."""
+        if not DEST_AFFINITY_ENABLED or DEST_PENALTY_S <= 0:
+            return
+        group = str(dest_group or "").strip()
+        wid = str(worker_id or "").strip()
+        if not group or not wid:
+            return
+        self._remap_dest_stats_worker_id(wid)
+        bucket = self._dest_worker_stats.setdefault(group, {})
+        mbps = (
+            float(sample_mbps)
+            if sample_mbps is not None and float(sample_mbps) > 0
+            else DEST_PENALTY_FALLBACK_MBPS
+        )
+        entry = bucket.get(wid)
+        if entry is None:
+            entry = {
+                "ema": mbps,
+                "n": 1,
+                "updated_at": time.time(),
+            }
+            bucket[wid] = entry
+        now = time.time()
+        until = now + DEST_PENALTY_S
+        prev_until = float(entry.get("penalty_until") or 0.0)
+        entry["penalty_until"] = max(prev_until, until)
+        prev_pen = float(entry.get("penalty_mbps") or 0.0)
+        if prev_pen > 0 and prev_until > now:
+            entry["penalty_mbps"] = min(prev_pen, mbps)
+        else:
+            entry["penalty_mbps"] = mbps
+        entry["updated_at"] = now
+        # Pull EMA toward the slow sample so ranking stays realistic after cooldown.
+        prev_ema = float(entry.get("ema") or mbps)
+        entry["ema"] = (DEST_AFFINITY_EMA * mbps) + ((1.0 - DEST_AFFINITY_EMA) * prev_ema)
+        entry["n"] = int(entry.get("n") or 0) + 1
+        self._dest_stats_dirty = True
+        self._maybe_save_dest_worker_stats()
+        logger.info(
+            "dest penalty force dest=%s worker=%s reason=%s "
+            "penalty_mbps=%.1f until_in=%.0fs",
+            group,
+            short_id(wid),
+            reason or "manual",
+            entry["penalty_mbps"],
+            entry["penalty_until"] - now,
+        )
+
+    def dest_worker_penalized(self, dest_group: str, worker_id: str) -> bool:
+        entry = self._lookup_dest_entry(dest_group, worker_id)
+        if entry is None:
+            return False
+        try:
+            return float(entry.get("penalty_until") or 0.0) > time.time()
+        except (TypeError, ValueError):
+            return False
+
     def dest_worker_mbps(self, dest_group: str, worker_id: str) -> float:
-        """Historical Mbps for worker on dest_group; falls back to global avg."""
+        """Historical Mbps for worker on dest_group; falls back to global avg.
+
+        While ``penalty_until`` is active, returns the observed ``penalty_mbps``
+        (not a fixed floor) so slower samples rank worse than mildly slow ones.
+        """
         group = str(dest_group or "").strip()
         wid = str(worker_id or "").strip()
         if DEST_AFFINITY_ENABLED and group and wid:
@@ -598,29 +788,51 @@ class WorkerGateway:
                 try:
                     n = int(entry.get("n") or 0)
                     ema = float(entry.get("ema") or 0.0)
+                    penalty_until = float(entry.get("penalty_until") or 0.0)
+                    penalty_mbps = float(entry.get("penalty_mbps") or 0.0)
                 except (TypeError, ValueError):
-                    n, ema = 0, 0.0
+                    n, ema, penalty_until, penalty_mbps = 0, 0.0, 0.0, 0.0
+                if penalty_until > time.time():
+                    # Prefer stored sample Mbps; fall back to EMA / constant.
+                    if penalty_mbps > 0:
+                        return penalty_mbps
+                    if ema > 0:
+                        return ema
+                    return DEST_PENALTY_FALLBACK_MBPS
                 if n >= DEST_AFFINITY_MIN_SAMPLES and ema > 0:
                     return ema
         return self._get_profile(wid).average_mbps
 
-    def _free_workers_for_affinity_wave(self) -> list[str]:
-        """Idle, unblocked workers — prefer one per IP for the concurrent wave."""
+    def _free_workers_for_affinity_wave(
+        self, *, dest_group: str = ""
+    ) -> list[str]:
+        """All idle workers for a min-makespan wave (finish the batch ASAP).
+
+        Includes penalized workers. Cost = expected seconds from observed Mbps, so
+        matching leaves slow workers idle when there are enough fast free slots,
+        but uses them when more offers remain than fast free workers.
+        Order: unique-IP non-penalized, unique-IP penalized, then same-IP extras.
+        """
         used_ips: set[str] = set()
-        unique: list[str] = []
-        extras: list[str] = []
+        unique_good: list[str] = []
+        unique_pen: list[str] = []
+        extras_good: list[str] = []
+        extras_pen: list[str] = []
+        dest_g = str(dest_group or "").strip() if DEST_AFFINITY_ENABLED else ""
+
         for wid in self._ordered_connected_worker_ids():
             if not self._worker_is_free(wid):
                 continue
+            penalized = bool(dest_g) and self.dest_worker_penalized(dest_g, wid)
             ip = self._get_profile(wid).ip.strip()
             if ip and ip in used_ips:
-                extras.append(wid)
+                (extras_pen if penalized else extras_good).append(wid)
                 continue
             if ip:
                 used_ips.add(ip)
-            unique.append(wid)
-        # First wave: unique IPs. Same-IP free workers join a later drain.
-        return unique if unique else extras
+            (unique_pen if penalized else unique_good).append(wid)
+
+        return unique_good + unique_pen + extras_good + extras_pen
 
     def _offer_expected_seconds(self, offer: dict, worker_id: str) -> float:
         dest_g = dest_group_from_offer(offer)
@@ -636,13 +848,16 @@ class WorkerGateway:
         offers: list[dict],
         workers: list[str],
     ) -> tuple[list[str], float]:
-        """Map offers → workers minimizing expected last completion time."""
+        """Map offers → workers minimizing expected last completion time.
+
+        Goal: all tasks in this wave finish as soon as possible (min makespan),
+        not max-Mbps on each offer independently.
+        """
         if not offers or not workers:
             return [], 0.0
         n = min(len(offers), len(workers))
         offers_n = offers[:n]
-        # Use the full free pool so matching can leave slow workers idle when
-        # there are more workers than offers in this wave.
+        # Full free pool: matching can leave slow workers idle when workers > offers.
         workers_n = list(workers)
         costs = [
             [self._offer_expected_seconds(offer, wid) for wid in workers_n]
@@ -669,7 +884,9 @@ class WorkerGateway:
         if not self._overflow_offers:
             return 0
 
-        free = self._free_workers_for_affinity_wave()
+        # Head dest only affects penalty labeling in the free pool order.
+        head_dest = dest_group_from_offer(self._overflow_offers[0])
+        free = self._free_workers_for_affinity_wave(dest_group=head_dest)
         if not free:
             return 0
 
@@ -679,6 +896,15 @@ class WorkerGateway:
             return 0
 
         offers = [self._overflow_offers[i] for i in range(n)]
+        # Makespan assumes every free worker is eligible for every head offer.
+        # Offers with prior failures (slow_net_wait) need per-offer excludes → greedy.
+        if any(
+            self._offer_attempted_workers.get(self._offer_key(o))
+            for o in offers
+        ):
+            return 0
+        # More free workers than offers: pass the full free pool so matching can
+        # leave the slowest idle (better makespan than forcing a slow pairing).
         worker_ids, makespan = self._assign_offers_min_makespan(offers, free)
         if len(worker_ids) != n or any(not w for w in worker_ids):
             return 0
@@ -975,8 +1201,8 @@ class WorkerGateway:
         deliver_failed: set[str] = set()
 
         # First: batch-assign free workers to head offers minimizing expected
-        # last completion (makespan). Greedy max-Mbps per offer can leave a
-        # bad worker×dest for the straggler — that hurts prism score.
+        # last completion (makespan) — finish all queued work ASAP. Greedy
+        # max-Mbps per offer can leave a bad worker×dest as the straggler.
         pending0 = len(self._overflow_offers)
         pressure0 = (
             OVERFLOW_BUSY_THRESHOLD > 0 and pending0 > OVERFLOW_BUSY_THRESHOLD
@@ -997,6 +1223,11 @@ class WorkerGateway:
             offer_id = self._offer_key(offer)
             dest_group = dest_group_from_offer(offer)
             excluded = set(self._dispatch_blocked) | deliver_failed
+            attempted = self._offer_attempted_workers.get(offer_id) or set()
+            # Exclude workers that already failed this offer (e.g. slow_net_wait),
+            # but allow capacity-retry prefer to re-deliver to the same worker.
+            if not (prefer and prefer in attempted):
+                excluded |= set(attempted)
 
             worker_id: Optional[str] = None
             use_prefer = False
@@ -1253,6 +1484,11 @@ class WorkerGateway:
         text = str(error or "").strip().lower()
         return text.startswith("queue_full") or text.startswith("memory_budget")
 
+    @staticmethod
+    def _is_slow_net_wait_error(error: object) -> bool:
+        text = str(error or "").strip().lower()
+        return "slow_net_wait:" in text or text.startswith("slow_net_wait")
+
     def _schedule_capacity_retry(self, worker_id: str, *, delay_s: float = 0.05) -> None:
         """Retry overflow to the same worker after a brief yield (slot race)."""
         wid = str(worker_id)
@@ -1343,6 +1579,101 @@ class WorkerGateway:
         )
         return False
 
+    async def _maybe_reassign_on_slow_net_wait(
+        self, worker_id: str, msg: dict
+    ) -> bool:
+        """If worker aborted for high net_wait, re-queue to a different worker.
+
+        Does not relay the failure upstream while a local redelivery is possible.
+        """
+        if bool(msg.get("success")):
+            return False
+        if not self._is_slow_net_wait_error(msg.get("error")):
+            return False
+
+        task_id = msg.get("task_id")
+        offer_id = str(msg.get("offer_id") or task_id or "").strip()
+        if not offer_id:
+            return False
+
+        offer = self._pending_offers.get(offer_id)
+        if not offer:
+            logger.warning(
+                "slow_net_wait without pending offer: task=%s offer=%s "
+                "worker=%s error=%s",
+                short_id(task_id),
+                short_id(offer_id),
+                short_id(worker_id),
+                msg.get("error"),
+            )
+            return False
+
+        attempted = self._offer_attempted_workers.setdefault(offer_id, set())
+        attempted.add(str(worker_id))
+        dest_group = dest_group_from_offer(offer)
+        if dest_group:
+            # Prefer observed transfer_mbps from the abort result when present.
+            sample = transfer_mbps_from_result(msg)
+            self.penalize_dest_worker(
+                dest_group,
+                worker_id,
+                reason=str(msg.get("error") or "slow_net_wait"),
+                sample_mbps=sample if sample is not None else None,
+            )
+        connected = set(self._sessions.keys())
+        # Avoid infinite local loop when every connected worker already failed.
+        if connected and attempted.issuperset(connected):
+            logger.warning(
+                "slow_net_wait: all connected workers attempted task=%s "
+                "offer=%s attempted=%d connected=%d — relay failure",
+                short_id(task_id),
+                short_id(offer_id),
+                len(attempted),
+                len(connected),
+            )
+            return False
+
+        self.mark_worker_idle(worker_id, offer_id, drain_overflow=False)
+        # Do not prefer the slow worker — drain will exclude attempted set.
+        if self._overflow_prefer_worker == worker_id:
+            self._overflow_prefer_worker = None
+
+        if self._enqueue_overflow(offer):
+            logger.info(
+                "slow_net_wait: re-queued task=%s offer=%s from=%s "
+                "attempted=%d pending=%d dest_group=%s (other workers)",
+                short_id(task_id),
+                short_id(offer_id),
+                short_id(worker_id),
+                len(attempted),
+                len(self._overflow_offers),
+                dest_group or "-",
+            )
+            await self._send_to_worker(
+                worker_id,
+                {
+                    "type": "task_result_ack",
+                    "task_id": task_id,
+                    "offer_id": offer_id,
+                    "received": True,
+                    "status": "late_superseded",
+                    "reason": f"queued_after_slow_net:{msg.get('error')}",
+                },
+            )
+            await self._drain_overflow_queue()
+            return True
+
+        logger.warning(
+            "slow_net_wait: queue full task=%s offer=%s from=%s "
+            "attempted=%d error=%s",
+            short_id(task_id),
+            short_id(offer_id),
+            short_id(worker_id),
+            len(attempted),
+            msg.get("error"),
+        )
+        return False
+
     async def deliver_task_offer(
         self,
         worker_id: str,
@@ -1423,6 +1754,9 @@ class WorkerGateway:
         When ``ORCH_DEST_AFFINITY`` is on and ``dest_group`` is set, among
         equally-idle eligible workers prefer higher historical Mbps for that
         destination group (falls back to global average until samples exist).
+        Free non-penalized workers are tried before free penalized ones; if
+        every non-penalized worker is busy, a free penalized worker is still
+        selected (do not stall the queue).
 
         ``assign_cap`` (overflow pressure mode): require ``load < assign_cap``
         instead of hello ``max_concurrent_tasks`` so backlog can stack up to N
@@ -1477,6 +1811,8 @@ class WorkerGateway:
             allow_ip_reuse: bool,
             require_idle: bool,
             allow_worker_reuse: bool,
+            exclude_penalized: bool = False,
+            only_penalized: bool = False,
         ) -> bool:
             if worker_id in excluded:
                 return False
@@ -1487,6 +1823,12 @@ class WorkerGateway:
                 return False
             if not allow_worker_reuse and _batch_count(worker_id) > 0:
                 return False
+            if dest_g and (exclude_penalized or only_penalized):
+                penalized = self.dest_worker_penalized(dest_g, worker_id)
+                if exclude_penalized and penalized:
+                    return False
+                if only_penalized and not penalized:
+                    return False
             ip = self._get_profile(worker_id).ip.strip()
             if (
                 not allow_ip_reuse
@@ -1502,6 +1844,8 @@ class WorkerGateway:
             allow_ip_reuse: bool,
             require_idle: bool,
             allow_worker_reuse: bool,
+            exclude_penalized: bool = False,
+            only_penalized: bool = False,
         ) -> Optional[str]:
             # (load, batch_n, -dest_mbps, -initial_order, offset, worker_id)
             candidates: list[tuple[int, int, float, int, int, str]] = []
@@ -1513,6 +1857,8 @@ class WorkerGateway:
                     allow_ip_reuse=allow_ip_reuse,
                     require_idle=require_idle,
                     allow_worker_reuse=allow_worker_reuse,
+                    exclude_penalized=exclude_penalized,
+                    only_penalized=only_penalized,
                 ):
                     continue
                 profile = self._get_profile(worker_id)
@@ -1539,7 +1885,8 @@ class WorkerGateway:
                 "selected worker %s round_robin ip=%s active=%d/%d "
                 "load=%d batch_n=%d mbps=%.1f dest_group=%s dest_mbps=%.1f "
                 "cursor=%d pool=%d batch_ips=%s "
-                "require_idle=%s reuse_worker=%s assign_cap=%s",
+                "require_idle=%s reuse_worker=%s assign_cap=%s "
+                "exclude_penalized=%s only_penalized=%s",
                 worker_id,
                 profile.ip or "?",
                 profile.active_count,
@@ -1555,44 +1902,103 @@ class WorkerGateway:
                 require_idle,
                 allow_worker_reuse,
                 cap if cap is not None else "-",
+                exclude_penalized,
+                only_penalized,
             )
             return worker_id
 
         def _pick_idle(
             *,
             allow_ip_reuse: bool,
+            exclude_penalized: bool = False,
+            only_penalized: bool = False,
         ) -> Optional[str]:
             return _pick(
                 allow_ip_reuse=allow_ip_reuse,
                 require_idle=True,
                 allow_worker_reuse=False,
+                exclude_penalized=exclude_penalized,
+                only_penalized=only_penalized,
             )
 
         def _pick_busy(
             *,
             allow_ip_reuse: bool,
+            exclude_penalized: bool = False,
         ) -> Optional[str]:
             return _pick(
                 allow_ip_reuse=allow_ip_reuse,
                 require_idle=False,
                 allow_worker_reuse=True,
+                exclude_penalized=exclude_penalized,
             )
 
-        if prefer_idle:
-            # Always exhaust idle workers (any IP) before stacking on busy ones.
-            worker_id = _pick_idle(allow_ip_reuse=False)
-            if worker_id:
-                return worker_id
-            if allow_used_ip:
-                worker_id = _pick_idle(allow_ip_reuse=True)
+        def _pick_idle_prefer_unpenalized(*, allow_ip_reuse: bool) -> Optional[str]:
+            """Free non-penalized first; if none, free penalized (still assign)."""
+            if dest_g:
+                worker_id = _pick_idle(
+                    allow_ip_reuse=allow_ip_reuse, exclude_penalized=True
+                )
                 if worker_id:
                     return worker_id
+                return _pick_idle(
+                    allow_ip_reuse=allow_ip_reuse, only_penalized=True
+                )
+            return _pick_idle(allow_ip_reuse=allow_ip_reuse)
+
+        if prefer_idle:
+            # Exhaust free non-penalized (fresh IP → any IP), then free penalized,
+            # then busy reuse. Penalized free workers still get work when needed.
+            if dest_g:
+                worker_id = _pick_idle(
+                    allow_ip_reuse=False, exclude_penalized=True
+                )
+                if worker_id:
+                    return worker_id
+                if allow_used_ip:
+                    worker_id = _pick_idle(
+                        allow_ip_reuse=True, exclude_penalized=True
+                    )
+                    if worker_id:
+                        return worker_id
+                worker_id = _pick_idle(
+                    allow_ip_reuse=False, only_penalized=True
+                )
+                if worker_id:
+                    return worker_id
+                if allow_used_ip:
+                    worker_id = _pick_idle(
+                        allow_ip_reuse=True, only_penalized=True
+                    )
+                    if worker_id:
+                        return worker_id
+            else:
+                worker_id = _pick_idle(allow_ip_reuse=False)
+                if worker_id:
+                    return worker_id
+                if allow_used_ip:
+                    worker_id = _pick_idle(allow_ip_reuse=True)
+                    if worker_id:
+                        return worker_id
             if not allow_busy_reuse:
                 return None
+            # Busy reuse: still prefer non-penalized, then any busy with capacity.
+            if dest_g:
+                worker_id = _pick_busy(
+                    allow_ip_reuse=False, exclude_penalized=True
+                )
+                if worker_id:
+                    return worker_id
             worker_id = _pick_busy(allow_ip_reuse=False)
             if worker_id:
                 return worker_id
             if allow_used_ip:
+                if dest_g:
+                    worker_id = _pick_busy(
+                        allow_ip_reuse=True, exclude_penalized=True
+                    )
+                    if worker_id:
+                        return worker_id
                 return _pick_busy(allow_ip_reuse=True)
             return None
 
@@ -1750,6 +2156,9 @@ class WorkerGateway:
             offer_id = msg.get("offer_id") or msg.get("task_id")
             if await self._maybe_reassign_on_capacity_reject(worker_id, msg):
                 # Offer re-queued; deferred retry handles re-deliver.
+                return
+            if await self._maybe_reassign_on_slow_net_wait(worker_id, msg):
+                # Offer re-queued to a different free worker.
                 return
             # Peek dest before _log_external_task_result pops offer context.
             offer_key = str(offer_id) if offer_id else ""
