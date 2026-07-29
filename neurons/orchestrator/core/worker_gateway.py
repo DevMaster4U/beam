@@ -1014,12 +1014,10 @@ class WorkerGateway:
                     for wid in self._sessions
                     if wid not in deliver_failed and self._worker_is_free(wid)
                 )
-                if (
-                    not DEST_AFFINITY_ENABLED
-                    or not dest_group
-                    or free_n <= 1
-                    or pressure
-                ):
+                # Prefer only when it is the sole free slot (or pressure stacking).
+                # Do NOT sticky-prefer when dest_group is empty — that pinned all
+                # sequential 1-offer batches onto the last finisher.
+                if free_n <= 1 or pressure:
                     use_prefer = True
             if use_prefer:
                 worker_id = prefer
