@@ -80,8 +80,9 @@ except ValueError:
     OVERFLOW_BUSY_MAX_PER_WORKER = 5
 
 # Prefer free workers that historically upload faster to this dest_group
-# (R2 host / destinations/<group>/…). Improves makespan / prism last-upload.
-DEST_AFFINITY_ENABLED = _env_bool("ORCH_DEST_AFFINITY", True)
+# (R2 host / destinations/<group>/…). Off by default: live waves showed
+# stale EMA + post-hoc penalties often miss contention; use free-worker RR.
+DEST_AFFINITY_ENABLED = _env_bool("ORCH_DEST_AFFINITY", False)
 try:
     DEST_AFFINITY_EMA = min(
         1.0, max(0.05, float(os.environ.get("ORCH_DEST_AFFINITY_EMA", "0.35")))
@@ -155,7 +156,8 @@ except ValueError:
 DEST_PENALTY_EFF_MBPS = DEST_PENALTY_FALLBACK_MBPS
 # Batch-assign free workers↔offers to minimize expected last completion
 # (makespan), not greedy max-Mbps per offer. Binary-search + matching.
-DEST_AFFINITY_MAKESPAN = _env_bool("ORCH_DEST_AFFINITY_MAKESPAN", True)
+# Requires ORCH_DEST_AFFINITY=true; default off → round-robin drain.
+DEST_AFFINITY_MAKESPAN = _env_bool("ORCH_DEST_AFFINITY_MAKESPAN", False)
 _DEFAULT_OFFER_BYTES = 64.0 * 1024 * 1024
 
 
@@ -1325,10 +1327,13 @@ class WorkerGateway:
                 dest_mbps = (
                     self.dest_worker_mbps(dest_group, worker_id) if dest_group else 0.0
                 )
+                assign_mode = (
+                    "greedy" if DEST_AFFINITY_ENABLED else "round_robin"
+                )
                 logger.info(
                     "_workers | queue_deliver task=%s offer=%s worker=%s "
                     "active=%d pending=%d pressure=%s dest_group=%s dest_mbps=%.1f "
-                    "assign=greedy",
+                    "assign=%s",
                     short_id(offer.get("task_id")),
                     short_id(offer_id),
                     short_id(worker_id),
@@ -1337,6 +1342,7 @@ class WorkerGateway:
                     pressure,
                     dest_group or "-",
                     dest_mbps,
+                    assign_mode,
                 )
             else:
                 # Re-queue and keep draining to other free workers (do not abort).
@@ -1832,6 +1838,9 @@ class WorkerGateway:
             return self._get_profile(worker_id).has_capacity
 
         def _score_mbps(worker_id: str) -> float:
+            # Affinity off → equal scores so cursor/offset is pure round-robin.
+            if not DEST_AFFINITY_ENABLED:
+                return 0.0
             if dest_g:
                 return self.dest_worker_mbps(dest_g, worker_id)
             return self._get_profile(worker_id).average_mbps
@@ -1905,9 +1914,22 @@ class WorkerGateway:
                 )
             if not candidates:
                 return None
-            candidates.sort(
-                key=lambda item: (item[0], item[1], item[2], item[3], item[4])
-            )
+            if DEST_AFFINITY_ENABLED:
+                # load → batch → dest Mbps → initial_order → RR offset
+                candidates.sort(
+                    key=lambda item: (
+                        item[0],
+                        item[1],
+                        item[2],
+                        item[3],
+                        item[4],
+                    )
+                )
+            else:
+                # Pure free-worker round robin (ignore Mbps / initial_order).
+                candidates.sort(
+                    key=lambda item: (item[0], item[1], item[4])
+                )
             _load_n, _bc, _neg_mbps, _neg_order, offset, worker_id = candidates[0]
             idx = (start + offset) % pool_size
             self._cursor = (idx + 1) % pool_size
