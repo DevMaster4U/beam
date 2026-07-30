@@ -1542,6 +1542,8 @@ async def prewarm_origins(
         *[_prewarm_single_origin(client, origin, timeout) for origin in origins],
         return_exceptions=True,
     )
+    if label == "interval":
+        return
     ok = sum(1 for r in results if r is True)
     elapsed_ms = (time.perf_counter() - started) * 1000
     hosts = ", ".join(_short_prewarm_host(o) for o in origins)
@@ -1572,10 +1574,6 @@ async def prewarm_interval_loop(state: WorkerState) -> None:
     """
     if not PREWARM_ENABLED or PREWARM_INTERVAL_S <= 0:
         return
-    print(
-        f"[Worker] Prewarm interval enabled: every {PREWARM_INTERVAL_S:.0f}s "
-        f"(timeout={PREWARM_TIMEOUT:.0f}s)"
-    )
     while state.running:
         try:
             await asyncio.sleep(PREWARM_INTERVAL_S)
@@ -1597,8 +1595,8 @@ async def prewarm_interval_loop(state: WorkerState) -> None:
             )
         except asyncio.CancelledError:
             return
-        except Exception as exc:
-            print(f"[Worker] Prewarm interval failed: {exc}")
+        except Exception:
+            pass
 
 
 # =============================================================================
