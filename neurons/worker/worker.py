@@ -449,6 +449,15 @@ predefined_etag_fast_path_semaphore = asyncio.Semaphore(PREDEFINED_ETAG_MAX_PARA
 PREWARM_ENABLED = _env_bool("WORKER_PREWARM_ENABLED", True)
 PREWARM_TIMEOUT = float(os.environ.get("WORKER_PREWARM_TIMEOUT", "5"))
 PREWARM_MAX_ORIGINS = max(1, int(os.environ.get("WORKER_PREWARM_MAX_ORIGINS", "32")))
+# Periodic HEAD to learned R2 origins so TLS/pool stay warm between ~30m transfers.
+# CDN/R2 idle keepalive is typically ~60–120s; default 180s refreshes before death.
+# 0 disables the interval loop (startup + per-task prewarm still run).
+try:
+    PREWARM_INTERVAL_S = max(
+        0.0, float(os.environ.get("WORKER_PREWARM_INTERVAL_S", "180"))
+    )
+except ValueError:
+    PREWARM_INTERVAL_S = 180.0
 try:
     WORKER_INITIAL_ORDER = int(os.environ.get("WORKER_INITIAL_ORDER", "0"))
 except ValueError:
@@ -1553,6 +1562,43 @@ async def prewarm_for_transfer(
     merge_prewarm_origins(state, urls)
     task_origins = origins_for_urls(urls)
     await prewarm_origins(state.http_client, task_origins, "task", PREWARM_TIMEOUT)
+
+
+async def prewarm_interval_loop(state: WorkerState) -> None:
+    """Refresh DNS/TLS/keepalive on learned origins between sparse transfers.
+
+    With ~30m between waves, idle connections die in ~1–2m. Re-HEAD on an
+    interval shorter than that so the next batch is not cold-start.
+    """
+    if not PREWARM_ENABLED or PREWARM_INTERVAL_S <= 0:
+        return
+    print(
+        f"[Worker] Prewarm interval enabled: every {PREWARM_INTERVAL_S:.0f}s "
+        f"(timeout={PREWARM_TIMEOUT:.0f}s)"
+    )
+    while state.running:
+        try:
+            await asyncio.sleep(PREWARM_INTERVAL_S)
+        except asyncio.CancelledError:
+            return
+        if not state.running or not state.http_client:
+            return
+        if not state.prewarm_origins:
+            state.prewarm_origins = load_prewarm_origins_from_disk()
+        origins = list(state.prewarm_origins)
+        if not origins:
+            continue
+        try:
+            await prewarm_origins(
+                state.http_client,
+                origins,
+                "interval",
+                PREWARM_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            print(f"[Worker] Prewarm interval failed: {exc}")
 
 
 # =============================================================================
@@ -4892,6 +4938,7 @@ async def run_worker(state: WorkerState):
     )
     state.http_client = httpx.AsyncClient(**client_kwargs)
     state.prewarm_origins = load_prewarm_origins_from_disk()
+    prewarm_interval_task: Optional[asyncio.Task] = None
     if PREWARM_ENABLED:
         await prewarm_origins(
             state.http_client,
@@ -4899,6 +4946,11 @@ async def run_worker(state: WorkerState):
             "startup",
             PREWARM_TIMEOUT,
         )
+        if PREWARM_INTERVAL_S > 0:
+            prewarm_interval_task = asyncio.create_task(
+                prewarm_interval_loop(state),
+                name="prewarm-interval",
+            )
 
     from neurons.common.control_ws_client import start_control_ws_client, stop_control_ws_client
 
@@ -4943,6 +4995,13 @@ async def run_worker(state: WorkerState):
         print(f"[Worker] Error: {e}")
         raise
     finally:
+        state.running = False
+        if prewarm_interval_task is not None and not prewarm_interval_task.done():
+            prewarm_interval_task.cancel()
+            try:
+                await prewarm_interval_task
+            except asyncio.CancelledError:
+                pass
         await stop_control_ws_client()
         if state.ws_task_handles:
             print(f"[Worker] Waiting for {len(state.ws_task_handles)} active WS task(s) to finish")

@@ -44,15 +44,22 @@ _RANGE_BYTES_RE = re.compile(r"\brange=bytes=\d+-\d+\((\d+)\)")
 
 
 def dest_group(dest: str) -> str:
-    """Extract destinations/<group>/… → group (e.g. backup, primary)."""
+    """Affinity key: host/…/destinations/<group> (matches orch dest_group_from_url)."""
     try:
         from urllib.parse import urlsplit
 
-        parts = [p for p in urlsplit(dest).path.split("/") if p]
+        parsed = urlsplit(dest)
+        host = (parsed.hostname or "").lower()
+        parts = [p for p in parsed.path.split("/") if p]
         if "destinations" in parts:
             i = parts.index("destinations")
             if i + 1 < len(parts):
-                return parts[i + 1]
+                prefix = "/".join(parts[: i + 2])
+                if host:
+                    return f"{host}/{prefix}"
+                return prefix
+        if host:
+            return host
     except Exception:
         pass
     return "?"

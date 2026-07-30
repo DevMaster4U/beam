@@ -162,8 +162,8 @@ _DEFAULT_OFFER_BYTES = 64.0 * 1024 * 1024
 def dest_group_from_url(dest_url: object) -> str:
     """Affinity bucket key for a dest URL.
 
-    Prefer R2 account host (worker speed differs per endpoint). Fall back to
-    ``destinations/<group>`` path segment, then bare hostname.
+    Worker speed differs per R2 host × destinations/<group> (backup/primary/…),
+    e.g. ``ef88….r2.cloudflarestorage.com/beam-xfer-test/destinations/backup2``.
     """
     text = str(dest_url or "").strip()
     if not text:
@@ -172,23 +172,31 @@ def dest_group_from_url(dest_url: object) -> str:
         parsed = urlsplit(text)
         host = (parsed.hostname or "").lower()
         path_parts = [p for p in parsed.path.split("/") if p]
-        path_group = ""
         if "destinations" in path_parts:
             i = path_parts.index("destinations")
             if i + 1 < len(path_parts):
-                path_group = path_parts[i + 1]
-        # …/<account>.r2.cloudflarestorage.com — account id is the real bucket.
-        if host.endswith(".r2.cloudflarestorage.com"):
-            account = host.split(".", 1)[0]
-            if account:
-                return account
-        if host and path_group:
-            return f"{host}/{path_group}"
-        if path_group:
-            return path_group
-        return host
+                # host + path through destinations/<group> (exclude object key).
+                prefix = "/".join(path_parts[: i + 2])
+                if host:
+                    return f"{host}/{prefix}"
+                return prefix
+        if host:
+            return host
+        return ""
     except Exception:
         return ""
+
+
+def dest_group_short_name(dest_group: object) -> str:
+    """``…/destinations/backup2`` → ``backup2`` (CSV seed / legacy keys)."""
+    text = str(dest_group or "").strip()
+    if not text:
+        return ""
+    if "/destinations/" in text:
+        return text.rsplit("/", 1)[-1]
+    if "/" not in text:
+        return text
+    return text.rsplit("/", 1)[-1]
 
 
 def dest_group_from_offer(offer: dict) -> str:
@@ -556,13 +564,36 @@ class WorkerGateway:
             self._dest_stats_dirty = True
 
     def _lookup_dest_entry(self, dest_group: str, worker_id: str) -> Optional[dict]:
-        bucket = self._dest_worker_stats.get(dest_group) or {}
-        entry = bucket.get(worker_id)
-        if entry is not None:
-            return entry
-        for key, ent in bucket.items():
-            if worker_id.startswith(key) or key.startswith(worker_id):
-                return ent
+        """Find stats for (dest_group, worker), with short-group / prefix fallbacks.
+
+        Full keys look like ``host/…/destinations/backup2``. CSV seed still uses
+        short names (``backup2``) — fall back so first-wave affinity is not cold.
+        """
+        group = str(dest_group or "").strip()
+        wid = str(worker_id or "").strip()
+        if not group or not wid:
+            return None
+
+        def _from_bucket(bucket: dict) -> Optional[dict]:
+            entry = bucket.get(wid)
+            if entry is not None:
+                return entry
+            for key, ent in bucket.items():
+                if wid.startswith(key) or key.startswith(wid):
+                    return ent
+            return None
+
+        bucket = self._dest_worker_stats.get(group)
+        if isinstance(bucket, dict):
+            hit = _from_bucket(bucket)
+            if hit is not None:
+                return hit
+
+        short = dest_group_short_name(group)
+        if short and short != group:
+            bucket = self._dest_worker_stats.get(short)
+            if isinstance(bucket, dict):
+                return _from_bucket(bucket)
         return None
 
     def _maybe_save_dest_worker_stats(self, *, force: bool = False) -> None:
