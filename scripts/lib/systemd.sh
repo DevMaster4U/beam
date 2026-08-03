@@ -64,6 +64,13 @@ beam_prepare_data_dirs() {
 
   beam_chown_if_needed "${BEAM_ROOT}/logs" "$user" "$group"
   beam_chown_if_needed "${BEAM_ROOT}/run" "$user" "$group"
+  # Foreground-as-root often leaves root-owned instance logs that break ubuntu systemd.
+  if [[ -d "${BEAM_ROOT}/logs/workers" ]]; then
+    beam_chown_if_needed "${BEAM_ROOT}/logs/workers" "$user" "$group"
+  fi
+  if [[ -d "${BEAM_ROOT}/logs/orchestrators" ]]; then
+    beam_chown_if_needed "${BEAM_ROOT}/logs/orchestrators" "$user" "$group"
+  fi
 }
 
 beam_prepare_repo_permissions() {

@@ -28,7 +28,7 @@ usage() {
 Usage: $0 <instance> [--foreground|-f | --stop | --restart | --status] [worker.py args...]
 
   <instance>     Name matching config/workers/<instance>.env
-  --foreground   Run in the foreground (debug; bypasses systemd)
+  --foreground   Run in the foreground (debug; stops systemd instance first)
   --stop         Stop the worker via systemd
   --restart      Restart the worker via systemd
   --status       Show systemd status and log path
@@ -123,7 +123,17 @@ CMD=(
   "${EXTRA_ARGS[@]}"
 )
 
+# Foreground and systemd must not share the same worker identity / WS session.
 if [[ "$FOREGROUND" -eq 1 ]]; then
+  if beam_unit_installed "$SERVICE" && beam_systemctl is-active --quiet "$SERVICE"; then
+    echo "Stopping ${SERVICE} so foreground is the only worker session..."
+    beam_systemctl stop "$SERVICE" || true
+  fi
+  if [[ "${EUID}" -eq 0 ]]; then
+    echo "Warning: foreground is running as root." >&2
+    echo "  Prefer: sudo -u ubuntu ./scripts/run-worker.sh ${INSTANCE} --foreground" >&2
+    echo "  Root can own logs/wallets and break the ubuntu systemd unit afterward." >&2
+  fi
   cd "${ROOT}/neurons/worker"
   exec "${CMD[@]}"
 fi
@@ -141,3 +151,15 @@ fi
 echo "  service: ${SERVICE}"
 echo "  env: ${ENV_FILE}"
 echo "  log: ${LOG_FILE}"
+# Surface immediate failures (inactive/failed) instead of a silent exit.
+sleep 1
+if beam_systemctl is-active --quiet "$SERVICE"; then
+  echo "  state: active"
+else
+  echo "  state: NOT active — check:" >&2
+  echo "    systemctl status ${SERVICE} --no-pager" >&2
+  echo "    journalctl -u ${SERVICE} -n 50 --no-pager" >&2
+  echo "    tail -n 50 ${LOG_FILE}" >&2
+  beam_systemctl status "$SERVICE" --no-pager || true
+  exit 1
+fi
