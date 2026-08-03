@@ -591,11 +591,7 @@ class Orchestrator:
                     self.subtensor = bt.Subtensor(network=self.settings.subtensor_network)
                 logger.info(f"Connected to subtensor: {self.subtensor.network}")
 
-                self.metagraph = bt.Metagraph(
-                    netuid=self.settings.netuid,
-                    network=self.subtensor.network,
-                )
-                self.metagraph.sync(subtensor=self.subtensor)
+                self.metagraph = self._fetch_metagraph()
                 return
             except Exception as exc:
                 last_error = exc
@@ -617,6 +613,48 @@ class Orchestrator:
         raise RuntimeError(
             f"Failed to initialize subtensor/metagraph after {SUBTENSOR_INIT_MAX_ATTEMPTS} attempts for {target}"
         ) from last_error
+
+    def _fetch_metagraph(self):
+        """Load subnet metagraph (bittensor 11+ SyncClient, with legacy fallback)."""
+        if self.subtensor is None:
+            raise RuntimeError("subtensor not initialized")
+        netuid = self.settings.netuid
+        # bittensor >= 11: Metagraph is a dataclass; fetch via SyncClient.subnets
+        subnets = getattr(self.subtensor, "subnets", None)
+        if subnets is not None and hasattr(subnets, "metagraph"):
+            mg = subnets.metagraph(netuid, commitments=False)
+            if mg is None:
+                raise RuntimeError(f"subnet {netuid} metagraph not found")
+            return mg
+        # legacy bittensor < 11
+        mg = bt.Metagraph(netuid=netuid, network=self.subtensor.network)
+        mg.sync(subtensor=self.subtensor)
+        return mg
+
+    def _uid_emission_alpha(self, uid: int) -> float:
+        """Emission for uid in alpha units (bittensor 11 neuron.emission or legacy E)."""
+        mg = self.metagraph
+        if mg is None:
+            return 0.0
+        if hasattr(mg, "E"):
+            return float(mg.E[uid])
+        neuron = mg.neuron(uid) if hasattr(mg, "neuron") else mg.neurons[uid]
+        emission = getattr(neuron, "emission", 0.0)
+        if hasattr(emission, "alpha"):
+            return float(emission.alpha)
+        return float(emission)
+
+    def _tao_per_alpha_price(self) -> float:
+        """TAO per alpha for this subnet (bittensor 11 prices API or legacy invert)."""
+        if self.subtensor is None:
+            return 0.0
+        prices = getattr(self.subtensor, "prices", None)
+        if prices is not None and hasattr(prices, "alpha_price"):
+            info = prices.alpha_price(self.settings.netuid)
+            return float(info.get("tao_per_alpha") or 0.0)
+        # legacy: get_subnet_price returned alpha-per-TAO
+        price = float(self.subtensor.get_subnet_price(self.settings.netuid))
+        return (1.0 / price) if price > 0 else 0.0
 
     async def start(self) -> None:
         """Start the Orchestrator background services."""
@@ -888,39 +926,37 @@ class Orchestrator:
         if self.metagraph is None or self.our_uid is None:
             return 0.0
         try:
-            emission_alpha = float(self.metagraph.E[self.our_uid])
+            emission_alpha = self._uid_emission_alpha(self.our_uid)
         except Exception as e:
             logger.error(f"Error getting emission: {e}")
             return 0.0
         if emission_alpha <= 0 or not self.subtensor:
             return emission_alpha
 
-        # metagraph.E returns emission in alpha (ध), not TAO.
-        # Convert using cached subnet price (refreshed every 5 min).
+        # Emission is in alpha (ध), not TAO. Convert using cached tao_per_alpha.
         import time as _time
 
         now = _time.time()
         cache_ttl = 300  # 5 minutes
         if (
-            not hasattr(self, "_cached_alpha_per_tao")
+            not hasattr(self, "_cached_tao_per_alpha")
             or (now - getattr(self, "_cached_price_at", 0)) > cache_ttl
         ):
             try:
-                price = self.subtensor.get_subnet_price(self.settings.netuid)
-                self._cached_alpha_per_tao = float(price)
+                self._cached_tao_per_alpha = self._tao_per_alpha_price()
                 self._cached_price_at = now
             except Exception as e:
                 logger.warning(f"Could not convert emission alpha→TAO: {e}")
                 # Use stale cache if available
-                if not hasattr(self, "_cached_alpha_per_tao"):
+                if not hasattr(self, "_cached_tao_per_alpha"):
                     return emission_alpha
 
-        alpha_per_tao = getattr(self, "_cached_alpha_per_tao", 0)
-        if alpha_per_tao > 0:
-            emission_tao = emission_alpha / alpha_per_tao
+        tao_per_alpha = getattr(self, "_cached_tao_per_alpha", 0.0)
+        if tao_per_alpha > 0:
+            emission_tao = emission_alpha * tao_per_alpha
             logger.debug(
                 f"Emission: {emission_alpha:.4f} ध → {emission_tao:.9f} TAO "
-                f"(rate: {alpha_per_tao:.2f} ध/τ)"
+                f"(rate: {tao_per_alpha:.6g} τ/ध)"
             )
             return emission_tao
 
@@ -940,7 +976,7 @@ class Orchestrator:
             try:
                 await asyncio.sleep(sync_interval)
                 if self.metagraph and self.subtensor:
-                    self.metagraph.sync(subtensor=self.subtensor)
+                    self.metagraph = self._fetch_metagraph()
 
                 # Always re-check UID after sync — hotkey may have moved to a
                 # different UID slot after re-registration (stale UID causes
