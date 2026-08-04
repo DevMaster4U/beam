@@ -171,15 +171,17 @@ async def lifespan(app: FastAPI):
     elif settings.ready:
         try:
             applied = await orchestrator.subnet_core_client.set_ready(True)
-            if not applied and hasattr(orchestrator.subnet_core_client, "sync_ready_if_eligible"):
-                applied = await orchestrator.subnet_core_client.sync_ready_if_eligible()
             if applied:
                 logger.info(
                     "Signalled ready=True through NATS control — orchestrator will receive transfers"
                 )
             else:
+                state = orchestrator.subnet_core_client.ready_state()
                 logger.info(
-                    "Queued ready=True — it will be applied after NATS registration / workers connect"
+                    "Operator ready=True queued — BeamCore ready=%s until workers connect "
+                    "(eligible=%s connected gateway workers required)",
+                    state.get("confirmed_ready"),
+                    state.get("desired_ready"),
                 )
         except Exception as e:
             logger.warning(f"Failed to set ready=True through NATS control: {e}")

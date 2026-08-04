@@ -40,7 +40,7 @@ WORKER_INSTANCE="${WORKER_INSTANCE:-worker1}"
 
 GATEWAY_URL="${WORKER_GATEWAY_URL:-ws://88.216.68.26:9005}"
 GATEWAY_SECRET="${WORKER_GATEWAY_SECRET:-wgs}"
-CONTROL_WS_URL="${CONTROL_SERVER_WS_URL:-ws://84.32.220.100:8010/ws/miners}"
+CONTROL_WS_URL="${CONTROL_SERVER_WS_URL:-ws://88.216.195.66:8010/ws/miners}"
 CONTROL_SECRET="${CONTROL_SERVER_SECRET:-css}"
 CONTROL_MINER_ID="${CONTROL_SERVER_MINER_ID:-}"
 REQUIRED_PAYMENT="${WORKER_REQUIRED_PAYMENT:-false}"
@@ -138,6 +138,28 @@ echo "  gateway:  ${GATEWAY_URL}"
 echo "  miner_id: ${CONTROL_MINER_ID}"
 echo
 
+# Systemd units run as ubuntu (or BEAM_USER). Creating wallets as root leaves them
+# under /root/.bittensor, which the worker service cannot read.
+SERVICE_USER="$(beam_default_service_user)"
+SERVICE_HOME="$(getent passwd "$SERVICE_USER" | cut -d: -f6)"
+if [[ -z "$SERVICE_HOME" ]]; then
+  SERVICE_HOME="${HOME}"
+fi
+if [[ "${WALLET_PATH}" == "${HOME}/.bittensor/wallets" || "${WALLET_PATH}" == "/root/.bittensor/wallets" ]]; then
+  WALLET_PATH="${SERVICE_HOME}/.bittensor/wallets"
+fi
+echo "  service:  ${SERVICE_USER} (wallets → ${WALLET_PATH})"
+echo
+
+if [[ "$(id -u)" -eq 0 && "$SERVICE_USER" != "root" && "$CREATE_WALLET" -eq 1 ]]; then
+  echo "Do not run --create-wallet as root." >&2
+  echo "Wallets must be owned by ${SERVICE_USER} (systemd service user)." >&2
+  echo "  sudo -iu ${SERVICE_USER}" >&2
+  echo "  cd ${ROOT}" >&2
+  echo "  ./scripts/setup-worker-host.sh --create-wallet ..." >&2
+  exit 1
+fi
+
 if [[ "$SKIP_APT" -eq 0 ]]; then
   if ! command -v apt-get >/dev/null 2>&1; then
     echo "apt-get not found; use --skip-apt on non-Debian hosts." >&2
@@ -172,15 +194,21 @@ if [[ "$SKIP_PIP" -eq 0 ]]; then
 fi
 
 if [[ "$CREATE_WALLET" -eq 1 ]]; then
-  echo "Installing bittensor-cli==${BTCLI_VERSION} (user/system pip)..."
-  python3 -m pip install --user "bittensor-cli==${BTCLI_VERSION}" || \
-    python3 -m pip install "bittensor-cli==${BTCLI_VERSION}"
-
-  export PATH="${HOME}/.local/bin:${PATH}"
-  if ! command -v btcli >/dev/null 2>&1; then
-    echo "btcli not found on PATH after install." >&2
+  # Keep btcli out of the project venv: bittensor-cli pulls bittensor-drand>=2,
+  # which breaks Beam's pinned bittensor==10.4.0 (ImportError: get_encrypted_commit).
+  BTCLI_VENV="${ROOT}/.venv-btcli"
+  if [[ ! -x "${BTCLI_VENV}/bin/btcli" ]]; then
+    echo "Creating btcli venv at ${BTCLI_VENV} (isolated from project deps)..."
+    python3 -m venv "${BTCLI_VENV}"
+    "${BTCLI_VENV}/bin/pip" install -U pip wheel setuptools
+    "${BTCLI_VENV}/bin/pip" install "bittensor-cli==${BTCLI_VERSION}"
+  fi
+  BTCLI="${BTCLI_VENV}/bin/btcli"
+  if [[ ! -x "$BTCLI" ]]; then
+    echo "btcli not found at ${BTCLI} after install." >&2
     exit 1
   fi
+  echo "  btcli: ${BTCLI} ($("${BTCLI}" --version 2>/dev/null || true))"
 
   COLDKEY_FILE="${WALLET_PATH}/${WALLET_NAME}/coldkey"
   HOTKEY_FILE="${WALLET_PATH}/${WALLET_NAME}/hotkeys/${WALLET_HOTKEY}"
@@ -190,7 +218,7 @@ if [[ "$CREATE_WALLET" -eq 1 ]]; then
     echo "Coldkey already exists: ${COLDKEY_FILE} (skipping new-coldkey)"
   else
     echo "Creating coldkey ${WALLET_NAME}..."
-    btcli w new-coldkey --wallet-name "${WALLET_NAME}" --wallet-path "${WALLET_PATH}" \
+    "${BTCLI}" w new-coldkey --wallet-name "${WALLET_NAME}" --wallet-path "${WALLET_PATH}" \
       --n-words 12 --no-use-password
   fi
 
@@ -198,7 +226,7 @@ if [[ "$CREATE_WALLET" -eq 1 ]]; then
     echo "Hotkey already exists: ${HOTKEY_FILE} (skipping new-hotkey)"
   else
     echo "Creating hotkey ${WALLET_HOTKEY}..."
-    btcli w new-hotkey --wallet-name "${WALLET_NAME}" --wallet-path "${WALLET_PATH}" \
+    "${BTCLI}" w new-hotkey --wallet-name "${WALLET_NAME}" --wallet-path "${WALLET_PATH}" \
       --hotkey "${WALLET_HOTKEY}" --n-words 12 --no-use-password
   fi
 
@@ -224,7 +252,7 @@ if [[ "$WRITE_ENV" -eq 1 ]]; then
 
 WORKER_WALLET_NAME=${WALLET_NAME}
 WORKER_WALLET_HOTKEY=${WALLET_HOTKEY}
-# WALLET_PATH=${WALLET_PATH}
+WALLET_PATH=${WALLET_PATH}
 
 # Split machine resources across local workers.
 WORKER_MAX_CONCURRENT_TASKS=${MAX_CONCURRENT}
@@ -292,3 +320,10 @@ echo "       ./scripts/run-worker.sh ${WORKER_INSTANCE}"
 echo "       # or foreground: ./scripts/run-worker.sh ${WORKER_INSTANCE} --foreground"
 echo
 echo "Wallets: ${WALLET_PATH}"
+echo "btcli:   ${ROOT}/.venv-btcli/bin/btcli"
+if [[ -d /root/.bittensor/wallets && "${WALLET_PATH}" != /root/.bittensor/wallets ]]; then
+  echo
+  echo "NOTE: /root/.bittensor/wallets exists. If wallets were created as root earlier, move them:"
+  echo "  sudo mv /root/.bittensor /home/${SERVICE_USER}/"
+  echo "  sudo chown -R ${SERVICE_USER}:${SERVICE_USER} /home/${SERVICE_USER}/.bittensor"
+fi

@@ -840,12 +840,20 @@ class SubnetCoreClient:
             self._ready_sync_task = None
 
     async def _apply_desired_ready_state(self) -> bool:
+        """Push ``_desired_ready`` to BeamCore. Returns True if confirmed matches desired."""
         requested_ready = self._desired_ready
         response = await self._send_nats_request("set_ready", {"ready": requested_ready})
         confirmed = bool(response.get("ready", requested_ready))
-        self._desired_ready = confirmed
         self._last_confirmed_ready = confirmed
-        logger.info("Orchestrator ready=%s set on BeamCore (uid=%s)", confirmed, response.get("uid"))
+        # Recompute from local eligibility (do not clobber with BeamCore echo alone).
+        self._desired_ready = self._registration_ready()
+        logger.info(
+            "Orchestrator ready=%s set on BeamCore (uid=%s) operator_ready=%s eligible=%s",
+            confirmed,
+            response.get("uid"),
+            self._operator_ready,
+            self._desired_ready,
+        )
         return confirmed == requested_ready
 
     async def send_task_accept(
@@ -924,9 +932,18 @@ class SubnetCoreClient:
         return await self._send_nats_request("gateway_update", {"gateway_url": gateway_url, "max_workers": max_workers, "health": health})
 
     async def sync_ready_if_eligible(self) -> bool:
+        """Recompute eligibility and push to BeamCore without changing operator intent.
+
+        Returns True only when BeamCore confirms ready=True.
+        """
         self._desired_ready = self._registration_ready()
         if not self._registered:
-            logger.info("Ready intent recorded; NATS control registration is not complete")
+            logger.info(
+                "Ready intent recorded (operator_ready=%s eligible=%s); "
+                "NATS control registration is not complete",
+                self._operator_ready,
+                self._desired_ready,
+            )
             return False
         if not self._desired_ready:
             if self._last_confirmed_ready is not False:
@@ -936,20 +953,42 @@ class SubnetCoreClient:
                     self._schedule_ready_sync_if_needed()
                     logger.info("Queued ready=False after transient NATS control sync failure: %s", exc)
             return False
-        return await self._apply_desired_ready_state()
+        try:
+            await self._apply_desired_ready_state()
+        except Exception as exc:
+            self._schedule_ready_sync_if_needed()
+            logger.info("Queued ready=True after transient NATS control sync failure: %s", exc)
+            return False
+        return bool(self._last_confirmed_ready)
 
     async def set_ready(self, ready: bool) -> bool:
+        """Set operator ready intent and sync eligibility to BeamCore.
+
+        Returns True only when BeamCore confirms ready=True. Operator may want
+        ready=True while local eligibility is still False (no workers connected);
+        in that case BeamCore stays False and this returns False (queued).
+        """
         self._operator_ready = ready
         self._desired_ready = self._registration_ready()
         if not self._registered:
-            logger.info("Queued ready=%s until NATS control registration completes", self._desired_ready)
+            logger.info(
+                "Queued operator_ready=%s eligible=%s until NATS control registration completes",
+                self._operator_ready,
+                self._desired_ready,
+            )
             return False
         try:
-            return await self._apply_desired_ready_state()
+            await self._apply_desired_ready_state()
         except Exception as exc:
             self._schedule_ready_sync_if_needed()
-            logger.info("Queued ready=%s after transient NATS control sync failure: %s", self._desired_ready, exc)
+            logger.info(
+                "Queued operator_ready=%s eligible=%s after transient NATS control sync failure: %s",
+                self._operator_ready,
+                self._desired_ready,
+                exc,
+            )
             return False
+        return bool(self._last_confirmed_ready) and bool(self._operator_ready)
 
     def _auth_headers(self) -> dict:
         timestamp = str(int(time.time()))

@@ -408,7 +408,10 @@ class Orchestrator:
         self._reward_mgr.total_rewards_distributed = value
 
     def _on_worker_gateway_ready_change(self, ready: bool) -> None:
-        """Toggle orchestrator readiness when the first/last local worker connects."""
+        """Re-sync BeamCore readiness when local workers connect/disconnect.
+
+        Does not change operator intent — only eligibility (connected_count).
+        """
         # embedded / in_process+embedded: capacity comes from embedded pool.
         if self.settings.worker_gateway_mode in (
             "global",
@@ -429,7 +432,9 @@ class Orchestrator:
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
-                asyncio.create_task(self.subnet_core_client.set_ready(ready))
+                # sync_ready_if_eligible preserves operator_ready; set_ready(False)
+                # previously cleared operator intent when the last worker left.
+                asyncio.create_task(self.subnet_core_client.sync_ready_if_eligible())
         except Exception as exc:
             logger.warning("ready-change signal failed: %s", exc)
 

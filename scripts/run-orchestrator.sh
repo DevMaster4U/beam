@@ -26,7 +26,7 @@ usage() {
 Usage: $0 <instance> [--foreground|-f | --stop | --restart | --status]
 
   <instance>     Name matching config/orchestrators/<instance>.env
-  --foreground   Run in the foreground (debug; bypasses systemd)
+  --foreground   Run in the foreground (debug; stops systemd instance first)
   --stop         Stop the orchestrator via systemd
   --restart      Restart the orchestrator via systemd
   --status       Show systemd status, log path, and API port
@@ -152,7 +152,17 @@ CMD=(
   --env-file "$ENV_FILE"
 )
 
+# Foreground and systemd must not bind the same API port / BeamCore session.
 if [[ "$FOREGROUND" -eq 1 ]]; then
+  if beam_unit_installed "$SERVICE" && beam_systemctl is-active --quiet "$SERVICE"; then
+    echo "Stopping ${SERVICE} so foreground is the only orchestrator session..."
+    beam_systemctl stop "$SERVICE" || true
+  fi
+  if [[ "${EUID}" -eq 0 ]]; then
+    echo "Warning: foreground is running as root." >&2
+    echo "  Prefer: sudo -u ubuntu ./scripts/run-orchestrator.sh ${INSTANCE} --foreground" >&2
+    echo "  Root uses /root/.bittensor wallets and can break the ubuntu systemd unit." >&2
+  fi
   export LOG_DIR="${ROOT}/logs"
   cd "${ROOT}/neurons/orchestrator"
   exec "${CMD[@]}"
@@ -168,21 +178,24 @@ else
   echo "Started orchestrator ${INSTANCE}"
 fi
 
-if beam_unit_installed "$SERVICE"; then
-  active="$(systemctl is-active "$SERVICE" 2>/dev/null || true)"
-  echo "  state: ${active:-unknown}"
-  if [[ "${active}" != "active" ]]; then
-    echo "  warning: service is not active — check: journalctl -u ${SERVICE} -n 50 --no-pager" >&2
-  fi
-fi
-
 echo "  service: ${SERVICE}"
 echo "  env: ${ENV_FILE}"
 echo "  log: ${LOG_FILE}"
+
+sleep 1
+if beam_systemctl is-active --quiet "$SERVICE"; then
+  echo "  state: active"
+else
+  echo "  state: NOT active — check:" >&2
+  echo "    systemctl status ${SERVICE} --no-pager" >&2
+  echo "    journalctl -u ${SERVICE} -n 80 --no-pager" >&2
+  echo "    tail -n 80 ${LOG_FILE}" >&2
+  beam_systemctl status "$SERVICE" --no-pager || true
+  exit 1
+fi
+
 if [[ -f "$LOG_FILE" ]]; then
   echo "  log_bytes: $(wc -c < "$LOG_FILE" | tr -d ' ')"
-elif beam_unit_installed "$SERVICE"; then
-  echo "  journal: journalctl -u ${SERVICE} -n 50 --no-pager"
 fi
 port="9000"
 if [[ -f "$ENV_FILE" ]]; then
