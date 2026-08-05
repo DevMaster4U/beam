@@ -13,6 +13,9 @@ Environment="LOG_DIR=@BEAM_ROOT@/logs"
 Environment="PYTHONUNBUFFERED=1"
 EnvironmentFile=-@BEAM_ROOT@/.env
 EnvironmentFile=-@BEAM_ROOT@/config/workers/%i.env
+# Fix root-owned logs/cache left by `sudo … --foreground` (ubuntu cannot write otherwise).
+ExecStartPre=+/bin/mkdir -p @BEAM_ROOT@/logs/workers/predefined_etag_range_data/.tmp @BEAM_ROOT@/logs/workers/predefined_etag_chunk_data
+ExecStartPre=+/bin/chown -R @BEAM_USER@:@BEAM_GROUP@ @BEAM_ROOT@/logs/workers
 ExecStart=@BEAM_VENV@/bin/python @BEAM_ROOT@/neurons/worker/worker.py --env-file @BEAM_ROOT@/config/workers/%i.env
 Restart=always
 RestartSec=5

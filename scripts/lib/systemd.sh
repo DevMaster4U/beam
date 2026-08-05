@@ -55,6 +55,8 @@ beam_prepare_data_dirs() {
   mkdir -p \
     "${BEAM_ROOT}/logs/orchestrators" \
     "${BEAM_ROOT}/logs/workers" \
+    "${BEAM_ROOT}/logs/workers/predefined_etag_range_data/.tmp" \
+    "${BEAM_ROOT}/logs/workers/predefined_etag_chunk_data" \
     "${BEAM_ROOT}/logs/global-gateway" \
     "${BEAM_ROOT}/logs/control-server" \
     "${BEAM_ROOT}/data/control-server/miners" \
@@ -64,7 +66,7 @@ beam_prepare_data_dirs() {
 
   beam_chown_if_needed "${BEAM_ROOT}/logs" "$user" "$group"
   beam_chown_if_needed "${BEAM_ROOT}/run" "$user" "$group"
-  # Foreground-as-root often leaves root-owned instance logs that break ubuntu systemd.
+  # Foreground-as-root often leaves root-owned instance logs/cache that break ubuntu systemd.
   if [[ -d "${BEAM_ROOT}/logs/workers" ]]; then
     beam_chown_if_needed "${BEAM_ROOT}/logs/workers" "$user" "$group"
   fi

@@ -15,6 +15,9 @@ Environment="ORCHESTRATOR_INSTANCE=%i"
 Environment="PYTHONUNBUFFERED=1"
 EnvironmentFile=-@BEAM_ROOT@/.env
 EnvironmentFile=-@BEAM_ROOT@/config/orchestrators/%i.env
+# Fix root-owned logs/cache left by `sudo … --foreground`.
+ExecStartPre=+/bin/mkdir -p @BEAM_ROOT@/logs/orchestrators @BEAM_ROOT@/logs/workers/predefined_etag_range_data/.tmp @BEAM_ROOT@/logs/workers/predefined_etag_chunk_data
+ExecStartPre=+/bin/chown -R @BEAM_USER@:@BEAM_GROUP@ @BEAM_ROOT@/logs/orchestrators @BEAM_ROOT@/logs/workers
 ExecStart=@BEAM_VENV@/bin/python @BEAM_ROOT@/neurons/orchestrator/main.py --env-file @BEAM_ROOT@/config/orchestrators/%i.env
 Restart=always
 RestartSec=5

@@ -182,13 +182,30 @@ def configure_worker_logging() -> None:
 
     log_root = Path(os.environ.get("LOG_DIR", _workspace_root() / "logs"))
     log_dir = log_root / "workers"
-    log_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f"[Worker] Cannot create log dir {log_dir}: {exc}", file=original_stderr)
+        return
 
     log_format = "%(asctime)s.%(msecs)03.0f | %(levelname)s | %(message)s"
     log_datefmt = "%Y-%m-%d %H:%M:%S"
     formatter = logging.Formatter(log_format, datefmt=log_datefmt)
 
-    file_handler = logging.FileHandler(log_dir / f"{instance}.log")
+    log_path = log_dir / f"{instance}.log"
+    try:
+        file_handler = logging.FileHandler(log_path)
+    except PermissionError:
+        # Common after `sudo … --foreground`: root-owned log; systemd User=ubuntu cannot append.
+        print(
+            f"[Worker] Permission denied writing {log_path}. "
+            f"Fix with: sudo chown -R \"$(id -un)\":\"$(id -gn)\" \"{log_dir}\" "
+            f"(or re-run ./scripts/run-worker.sh which chowns logs). "
+            "Continuing with journal/stderr only.",
+            file=original_stderr,
+        )
+        return
+
     file_handler.setFormatter(formatter)
 
     handlers: list[logging.Handler] = [file_handler]
