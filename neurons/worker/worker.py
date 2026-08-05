@@ -839,20 +839,38 @@ async def upload_predefined_etag_from_local_cache(
     """Upload cached range bytes to dest. Returns (ok, send_ms, etag_real, etag_local, error).
 
     When skip_hash=True, do not sha256/md5 before PUT (caller hashes in parallel or skips).
+    Prefer streaming from disk when ``data`` is not provided so cache hits do not
+    materialize the full range in RAM solely for hashing/upload setup.
     """
     if not has_predefined_etag_chunk_data(transfer_context) and not data:
         return False, 0.0, None, None, "cache_file_missing"
 
-    if data is None:
-        data = await asyncio.to_thread(read_predefined_etag_range_bytes, transfer_context)
-    if not data:
-        return False, 0.0, None, None, "cache_file_empty"
-
     resolved_etag_local = etag_local
     computed = chunk_hash or ""
-    if not skip_hash:
-        computed = hashlib.sha256(data).hexdigest()
-        resolved_etag_local = etag_local or _etag_quoted_md5(data)
+    body = data
+    if body is None:
+        if not skip_hash:
+            hashed = await asyncio.to_thread(
+                _hash_predefined_etag_range_from_disk, transfer_context
+            )
+            if not hashed:
+                return False, 0.0, None, None, "cache_file_empty"
+            computed, disk_etag = hashed
+            resolved_etag_local = etag_local or disk_etag
+            if (
+                WORKER_VERIFY_CHUNK_HASH
+                and chunk_hash
+                and computed.lower() != chunk_hash.lower()
+            ):
+                return False, 0.0, None, resolved_etag_local, "cache_file_hash_mismatch"
+        # Stream upload from disk via existing buffered helper only when we must
+        # materialize; prefer reading once into body only for the PUT API below.
+        body = await asyncio.to_thread(read_predefined_etag_range_bytes, transfer_context)
+        if not body:
+            return False, 0.0, None, None, "cache_file_empty"
+    elif not skip_hash:
+        computed = hashlib.sha256(body).hexdigest()
+        resolved_etag_local = etag_local or _etag_quoted_md5(body)
         if (
             WORKER_VERIFY_CHUNK_HASH
             and chunk_hash
@@ -869,7 +887,7 @@ async def upload_predefined_etag_from_local_cache(
         send_ms, etag_real = await upload_buffered_predefined_etag(
             client,
             destination_url=transfer_context["dest_url"],
-            body=data,
+            body=body,
             chunk_hash=computed,
             transfer_id=str(transfer_context.get("transfer_id") or task_id or ""),
             chunk_index=0,
@@ -886,6 +904,9 @@ async def upload_predefined_etag_from_local_cache(
         return True, send_ms, etag_real, resolved_etag_local, None
     except Exception as exc:
         return False, 0.0, None, resolved_etag_local, exception_detail(exc)
+    finally:
+        body = None
+        data = None
 
 
 async def ensure_predefined_etag_chunk_data_local(
@@ -1778,14 +1799,50 @@ def uses_local_cache_file(transfer_context: dict) -> bool:
 
 
 def save_predefined_etag_chunk_data(transfer_context: dict, data: bytes) -> Optional[Path]:
-    """Persist fetched chunk bytes into the continuous range store (merge + ≤1 GiB)."""
+    """Persist fetched chunk bytes into the continuous range store (merge + ≤1 GiB).
+
+    Writes through a temp file + ingest_from_file so merge packing streams from disk
+    instead of keeping a second full-range copy alive during ingest.
+    """
     if not data or not predefined_etag_transfer_eligible(transfer_context):
         return None
     source, start, end = _transfer_byte_range(transfer_context)
     if not source:
         return None
-    segment = get_worker_range_store().ingest(source, start, end, data)
-    return get_worker_range_store().segment_path(source, segment)
+    store = get_worker_range_store()
+    expected = end - start + 1
+    if len(data) != expected:
+        return None
+    tmp_dir = _predefined_etag_range_data_dir() / ".tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f"ingest_{start}_", suffix=".bin", dir=tmp_dir
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        tmp_path.write_bytes(data)
+        segment = store.ingest_from_file(source, start, end, tmp_path)
+        return store.segment_path(source, segment)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def save_predefined_etag_chunk_data_from_file(
+    transfer_context: dict, path: Path
+) -> Optional[Path]:
+    """Persist an on-disk range file into the continuous store without a RAM join."""
+    if not predefined_etag_transfer_eligible(transfer_context):
+        return None
+    source, start, end = _transfer_byte_range(transfer_context)
+    if not source:
+        return None
+    src = Path(path)
+    if not src.is_file():
+        return None
+    store = get_worker_range_store()
+    segment = store.ingest_from_file(source, start, end, src)
+    return store.segment_path(source, segment)
 
 
 async def _iter_predefined_etag_range_chunks(transfer_context: dict):
@@ -2440,7 +2497,11 @@ def apply_range_coverage_snapshot(sources: list[dict]) -> None:
 
 
 async def sync_range_to_control_server(transfer_context: dict) -> bool:
-    """Upload local range bytes to control-server and announce coverage."""
+    """Upload local range bytes to control-server and announce coverage.
+
+    Streams from the range store (or a legacy cache file) so a non-cached miss
+    that later syncs does not re-load the full range into a long-lived ``bytes``.
+    """
     from neurons.common.byte_range_store import normalize_source_url
 
     source_url = normalize_source_url(str(transfer_context.get("source_url") or ""))
@@ -2451,21 +2512,34 @@ async def sync_range_to_control_server(transfer_context: dict) -> bool:
         return False
     if not source_url:
         return False
-    data = await asyncio.to_thread(read_predefined_etag_range_bytes, transfer_context)
-    if not data:
-        return False
     try:
-        from neurons.common.control_client import upload_predefined_etag_range_data
-
-        uploaded = await asyncio.to_thread(
-            upload_predefined_etag_range_data,
-            source_url,
-            start,
-            end,
-            data,
-            chunk_hash=hashlib.sha256(data).hexdigest(),
-            etag="",
+        from neurons.common.control_client import (
+            upload_predefined_etag_range_from_file,
+            upload_predefined_etag_range_from_store,
         )
+
+        store = get_worker_range_store()
+        if store.covers(source_url, start, end):
+            uploaded = await asyncio.to_thread(
+                upload_predefined_etag_range_from_store,
+                source_url,
+                start,
+                end,
+                store,
+                etag="",
+            )
+        else:
+            path = predefined_etag_chunk_data_path(transfer_context)
+            if not path.is_file() or path.stat().st_size != (end - start + 1):
+                return False
+            uploaded = await asyncio.to_thread(
+                upload_predefined_etag_range_from_file,
+                source_url,
+                start,
+                end,
+                path,
+                etag="",
+            )
         if uploaded:
             from neurons.common import control_ws_client
 
@@ -2519,10 +2593,49 @@ def _etag_quoted_md5(data: bytes) -> str:
     return f'"{hashlib.md5(data).hexdigest()}"'
 
 
+def _hash_predefined_etag_range_from_disk(
+    transfer_context: dict,
+) -> Optional[tuple[str, str]]:
+    """Return (sha256_hex, quoted_md5_etag) by streaming disk, or None on miss."""
+    source, start, end = _transfer_byte_range(transfer_context)
+    expected = end - start + 1
+    if expected <= 0:
+        return None
+    sha = hashlib.sha256()
+    md5 = hashlib.md5()
+    written = 0
+    store = get_worker_range_store()
+    if source and store.covers(source, start, end):
+        iterator = store.iter_slice(
+            source, start, end, chunk_size=FETCH_STREAM_CHUNK_SIZE
+        )
+        if iterator is None:
+            return None
+        for part in iterator:
+            sha.update(part)
+            md5.update(part)
+            written += len(part)
+    else:
+        path = predefined_etag_chunk_data_path(transfer_context)
+        if not path.is_file() or path.stat().st_size != expected:
+            return None
+        with path.open("rb") as handle:
+            while True:
+                part = handle.read(FETCH_STREAM_CHUNK_SIZE)
+                if not part:
+                    break
+                sha.update(part)
+                md5.update(part)
+                written += len(part)
+    if written != expected:
+        return None
+    return sha.hexdigest(), f'"{md5.hexdigest()}"'
+
+
 def derive_predefined_etag_from_range_data(
     transfer_context: dict,
 ) -> Optional[PredefinedETagChunkCacheEntry]:
-    """If range_data covers this task, load bytes and compute chunk_hash + etag.
+    """If range_data covers this task, stream-hash chunk_hash + etag from disk.
 
     Always computed from raw bytes (never from predefined_etag_chunks.json).
     """
@@ -2530,22 +2643,11 @@ def derive_predefined_etag_from_range_data(
         return None
     if not has_predefined_etag_chunk_data(transfer_context):
         return None
-    data = read_predefined_etag_range_bytes(transfer_context)
-    if not data:
+    hashed = _hash_predefined_etag_range_from_disk(transfer_context)
+    if not hashed:
         return None
-    try:
-        expected = (
-            int(transfer_context["range_end"]) - int(transfer_context["range_start"]) + 1
-        )
-    except (KeyError, TypeError, ValueError):
-        return None
-    if len(data) != expected:
-        return None
-
-    return PredefinedETagChunkCacheEntry(
-        chunk_hash=_sha256_hex(data),
-        etag=_etag_quoted_md5(data),
-    )
+    chunk_hash, etag = hashed
+    return PredefinedETagChunkCacheEntry(chunk_hash=chunk_hash, etag=etag)
 
 
 def resolve_predefined_etag_cache(
@@ -3455,12 +3557,30 @@ async def fetch_and_send_chunk(
                     raise
 
                 fetch_ms = (time.perf_counter() - fetch_started) * 1000
-                body = bytes(buffer)
-                if transfer_context is not None:
-                    save_predefined_etag_chunk_data(transfer_context, body)
-                chunk_hash = await asyncio.get_running_loop().run_in_executor(
-                    None, _sha256_hex, body
+                # Spill buffer to disk before hashing/ingest so we do not keep
+                # bytearray + bytes + ingest copies of a new (non-cached) range.
+                tmp_dir = _predefined_etag_range_data_dir() / ".tmp"
+                tmp_dir.mkdir(parents=True, exist_ok=True)
+                fd, tmp_name = tempfile.mkstemp(
+                    prefix=f"miss_{upload_offset}_",
+                    suffix=".bin",
+                    dir=tmp_dir,
                 )
+                os.close(fd)
+                tmp_path = Path(tmp_name)
+                try:
+                    with tmp_path.open("wb") as out:
+                        out.write(buffer)
+                    del buffer
+                    if transfer_context is not None:
+                        save_predefined_etag_chunk_data_from_file(
+                            transfer_context, tmp_path
+                        )
+                    chunk_hash = await asyncio.get_running_loop().run_in_executor(
+                        None, _sha256_file, tmp_path
+                    )
+                finally:
+                    tmp_path.unlink(missing_ok=True)
                 if (
                     WORKER_VERIFY_CHUNK_HASH
                     and expected_chunk_hash
@@ -3493,7 +3613,6 @@ async def fetch_and_send_chunk(
                     PREDEFINED_ETAG,
                     buffer=None,
                 )
-                del buffer, body
                 return (
                     bytes_transferred,
                     chunk_hash,

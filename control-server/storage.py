@@ -139,6 +139,18 @@ def store_predefined_etag_range_data(
     return segment.to_dict()
 
 
+def store_predefined_etag_range_from_file(
+    source_url: str, start: int, end: int, path: Path
+) -> dict[str, Any]:
+    """Ingest an on-disk range file without loading the whole body into RAM."""
+    from neurons.common.byte_range_store import normalize_source_url
+
+    segment = get_range_store().ingest_from_file(
+        normalize_source_url(source_url), start, end, Path(path)
+    )
+    return segment.to_dict()
+
+
 def store_predefined_etag_chunk_data(key: str, data: bytes) -> Path:
     """Store chunk bytes into the continuous range store (legacy key API)."""
     parsed = parse_cache_key_range(key)

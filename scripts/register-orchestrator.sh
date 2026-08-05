@@ -201,10 +201,16 @@ print(f"  hotkey: {hotkey}", file=sys.stderr)
 print(f"  signed: {msg}", file=sys.stderr)
 
 body = json.dumps(payload).encode("utf-8")
+# Cloudflare Browser Integrity Check returns HTTP 403 / error 1010 for the
+# default Python-urllib User-Agent. Use a normal client signature.
 req = urllib.request.Request(
     f"{core}/orchestrators/register",
     data=body,
-    headers={"Content-Type": "application/json"},
+    headers={
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "beam-register-orchestrator/1.0 (+https://github.com/Beam-Network/beam)",
+    },
     method="POST",
 )
 try:

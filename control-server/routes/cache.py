@@ -12,6 +12,7 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from auth import require_control_secret
+from config import get_settings
 from storage import (
     delete_all_chunk_data_files,
     delete_predefined_etag_chunk_data,
@@ -26,7 +27,7 @@ from storage import (
     range_coverage_snapshot,
     range_store_status,
     store_predefined_etag_chunk_data,
-    store_predefined_etag_range_data,
+    store_predefined_etag_range_from_file,
     upsert_predefined_etag_entry,
 )
 from ws_hub import miner_hub
@@ -75,6 +76,10 @@ async def put_range_data(
     x_etag: str = Header(default="", alias="X-ETag"),
     x_miner_id: str = Header(default="", alias="X-Miner-Id"),
 ) -> dict[str, Any]:
+    import os
+    import tempfile
+    from pathlib import Path
+
     source_url = x_source_url.strip()
     try:
         start = int(x_range_start)
@@ -83,23 +88,49 @@ async def put_range_data(
         raise HTTPException(status_code=400, detail="invalid range headers") from exc
     if not source_url or end < start:
         raise HTTPException(status_code=400, detail="source_url and valid range required")
+    expected = end - start + 1
+    tmp_dir = get_settings().cache_dir / "range_data" / ".tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f"put_{start}_", suffix=".bin", dir=tmp_dir
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
     try:
-        data = await request.body()
-        if not data:
+        hasher = hashlib.sha256()
+        written = 0
+        with tmp_path.open("wb") as out:
+            async for part in request.stream():
+                if not part:
+                    continue
+                written += len(part)
+                if written > expected:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"body length {written} > range size {expected}"
+                        ),
+                    )
+                hasher.update(part)
+                out.write(part)
+        if written == 0:
             raise HTTPException(status_code=400, detail="range body required")
-        expected = end - start + 1
-        if len(data) != expected:
+        if written != expected:
             raise HTTPException(
                 status_code=400,
-                detail=f"body length {len(data)} != range size {expected}",
+                detail=f"body length {written} != range size {expected}",
             )
-        computed_hash = hashlib.sha256(data).hexdigest()
+        computed_hash = hasher.hexdigest()
         chunk_hash = x_chunk_hash.strip() or computed_hash
         if chunk_hash.lower() != computed_hash.lower():
             raise HTTPException(status_code=400, detail="chunk hash mismatch")
         etag = x_etag.strip()
         segment = await asyncio.to_thread(
-            store_predefined_etag_range_data, source_url, start, end, data
+            store_predefined_etag_range_from_file,
+            source_url,
+            start,
+            end,
+            tmp_path,
         )
         await miner_hub.broadcast_range(
             source_url=source_url,
@@ -112,7 +143,7 @@ async def put_range_data(
             "source_url": source_url,
             "start": start,
             "end": end,
-            "bytes": len(data),
+            "bytes": written,
             "chunk_hash": computed_hash,
             "segment": segment,
         }
@@ -120,6 +151,8 @@ async def put_range_data(
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"range store failed: {exc}") from exc
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 @router.get("/ranges/data")

@@ -196,24 +196,30 @@ def upload_predefined_etag_chunk_data(
         return False
 
 
-def upload_predefined_etag_range_data(
+def _put_predefined_etag_range(
     source_url: str,
     start: int,
     end: int,
-    data: bytes,
+    content: Any,
     *,
-    chunk_hash: str = "",
+    content_length: int,
+    chunk_hash: str,
     etag: str = "",
     config: Optional[ControlServerConfig] = None,
 ) -> bool:
-    """Upload a byte range into the control-server continuous range store."""
+    """PUT range body (bytes, file, or iterator) with fixed Content-Length."""
     from neurons.common.byte_range_store import normalize_source_url
 
     cfg = config or get_control_server_config()
     source_url = normalize_source_url(source_url)
-    if not cfg.http_url or not cfg.secret or not source_url or not data:
-        return False
-    if end < start or len(data) != (end - start + 1):
+    if (
+        not cfg.http_url
+        or not cfg.secret
+        or not source_url
+        or end < start
+        or content_length != (end - start + 1)
+        or not chunk_hash
+    ):
         return False
     url = f"{cfg.http_url}/cache/predefined-etag/ranges"
     headers = {
@@ -221,15 +227,16 @@ def upload_predefined_etag_range_data(
         "X-Source-Url": source_url,
         "X-Range-Start": str(start),
         "X-Range-End": str(end),
-        "X-Chunk-Hash": chunk_hash or hashlib.sha256(data).hexdigest(),
+        "X-Chunk-Hash": chunk_hash,
         "X-ETag": etag or "",
         "Content-Type": "application/octet-stream",
+        "Content-Length": str(content_length),
     }
     if cfg.miner_id:
         headers["X-Miner-Id"] = cfg.miner_id
     try:
         with httpx.Client(timeout=CHUNK_DATA_TIMEOUT) as client:
-            resp = client.put(url, content=data, headers=headers)
+            resp = client.put(url, content=content, headers=headers)
             resp.raise_for_status()
         return True
     except Exception as exc:
@@ -241,6 +248,146 @@ def upload_predefined_etag_range_data(
             exc,
         )
         return False
+
+
+def upload_predefined_etag_range_data(
+    source_url: str,
+    start: int,
+    end: int,
+    data: bytes,
+    *,
+    chunk_hash: str = "",
+    etag: str = "",
+    config: Optional[ControlServerConfig] = None,
+) -> bool:
+    """Upload a byte range into the control-server continuous range store.
+
+    Prefer :func:`upload_predefined_etag_range_from_store` for large ranges so the
+    worker does not keep a full-range ``bytes`` buffer during PUT.
+    """
+    if not data:
+        return False
+    return _put_predefined_etag_range(
+        source_url,
+        start,
+        end,
+        data,
+        content_length=len(data),
+        chunk_hash=chunk_hash or hashlib.sha256(data).hexdigest(),
+        etag=etag,
+        config=config,
+    )
+
+
+def upload_predefined_etag_range_from_file(
+    source_url: str,
+    start: int,
+    end: int,
+    path: str | Path,
+    *,
+    chunk_hash: str = "",
+    etag: str = "",
+    config: Optional[ControlServerConfig] = None,
+    chunk_size: int = 1024 * 1024,
+) -> bool:
+    """Stream a local file into the control-server range store (no full RAM buffer)."""
+    src = Path(path)
+    if not src.is_file() or end < start:
+        return False
+    expected = end - start + 1
+    if src.stat().st_size != expected:
+        return False
+    resolved_hash = (chunk_hash or "").strip()
+    if not resolved_hash:
+        hasher = hashlib.sha256()
+        with src.open("rb") as handle:
+            while True:
+                part = handle.read(chunk_size)
+                if not part:
+                    break
+                hasher.update(part)
+        resolved_hash = hasher.hexdigest()
+    with src.open("rb") as handle:
+        return _put_predefined_etag_range(
+            source_url,
+            start,
+            end,
+            handle,
+            content_length=expected,
+            chunk_hash=resolved_hash,
+            etag=etag,
+            config=config,
+        )
+
+
+def upload_predefined_etag_range_from_store(
+    source_url: str,
+    start: int,
+    end: int,
+    store: Any,
+    *,
+    chunk_hash: str = "",
+    etag: str = "",
+    config: Optional[ControlServerConfig] = None,
+    chunk_size: int = 1024 * 1024,
+) -> bool:
+    """Stream covered range bytes from a ByteRangeStore without joining into RAM."""
+    from neurons.common.byte_range_store import normalize_source_url
+
+    source_url = normalize_source_url(source_url)
+    if not source_url or end < start or store is None:
+        return False
+    if not store.covers(source_url, start, end):
+        return False
+    expected = end - start + 1
+    covering = store.find_covering_segments(source_url, start, end)
+    if (
+        covering
+        and len(covering) == 1
+        and covering[0].start == start
+        and covering[0].end == end
+    ):
+        return upload_predefined_etag_range_from_file(
+            source_url,
+            start,
+            end,
+            store.segment_path(source_url, covering[0]),
+            chunk_hash=chunk_hash,
+            etag=etag,
+            config=config,
+            chunk_size=chunk_size,
+        )
+
+    resolved_hash = (chunk_hash or "").strip()
+    if not resolved_hash:
+        hasher = hashlib.sha256()
+        iterator = store.iter_slice(
+            source_url, start, end, chunk_size=chunk_size
+        )
+        if iterator is None:
+            return False
+        for part in iterator:
+            hasher.update(part)
+        resolved_hash = hasher.hexdigest()
+
+    def _gen():
+        iterator = store.iter_slice(
+            source_url, start, end, chunk_size=chunk_size
+        )
+        if iterator is None:
+            return
+        yield from iterator
+
+    return _put_predefined_etag_range(
+        source_url,
+        start,
+        end,
+        _gen(),
+        content_length=expected,
+        chunk_hash=resolved_hash,
+        etag=etag,
+        config=config,
+    )
 
 
 def fetch_predefined_etag_chunk_data(
