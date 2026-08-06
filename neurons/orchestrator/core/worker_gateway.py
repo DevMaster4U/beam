@@ -59,6 +59,14 @@ def _env_bool(name: str, default: bool) -> bool:
 # for an idle worker instead of stacking onto a busy first-wave worker.
 PREFER_IDLE_WORKERS = _env_bool("ORCH_PREFER_IDLE_WORKERS", True)
 ALLOW_BUSY_WORKER_REUSE = _env_bool("ORCH_ALLOW_BUSY_WORKER_REUSE", False)
+# Re-queue offers rejected with cache_miss_not_accepted to workers that
+# advertise non_cached_file=true (WORKER_NON_CACHED_FILE).
+CACHE_MISS_REOFFER = _env_bool("ORCH_CACHE_MISS_REOFFER", True)
+# When true, first-wave assignment prefers workers with non_cached_file=true
+# (miss-capable). When false (default), prefer cache-only workers first so
+# hits stay on them and misses get rejected+reoffered to miss-capable.
+PREFER_NON_CACHED_WORKERS = _env_bool("ORCH_PREFER_NON_CACHED_WORKERS", False)
+CACHE_MISS_NOT_ACCEPTED = "cache_miss_not_accepted"
 # Hold undelivered offers locally and push when a worker becomes idle
 # (instead of failing / relying on BeamCore reassignment).
 OVERFLOW_QUEUE_ENABLED = _env_bool("ORCH_OVERFLOW_QUEUE_ENABLED", True)
@@ -346,6 +354,8 @@ class _WorkerProfile:
     max_concurrent_tasks: int = 5
     worker_version: str = ""
     initial_order: int = 0
+    # True when worker accepts cache-miss transfers (WORKER_NON_CACHED_FILE).
+    non_cached_file: bool = True
     claimed_bandwidth_mbps: float = 0.0
     transfer_mbps_sum: float = 0.0
     transfer_count: int = 0
@@ -405,6 +415,8 @@ class WorkerGateway:
         # offer_id → full task_offer payload for capacity-reject reassignment
         self._pending_offers: Dict[str, dict] = {}
         self._offer_attempted_workers: Dict[str, Set[str]] = {}
+        # offer_ids that must go to non_cached_file=true workers (after miss reject).
+        self._offer_require_non_cached: Set[str] = set()
         # Offers waiting for an idle worker (single dispatcher queue).
         self._overflow_offers: deque = deque()
         self._overflow_offer_ids: Set[str] = set()
@@ -1068,6 +1080,7 @@ class WorkerGateway:
         worker_version: Optional[str] = None,
         initial_order: Optional[int] = None,
         claimed_bandwidth_mbps: Optional[float] = None,
+        non_cached_file: Optional[bool] = None,
     ) -> None:
         profile = self._get_profile(worker_id)
         if ip and ip.strip():
@@ -1078,6 +1091,8 @@ class WorkerGateway:
             profile.worker_version = worker_version.strip()
         if initial_order is not None:
             profile.initial_order = int(initial_order)
+        if non_cached_file is not None:
+            profile.non_cached_file = bool(non_cached_file)
         if claimed_bandwidth_mbps is not None and claimed_bandwidth_mbps > 0:
             if profile.claimed_bandwidth_mbps <= 0:
                 profile.claimed_bandwidth_mbps = float(claimed_bandwidth_mbps)
@@ -1264,6 +1279,9 @@ class WorkerGateway:
 
             worker_id: Optional[str] = None
             use_prefer = False
+            require_nc = bool(
+                offer_id and offer_id in self._offer_require_non_cached
+            )
             if prefer and prefer not in excluded and (
                 self._worker_is_free(prefer)
                 or (
@@ -1273,16 +1291,19 @@ class WorkerGateway:
                     < OVERFLOW_BUSY_MAX_PER_WORKER
                 )
             ):
-                free_n = sum(
-                    1
-                    for wid in self._sessions
-                    if wid not in deliver_failed and self._worker_is_free(wid)
-                )
-                # Prefer only when it is the sole free slot (or pressure stacking).
-                # Do NOT sticky-prefer when dest_group is empty — that pinned all
-                # sequential 1-offer batches onto the last finisher.
-                if free_n <= 1 or pressure:
-                    use_prefer = True
+                if require_nc and not self._get_profile(prefer).non_cached_file:
+                    prefer = None
+                else:
+                    free_n = sum(
+                        1
+                        for wid in self._sessions
+                        if wid not in deliver_failed and self._worker_is_free(wid)
+                    )
+                    # Prefer only when it is the sole free slot (or pressure stacking).
+                    # Do NOT sticky-prefer when dest_group is empty — that pinned all
+                    # sequential 1-offer batches onto the last finisher.
+                    if free_n <= 1 or pressure:
+                        use_prefer = True
             if use_prefer:
                 worker_id = prefer
                 prefer = None
@@ -1295,6 +1316,8 @@ class WorkerGateway:
                     force_allow_busy=pressure,
                     assign_cap=OVERFLOW_BUSY_MAX_PER_WORKER if pressure else None,
                     dest_group=dest_group or None,
+                    prefer_non_cached_capable=True if require_nc else None,
+                    require_non_cached_capable=require_nc,
                 )
 
             if not worker_id:
@@ -1515,11 +1538,19 @@ class WorkerGateway:
         key = str(offer_id)
         self._pending_offers.pop(key, None)
         self._offer_attempted_workers.pop(key, None)
+        self._offer_require_non_cached.discard(key)
 
     @staticmethod
     def _is_capacity_reject_error(error: object) -> bool:
         text = str(error or "").strip().lower()
         return text.startswith("queue_full") or text.startswith("memory_budget")
+
+    @staticmethod
+    def _is_cache_miss_reject_error(error: object) -> bool:
+        text = str(error or "").strip().lower()
+        return text == CACHE_MISS_NOT_ACCEPTED or text.startswith(
+            CACHE_MISS_NOT_ACCEPTED
+        )
 
     @staticmethod
     def _is_slow_net_wait_error(error: object) -> bool:
@@ -1613,6 +1644,93 @@ class WorkerGateway:
             short_id(worker_id),
             len(attempted),
             msg.get("error"),
+        )
+        return False
+
+    async def _maybe_reassign_on_cache_miss_reject(
+        self, worker_id: str, msg: dict
+    ) -> bool:
+        """Re-queue cache-only rejects to workers with non_cached_file=true."""
+        if not CACHE_MISS_REOFFER:
+            return False
+        if bool(msg.get("success")):
+            return False
+        if not self._is_cache_miss_reject_error(msg.get("error")):
+            return False
+
+        task_id = msg.get("task_id")
+        offer_id = str(msg.get("offer_id") or task_id or "").strip()
+        if not offer_id:
+            return False
+
+        offer = self._pending_offers.get(offer_id)
+        if not offer:
+            logger.warning(
+                "cache_miss reject without pending offer: task=%s offer=%s "
+                "worker=%s error=%s",
+                short_id(task_id),
+                short_id(offer_id),
+                short_id(worker_id),
+                msg.get("error"),
+            )
+            return False
+
+        attempted = self._offer_attempted_workers.setdefault(offer_id, set())
+        attempted.add(str(worker_id))
+        self._offer_require_non_cached.add(offer_id)
+
+        capable = {
+            wid
+            for wid, profile in self._profiles.items()
+            if wid in self._sessions and profile.non_cached_file
+        }
+        remaining = capable - attempted
+        if not remaining:
+            logger.warning(
+                "cache_miss: no non_cached_file workers left task=%s offer=%s "
+                "attempted=%d capable=%d — relay failure",
+                short_id(task_id),
+                short_id(offer_id),
+                len(attempted),
+                len(capable),
+            )
+            return False
+
+        self.mark_worker_idle(worker_id, offer_id, drain_overflow=False)
+        if self._overflow_prefer_worker == worker_id:
+            self._overflow_prefer_worker = None
+
+        if self._enqueue_overflow(offer):
+            logger.info(
+                "cache_miss: re-queued task=%s offer=%s from=%s "
+                "attempted=%d pending=%d prefer_non_cached=true remaining=%d",
+                short_id(task_id),
+                short_id(offer_id),
+                short_id(worker_id),
+                len(attempted),
+                len(self._overflow_offers),
+                len(remaining),
+            )
+            await self._send_to_worker(
+                worker_id,
+                {
+                    "type": "task_result_ack",
+                    "task_id": task_id,
+                    "offer_id": offer_id,
+                    "received": True,
+                    "status": "late_superseded",
+                    "reason": f"queued_after_cache_miss:{msg.get('error')}",
+                },
+            )
+            await self._drain_overflow_queue()
+            return True
+
+        logger.warning(
+            "cache_miss: queue full task=%s offer=%s from=%s attempted=%d",
+            short_id(task_id),
+            short_id(offer_id),
+            short_id(worker_id),
+            len(attempted),
         )
         return False
 
@@ -1776,6 +1894,8 @@ class WorkerGateway:
         force_allow_busy: bool = False,
         assign_cap: Optional[int] = None,
         dest_group: Optional[str] = None,
+        prefer_non_cached_capable: Optional[bool] = None,
+        require_non_cached_capable: bool = False,
     ) -> Optional[str]:
         """Pick the next worker with capacity, matching global-gateway batch IP spread.
 
@@ -1794,6 +1914,14 @@ class WorkerGateway:
         Free non-penalized workers are tried before free penalized ones; if
         every non-penalized worker is busy, a free penalized worker is still
         selected (do not stall the queue).
+
+        ``prefer_non_cached_capable``:
+          True  → rank workers with non_cached_file=true first (miss-capable)
+          False → rank cache-only workers first (non_cached_file=false)
+          None  → use ORCH_PREFER_NON_CACHED_WORKERS default
+
+        ``require_non_cached_capable``: only workers with non_cached_file=true
+        (used after a cache_miss_not_accepted reject).
 
         ``assign_cap`` (overflow pressure mode): require ``load < assign_cap``
         instead of hello ``max_concurrent_tasks`` so backlog can stack up to N
@@ -1818,6 +1946,8 @@ class WorkerGateway:
         allow_busy_reuse = ALLOW_BUSY_WORKER_REUSE or force_allow_busy
         cap = int(assign_cap) if assign_cap is not None and assign_cap > 0 else None
         dest_g = str(dest_group or "").strip() if DEST_AFFINITY_ENABLED else ""
+        if prefer_non_cached_capable is None:
+            prefer_non_cached_capable = PREFER_NON_CACHED_WORKERS
 
         def _batch_count(worker_id: str) -> int:
             if counts is not None:
@@ -1845,6 +1975,14 @@ class WorkerGateway:
                 return self.dest_worker_mbps(dest_g, worker_id)
             return self._get_profile(worker_id).average_mbps
 
+        def _non_cached_rank(worker_id: str) -> int:
+            """0 = preferred for this offer's non_cached policy."""
+            capable = self._get_profile(worker_id).non_cached_file
+            if prefer_non_cached_capable:
+                return 0 if capable else 1
+            # Prefer cache-only workers first when not forcing miss-capable.
+            return 0 if not capable else 1
+
         def _eligible(
             worker_id: str,
             *,
@@ -1855,6 +1993,10 @@ class WorkerGateway:
             only_penalized: bool = False,
         ) -> bool:
             if worker_id in excluded:
+                return False
+            if require_non_cached_capable and not self._get_profile(
+                worker_id
+            ).non_cached_file:
                 return False
             if not _has_assign_capacity(worker_id):
                 return False
@@ -1887,8 +2029,8 @@ class WorkerGateway:
             exclude_penalized: bool = False,
             only_penalized: bool = False,
         ) -> Optional[str]:
-            # (load, batch_n, -dest_mbps, -initial_order, offset, worker_id)
-            candidates: list[tuple[int, int, float, int, int, str]] = []
+            # (non_cached_rank, load, batch_n, -dest_mbps, -initial_order, offset, wid)
+            candidates: list[tuple[int, int, int, float, int, int, str]] = []
             for offset in range(pool_size):
                 idx = (start + offset) % pool_size
                 worker_id = connected[idx]
@@ -1904,6 +2046,7 @@ class WorkerGateway:
                 profile = self._get_profile(worker_id)
                 candidates.append(
                     (
+                        _non_cached_rank(worker_id),
                         _load(worker_id),
                         _batch_count(worker_id),
                         -_score_mbps(worker_id),
@@ -1915,7 +2058,7 @@ class WorkerGateway:
             if not candidates:
                 return None
             if DEST_AFFINITY_ENABLED:
-                # load → batch → dest Mbps → initial_order → RR offset
+                # non_cached → load → batch → dest Mbps → initial_order → RR
                 candidates.sort(
                     key=lambda item: (
                         item[0],
@@ -1923,14 +2066,23 @@ class WorkerGateway:
                         item[2],
                         item[3],
                         item[4],
+                        item[5],
                     )
                 )
             else:
-                # Pure free-worker round robin (ignore Mbps / initial_order).
+                # non_cached preference then free-worker round robin
                 candidates.sort(
-                    key=lambda item: (item[0], item[1], item[4])
+                    key=lambda item: (item[0], item[1], item[2], item[5])
                 )
-            _load_n, _bc, _neg_mbps, _neg_order, offset, worker_id = candidates[0]
+            (
+                _nc_rank,
+                _load_n,
+                _bc,
+                _neg_mbps,
+                _neg_order,
+                offset,
+                worker_id,
+            ) = candidates[0]
             idx = (start + offset) % pool_size
             self._cursor = (idx + 1) % pool_size
             profile = self._get_profile(worker_id)
@@ -1939,7 +2091,8 @@ class WorkerGateway:
                 "load=%d batch_n=%d mbps=%.1f dest_group=%s dest_mbps=%.1f "
                 "cursor=%d pool=%d batch_ips=%s "
                 "require_idle=%s reuse_worker=%s assign_cap=%s "
-                "exclude_penalized=%s only_penalized=%s",
+                "exclude_penalized=%s only_penalized=%s "
+                "non_cached=%s prefer_nc=%s require_nc=%s",
                 worker_id,
                 profile.ip or "?",
                 profile.active_count,
@@ -1957,6 +2110,9 @@ class WorkerGateway:
                 cap if cap is not None else "-",
                 exclude_penalized,
                 only_penalized,
+                profile.non_cached_file,
+                prefer_non_cached_capable,
+                require_non_cached_capable,
             )
             return worker_id
 
@@ -2182,6 +2338,17 @@ class WorkerGateway:
                     claimed = float(claimed_raw)
                 except (TypeError, ValueError):
                     claimed = None
+            non_cached_raw = msg.get("non_cached_file")
+            non_cached: Optional[bool] = None
+            if isinstance(non_cached_raw, bool):
+                non_cached = non_cached_raw
+            elif non_cached_raw is not None:
+                non_cached = str(non_cached_raw).strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }
             self.update_worker_hello(
                 worker_id,
                 ip=ip or None,
@@ -2189,16 +2356,19 @@ class WorkerGateway:
                 worker_version=worker_version or None,
                 initial_order=initial_order,
                 claimed_bandwidth_mbps=claimed,
+                non_cached_file=non_cached,
             )
             profile = self._get_profile(worker_id)
             logger.info(
-                "Worker hello: %s version=%s ip=%s max_tasks=%d active=%d initial_order=%d",
+                "Worker hello: %s version=%s ip=%s max_tasks=%d active=%d "
+                "initial_order=%d non_cached_file=%s",
                 worker_id,
                 profile.worker_version or "?",
                 profile.ip or "?",
                 profile.max_concurrent_tasks,
                 profile.active_count,
                 profile.initial_order,
+                profile.non_cached_file,
             )
         elif msg_type == "task_result":
             log_relay(
@@ -2209,6 +2379,9 @@ class WorkerGateway:
             offer_id = msg.get("offer_id") or msg.get("task_id")
             if await self._maybe_reassign_on_capacity_reject(worker_id, msg):
                 # Offer re-queued; deferred retry handles re-deliver.
+                return
+            if await self._maybe_reassign_on_cache_miss_reject(worker_id, msg):
+                # Offer re-queued to a non_cached_file=true worker.
                 return
             if await self._maybe_reassign_on_slow_net_wait(worker_id, msg):
                 # Offer re-queued to a different free worker.

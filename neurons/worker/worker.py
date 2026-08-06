@@ -479,6 +479,10 @@ try:
     WORKER_INITIAL_ORDER = int(os.environ.get("WORKER_INITIAL_ORDER", "0"))
 except ValueError:
     WORKER_INITIAL_ORDER = 0
+# When false, reject offers that are not covered by local range cache so the
+# orchestrator can re-offer to a worker with WORKER_NON_CACHED_FILE=true.
+WORKER_NON_CACHED_FILE = _env_bool("WORKER_NON_CACHED_FILE", True)
+CACHE_MISS_NOT_ACCEPTED = "cache_miss_not_accepted"
 
 
 # Global semaphore for task concurrency
@@ -4297,6 +4301,8 @@ async def ws_send_worker_hello(websocket, state: WorkerState) -> bool:
             # parallelism is still limited by MAX_CONCURRENT_TASKS / semaphore.
             "max_concurrent_tasks": ADVERTISED_MAX_TASKS,
             "initial_order": WORKER_INITIAL_ORDER,
+            # True → willing to fetch+upload cache misses. False → reject misses.
+            "non_cached_file": WORKER_NON_CACHED_FILE,
         }
         await ws_send_json(websocket, state, msg)
         return True
@@ -4811,6 +4817,34 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
         return False
     reserved_capacity = True
 
+    # Cache-only workers: fast-reject misses so orch can re-offer to
+    # WORKER_NON_CACHED_FILE=true workers instead of burning uplink on a miss.
+    if (
+        not WORKER_NON_CACHED_FILE
+        and predefined_etag_transfer_eligible(transfer_context)
+        and not has_predefined_etag_chunk_data(transfer_context)
+    ):
+        await finalize_ws_task_result(
+            websocket,
+            state,
+            task_id,
+            False,
+            0,
+            error=CACHE_MISS_NOT_ACCEPTED,
+            offer_id=offer_id,
+            path="cache_miss_reject",
+            cached=False,
+            hash_source="-",
+        )
+        release_ws_capacity(state, task_key, estimated_bytes, reserved_capacity)
+        reserved_capacity = False
+        print(
+            f"[Worker] [WS] Rejected miss (WORKER_NON_CACHED_FILE=false): "
+            f"task={task_label(task_id)} offer={task_label(offer_id)} "
+            f"error={CACHE_MISS_NOT_ACCEPTED}"
+        )
+        return False
+
     log_task_start(
         "[Worker] [WS]",
         task_id,
@@ -5119,6 +5153,7 @@ async def run_worker(state: WorkerState):
             f"[Worker] Cache flags: USE_CACHE_FILE={WORKER_USE_CACHE_FILE} "
             f"EARLY_SUBMIT={WORKER_PREDEFINED_ETAG_EARLY_SUBMIT} "
             f"VERIFY_CHUNK_HASH={WORKER_VERIFY_CHUNK_HASH} "
+            f"NON_CACHED_FILE={WORKER_NON_CACHED_FILE} "
             f"CACHE_SYNC_DELAY_SEC={CONTROL_SERVER_CACHE_SYNC_DELAY_SEC:.0f}"
         )
         await websocket_loop(state)
