@@ -127,6 +127,8 @@ WALLET_PATH="${WALLET_PATH/#\~/${HOME}}"
 
 if [[ -n "${VIRTUAL_ENV:-}" && -x "${VIRTUAL_ENV}/bin/python" ]]; then
   PY="${VIRTUAL_ENV}/bin/python"
+elif [[ -x "${ROOT}/.venv/bin/python" ]]; then
+  PY="${ROOT}/.venv/bin/python"
 elif [[ -x "${ROOT}/venv/bin/python" ]]; then
   PY="${ROOT}/venv/bin/python"
 else

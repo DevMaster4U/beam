@@ -35,16 +35,15 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
   git build-essential curl jq
 
 VENV="${ROOT}/.venv"
+if [[ -x "${ROOT}/venv/bin/python" && ! -x "${VENV}/bin/python" ]]; then
+  echo "Note: legacy ${ROOT}/venv exists; creating/using ${VENV} instead."
+fi
 if [[ ! -x "${VENV}/bin/python" ]]; then
-  if [[ -x "${ROOT}/venv/bin/python" ]]; then
-    VENV="${ROOT}/venv"
-  else
-    echo "Creating virtualenv at ${VENV}..."
-    python3 -m venv "${VENV}"
-  fi
+  echo "Creating virtualenv at ${VENV}..."
+  python3 -m venv "${VENV}"
 fi
 
-echo "Installing Python dependencies..."
+echo "Installing Python dependencies into ${VENV}..."
 "${VENV}/bin/pip" install -U pip wheel setuptools
 "${VENV}/bin/pip" install -e "${ROOT}"
 
@@ -53,6 +52,7 @@ beam_prepare_repo_permissions
 echo
 echo "Setup complete."
 echo
+echo "Python:  ${VENV}/bin/python"
 echo "Next steps (as $(id -un)):"
 echo "  1. Copy and edit env files under config/ and .env"
 echo "  2. Install systemd units:"

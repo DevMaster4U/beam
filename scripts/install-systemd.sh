@@ -215,7 +215,7 @@ if [[ ! -d "$SYSTEMD_DIR" ]]; then
 fi
 
 if ! VENV="$(beam_resolve_venv)"; then
-  echo "Missing virtualenv: create ${ROOT}/venv or ${ROOT}/.venv and run pip install -e ." >&2
+  echo "Missing virtualenv: create ${ROOT}/.venv (or legacy ${ROOT}/venv) and run pip install -e ." >&2
   exit 1
 fi
 

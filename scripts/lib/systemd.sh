@@ -123,12 +123,13 @@ beam_require_unit() {
 }
 
 beam_resolve_venv() {
-  if [[ -x "${BEAM_ROOT}/venv/bin/python" ]]; then
-    printf '%s\n' "${BEAM_ROOT}/venv"
-    return 0
-  fi
+  # Prefer .venv (setup-ec2 / setup-worker-host); fall back to legacy venv/.
   if [[ -x "${BEAM_ROOT}/.venv/bin/python" ]]; then
     printf '%s\n' "${BEAM_ROOT}/.venv"
+    return 0
+  fi
+  if [[ -x "${BEAM_ROOT}/venv/bin/python" ]]; then
+    printf '%s\n' "${BEAM_ROOT}/venv"
     return 0
   fi
   return 1

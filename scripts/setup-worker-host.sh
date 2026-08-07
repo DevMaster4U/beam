@@ -2,7 +2,7 @@
 # First-time worker host setup (Ubuntu/Debian).
 #
 # Automates the common flow:
-#   apt packages → venv → pip install → optional wallet → worker.env → systemd
+#   apt packages → .venv → pip install → optional wallet → worker.env → systemd
 #
 # Prerequisites (outside this script):
 #   git clone https://github.com/DevMaster4U/beam.git sn105
@@ -57,7 +57,7 @@ Environment install for a Beam worker host.
 
 Options:
   --skip-apt              Skip apt-get package install
-  --skip-pip              Skip venv / pip install
+  --skip-pip              Skip .venv / pip install
   --create-wallet         Create coldkey+hotkey via btcli (no password)
   --wallet-name NAME      Coldkey name (default: sn105_w)
   --wallet-hotkey NAME    Hotkey name (default: sn105_w1)
@@ -179,13 +179,16 @@ if [[ "$SKIP_APT" -eq 0 ]]; then
   fi
 fi
 
-VENV="${ROOT}/venv"
+VENV="${ROOT}/.venv"
 if [[ "$SKIP_PIP" -eq 0 ]]; then
+  if [[ -x "${ROOT}/venv/bin/python" && ! -x "${VENV}/bin/python" ]]; then
+    echo "Note: legacy ${ROOT}/venv exists; creating/using ${VENV} instead."
+  fi
   if [[ ! -x "${VENV}/bin/python" ]]; then
     echo "Creating virtualenv at ${VENV}..."
     python3 -m venv "${VENV}"
   fi
-  echo "Installing Python dependencies..."
+  echo "Installing Python dependencies into ${VENV}..."
   "${VENV}/bin/pip" install -U pip wheel setuptools
   if [[ -f "${ROOT}/requirements.txt" ]]; then
     "${VENV}/bin/pip" install -r "${ROOT}/requirements.txt"
@@ -319,6 +322,7 @@ echo "  4. Start worker:"
 echo "       ./scripts/run-worker.sh ${WORKER_INSTANCE}"
 echo "       # or foreground: ./scripts/run-worker.sh ${WORKER_INSTANCE} --foreground"
 echo
+echo "Python:  ${VENV}/bin/python"
 echo "Wallets: ${WALLET_PATH}"
 echo "btcli:   ${ROOT}/.venv-btcli/bin/btcli"
 if [[ -d /root/.bittensor/wallets && "${WALLET_PATH}" != /root/.bittensor/wallets ]]; then
