@@ -102,9 +102,19 @@ async def lifespan(app: FastAPI):
 
     logger.info("Loading embedded transfer module...")
     transfer = get_transfer_module()
-    transfer.setup_control_server_cache_sync()
+    from core.range_coverage import (
+        ORCH_DOWNLOAD_RANGE_DATA,
+        setup_orch_range_coverage_sync,
+    )
+
+    # Coverage metadata for proactive miss routing (no range bytes by default).
+    setup_orch_range_coverage_sync()
+    if ORCH_DOWNLOAD_RANGE_DATA:
+        # Optional: also pull range bytes (embedded workers). Default off.
+        transfer.setup_control_server_cache_sync()
+        transfer.start_predefined_etag_chunk_download_bootstrap()
+        logger.info("Orch range byte download enabled (ORCH_DOWNLOAD_RANGE_DATA=true)")
     await start_control_ws_client()
-    transfer.start_predefined_etag_chunk_download_bootstrap()
 
     # Initialize rate limiter
     rate_limiter = get_rate_limiter()

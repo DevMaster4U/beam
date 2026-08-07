@@ -19,8 +19,8 @@ RangeSnapshotHandler = Callable[[list[dict[str, Any]]], None]
 RangeBroadcastHandler = Callable[[str, int, int], None]
 SyncDoneHandler = Callable[[], None]
 
-_range_snapshot_handler: Optional[RangeSnapshotHandler] = None
-_range_broadcast_handler: Optional[RangeBroadcastHandler] = None
+_range_snapshot_handlers: list[RangeSnapshotHandler] = []
+_range_broadcast_handlers: list[RangeBroadcastHandler] = []
 _sync_done_handler: Optional[SyncDoneHandler] = None
 _cache_sync_done_event: Optional[asyncio.Event] = None
 _update_queue: Optional[asyncio.Queue] = None
@@ -29,13 +29,15 @@ _stop_event: Optional[asyncio.Event] = None
 
 
 def register_range_snapshot_handler(handler: RangeSnapshotHandler) -> None:
-    global _range_snapshot_handler
-    _range_snapshot_handler = handler
+    """Register a snapshot handler (multiple allowed; duplicates ignored)."""
+    if handler not in _range_snapshot_handlers:
+        _range_snapshot_handlers.append(handler)
 
 
 def register_range_broadcast_handler(handler: RangeBroadcastHandler) -> None:
-    global _range_broadcast_handler
-    _range_broadcast_handler = handler
+    """Register a broadcast handler (multiple allowed; duplicates ignored)."""
+    if handler not in _range_broadcast_handlers:
+        _range_broadcast_handlers.append(handler)
 
 
 def register_sync_done_handler(handler: SyncDoneHandler) -> None:
@@ -121,7 +123,7 @@ def schedule_cache_update(key: str, chunk_hash: str, etag: str) -> None:
 
 
 def _apply_range_snapshot(sources: list[Any]) -> None:
-    if not _range_snapshot_handler:
+    if not _range_snapshot_handlers:
         return
     normalized: list[dict[str, Any]] = []
     for item in sources or []:
@@ -141,25 +143,27 @@ def _apply_range_snapshot(sources: list[Any]) -> None:
                 except (KeyError, TypeError, ValueError):
                     continue
         normalized.append({"source_url": source_url, "segments": segs})
-    try:
-        _range_snapshot_handler(normalized)
-    except Exception as exc:
-        logger.warning("Range snapshot handler failed: %s", exc)
+    for handler in list(_range_snapshot_handlers):
+        try:
+            handler(normalized)
+        except Exception as exc:
+            logger.warning("Range snapshot handler failed: %s", exc)
 
 
 def _apply_range_broadcast(source_url: str, start: int, end: int) -> None:
-    if not _range_broadcast_handler:
+    if not _range_broadcast_handlers:
         return
-    try:
-        _range_broadcast_handler(source_url, start, end)
-    except Exception as exc:
-        logger.warning(
-            "Range broadcast handler failed src=%s %s-%s err=%s",
-            source_url[:96],
-            start,
-            end,
-            exc,
-        )
+    for handler in list(_range_broadcast_handlers):
+        try:
+            handler(source_url, start, end)
+        except Exception as exc:
+            logger.warning(
+                "Range broadcast handler failed src=%s %s-%s err=%s",
+                source_url[:96],
+                start,
+                end,
+                exc,
+            )
 
 
 async def _send_pending_updates(ws) -> None:

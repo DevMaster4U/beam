@@ -26,6 +26,7 @@ from core.relay_log import (
     transfer_context_range_label,
     transfer_context_urls,
 )
+from core.range_coverage import offer_coverage_state
 
 logger = logging.getLogger(__name__)
 
@@ -964,8 +965,11 @@ class WorkerGateway:
         offers = [self._overflow_offers[i] for i in range(n)]
         # Makespan assumes every free worker is eligible for every head offer.
         # Offers with prior failures (slow_net_wait) need per-offer excludes → greedy.
+        # Coverage misses must go to non_cached workers → greedy per-offer path.
         if any(
             self._offer_attempted_workers.get(self._offer_key(o))
+            or offer_coverage_state(o) == "miss"
+            or self._offer_key(o) in self._offer_require_non_cached
             for o in offers
         ):
             return 0
@@ -1032,7 +1036,7 @@ class WorkerGateway:
             logger.info(
                 "_workers | queue_deliver %s worker=%s "
                 "active=%d pending=%d pressure=%s dest_group=%s dest_mbps=%.1f "
-                "assign=makespan exp_s=%.2f makespan_s=%.2f "
+                "assign=makespan exp_s=%.2f makespan_s=%.2f coverage=%s "
                 "queue_wait_ms=%.0f queue_wait_s=%.3f",
                 task_key_log_label(offer),
                 short_id(worker_id),
@@ -1043,6 +1047,7 @@ class WorkerGateway:
                 dest_mbps,
                 exp_s,
                 makespan,
+                offer_coverage_state(offer),
                 wait_ms,
                 wait_ms / 1000.0,
             )
@@ -1301,9 +1306,22 @@ class WorkerGateway:
 
             worker_id: Optional[str] = None
             use_prefer = False
+            coverage = offer_coverage_state(offer)
+            # Proactive: control-server coverage miss → only miss-capable workers.
+            # Reactive reject→reoffer still sets _offer_require_non_cached.
+            if coverage == "miss" and offer_id:
+                self._offer_require_non_cached.add(offer_id)
             require_nc = bool(
                 offer_id and offer_id in self._offer_require_non_cached
             )
+            # Hit → prefer cache-only (non_cached_file=false) when not forcing miss path.
+            prefer_nc: Optional[bool]
+            if require_nc or coverage == "miss":
+                prefer_nc = True
+            elif coverage == "hit":
+                prefer_nc = False
+            else:
+                prefer_nc = None
             if prefer and prefer not in excluded and (
                 self._worker_is_free(prefer)
                 or (
@@ -1338,7 +1356,7 @@ class WorkerGateway:
                     force_allow_busy=pressure,
                     assign_cap=OVERFLOW_BUSY_MAX_PER_WORKER if pressure else None,
                     dest_group=dest_group or None,
-                    prefer_non_cached_capable=True if require_nc else None,
+                    prefer_non_cached_capable=prefer_nc,
                     require_non_cached_capable=require_nc,
                 )
 
@@ -1379,7 +1397,7 @@ class WorkerGateway:
                 logger.info(
                     "_workers | queue_deliver %s worker=%s "
                     "active=%d pending=%d pressure=%s dest_group=%s dest_mbps=%.1f "
-                    "assign=%s queue_wait_ms=%.0f queue_wait_s=%.3f",
+                    "assign=%s coverage=%s queue_wait_ms=%.0f queue_wait_s=%.3f",
                     task_key_log_label(offer),
                     short_id(worker_id),
                     profile.active_count,
@@ -1388,6 +1406,7 @@ class WorkerGateway:
                     dest_group or "-",
                     dest_mbps,
                     assign_mode,
+                    coverage,
                     wait_ms,
                     wait_ms / 1000.0,
                 )
