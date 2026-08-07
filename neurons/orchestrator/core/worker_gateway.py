@@ -21,6 +21,8 @@ from core.relay_log import (
     chunk_id_from_transfer_context,
     log_relay,
     short_id,
+    stamp_offer_task_key,
+    task_key_log_label,
     transfer_context_range_label,
     transfer_context_urls,
 )
@@ -207,6 +209,25 @@ def dest_group_short_name(dest_group: object) -> str:
     if "/" not in text:
         return text
     return text.rsplit("/", 1)[-1]
+
+
+def offer_queue_wait_ms(offer: dict) -> float:
+    """Milliseconds since this offer was last put on the orch overflow queue."""
+    raw = offer.get("_orch_queued_at")
+    try:
+        started = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    if started <= 0:
+        return 0.0
+    return max(0.0, (time.monotonic() - started) * 1000.0)
+
+
+def stamp_offer_queued(offer: dict) -> dict:
+    """Mark enqueue time + cache task_key once (deliver/result never re-hash)."""
+    offer["_orch_queued_at"] = time.monotonic()
+    stamp_offer_task_key(offer)
+    return offer
 
 
 def dest_group_from_offer(offer: dict) -> str:
@@ -1007,12 +1028,13 @@ class WorkerGateway:
                 self.dest_worker_mbps(dest_group, worker_id) if dest_group else 0.0
             )
             exp_s = self._offer_expected_seconds(offer, worker_id)
+            wait_ms = offer_queue_wait_ms(offer)
             logger.info(
-                "_workers | queue_deliver task=%s offer=%s worker=%s "
+                "_workers | queue_deliver %s worker=%s "
                 "active=%d pending=%d pressure=%s dest_group=%s dest_mbps=%.1f "
-                "assign=makespan exp_s=%.2f makespan_s=%.2f",
-                short_id(offer.get("task_id")),
-                short_id(self._offer_key(offer)),
+                "assign=makespan exp_s=%.2f makespan_s=%.2f "
+                "queue_wait_ms=%.0f queue_wait_s=%.3f",
+                task_key_log_label(offer),
                 short_id(worker_id),
                 profile.active_count,
                 len(self._overflow_offers) + len(undelivered),
@@ -1021,6 +1043,8 @@ class WorkerGateway:
                 dest_mbps,
                 exp_s,
                 makespan,
+                wait_ms,
+                wait_ms / 1000.0,
             )
 
         for offer in reversed(undelivered):
@@ -1173,13 +1197,12 @@ class WorkerGateway:
             return True
         if OVERFLOW_QUEUE_MAX > 0 and len(self._overflow_offers) >= OVERFLOW_QUEUE_MAX:
             logger.warning(
-                "offer queue full (%d); cannot hold task=%s offer=%s",
+                "offer queue full (%d); cannot hold %s",
                 OVERFLOW_QUEUE_MAX,
-                short_id(offer.get("task_id")),
-                short_id(offer_id),
+                task_key_log_label(offer, offer_id=offer_id),
             )
             return False
-        payload = dict(offer)
+        payload = stamp_offer_queued(dict(offer))
         self._overflow_offers.append(payload)
         self._overflow_offer_ids.add(offer_id)
         self._pending_offers[offer_id] = payload
@@ -1187,9 +1210,8 @@ class WorkerGateway:
         self._remember_offer_context(payload)
         if not quiet:
             logger.info(
-                "_workers | queue_enqueue task=%s offer=%s pending=%d",
-                short_id(offer.get("task_id")),
-                short_id(offer_id),
+                "_workers | queue_enqueue %s pending=%d",
+                task_key_log_label(payload),
                 len(self._overflow_offers),
             )
         return True
@@ -1353,12 +1375,12 @@ class WorkerGateway:
                 assign_mode = (
                     "greedy" if DEST_AFFINITY_ENABLED else "round_robin"
                 )
+                wait_ms = offer_queue_wait_ms(offer)
                 logger.info(
-                    "_workers | queue_deliver task=%s offer=%s worker=%s "
+                    "_workers | queue_deliver %s worker=%s "
                     "active=%d pending=%d pressure=%s dest_group=%s dest_mbps=%.1f "
-                    "assign=%s",
-                    short_id(offer.get("task_id")),
-                    short_id(offer_id),
+                    "assign=%s queue_wait_ms=%.0f queue_wait_s=%.3f",
+                    task_key_log_label(offer),
                     short_id(worker_id),
                     profile.active_count,
                     len(self._overflow_offers),
@@ -1366,6 +1388,8 @@ class WorkerGateway:
                     dest_group or "-",
                     dest_mbps,
                     assign_mode,
+                    wait_ms,
+                    wait_ms / 1000.0,
                 )
             else:
                 # Re-queue and keep draining to other free workers (do not abort).
@@ -1374,10 +1398,9 @@ class WorkerGateway:
                     self._overflow_offer_ids.add(offer_id)
                 deliver_failed.add(worker_id)
                 logger.warning(
-                    "_workers | deliver_fail task=%s offer=%s worker=%s "
+                    "_workers | deliver_fail %s worker=%s "
                     "requeued; trying other free workers",
-                    short_id(offer.get("task_id")),
-                    short_id(offer_id),
+                    task_key_log_label(offer),
                     short_id(worker_id),
                 )
                 continue
@@ -1433,6 +1456,15 @@ class WorkerGateway:
                 ctx["range_end"] = int(range_end)
         except (TypeError, ValueError):
             pass
+        # Read-only: task_key was stamped at enqueue (no hashing here).
+        cached_key = str(
+            offer.get("task_key")
+            or offer.get("taskKey")
+            or offer.get("_orch_task_key")
+            or ""
+        ).strip()
+        if cached_key:
+            ctx["task_key"] = cached_key
         if ctx:
             self._offer_contexts[offer_id] = ctx
             # Bound memory for long-running orch
@@ -1451,6 +1483,13 @@ class WorkerGateway:
         src, dest = transfer_context_urls(ctx) if ctx else ("-", "-")
         range_label = transfer_context_range_label(ctx) if ctx else "-"
         chunk_id = chunk_id_from_transfer_context(ctx) if ctx else None
+        # Read-only label from msg/ctx — never hash on the result path.
+        id_label = task_key_log_label(
+            task_key=(msg.get("task_key") if isinstance(msg, dict) else None)
+            or ctx.get("task_key"),
+            task_id=task_id,
+            offer_id=offer_id,
+        )
         if success:
             try:
                 load_ms = float(msg.get("load_ms") or 0.0)
@@ -1479,13 +1518,12 @@ class WorkerGateway:
             path_label = str(msg.get("path") or "external")
             hash_source = str(msg.get("hash_source") or "-")
             logger.info(
-                "_workers | task_done task=%s offer=%s chunk_id=%s worker=%s "
+                "_workers | task_done %s chunk_id=%s worker=%s "
                 "src=%s dest=%s range=%s hash=%s etag_real=%s "
                 "cached=%s path=%s hash_source=%s "
                 "load_ms=%.1f hash_ms=%.1f etag_ms=%.1f fetch_ms=%.1f "
                 "send_ms=%.1f wall_ms=%.1f",
-                short_id(task_id),
-                short_id(offer_id),
+                id_label,
                 chunk_id if chunk_id is not None else "?",
                 short_id(worker_id),
                 src,
@@ -1505,10 +1543,9 @@ class WorkerGateway:
             )
         else:
             logger.warning(
-                "_workers | failed task=%s offer=%s worker=%s reason=%s "
+                "_workers | failed %s worker=%s reason=%s "
                 "src=%s dest=%s range=%s hash=%s etag=%s",
-                short_id(task_id),
-                short_id(offer_id),
+                id_label,
                 short_id(worker_id),
                 msg.get("error") or "external_task_failed",
                 src,
@@ -1842,7 +1879,13 @@ class WorkerGateway:
             logger.warning("deliver_task_offer: worker %s not connected", worker_id)
             return False
         try:
-            payload = {"type": "task_offer", **offer}
+            # Never send orch-private bookkeeping fields to the worker.
+            wire = {
+                k: v
+                for k, v in offer.items()
+                if not (isinstance(k, str) and k.startswith("_orch_"))
+            }
+            payload = {"type": "task_offer", **wire}
             if ws is not None:
                 await ws.send_text(json.dumps(payload))
             else:
@@ -1869,10 +1912,9 @@ class WorkerGateway:
                 )
             )
             logger.info(
-                "_workers | task_start task=%s offer=%s worker=%s "
+                "_workers | task_start %s worker=%s "
                 "chunk_id=%s range=%s",
-                short_id(task_id),
-                short_id(offer_id),
+                task_key_log_label(offer, task_id=task_id, offer_id=offer_id),
                 short_id(worker_id),
                 chunk_id if chunk_id is not None else "?",
                 range_label,
@@ -2277,30 +2319,58 @@ class WorkerGateway:
         """
         queued = 0
         failed = 0
+        missing_task_key_sample: Optional[dict] = None
 
         for offer in offers:
             if not isinstance(offer, dict):
                 failed += 1
                 continue
-            if self._enqueue_overflow(offer, quiet=True):
+            # Cheap pre-stamp presence check (no hashing); stamp happens in enqueue.
+            if missing_task_key_sample is None and not (
+                offer.get("task_key")
+                or offer.get("taskKey")
+                or offer.get("idempotency_key")
+                or offer.get("idempotencyKey")
+            ):
+                missing_task_key_sample = offer
+            # Per-task: queue_enqueue → (later) queue_deliver + queue_wait_* → task_done
+            if self._enqueue_overflow(offer):
                 queued += 1
             else:
                 failed += 1
                 logger.warning(
-                    "Offer queue rejected task=%s (queue full or disabled)",
-                    offer.get("task_id"),
+                    "Offer queue rejected %s (queue full or disabled)",
+                    task_key_log_label(offer),
                 )
+
+        if missing_task_key_sample is not None and not getattr(
+            self, "_warned_missing_task_key", False
+        ):
+            self._warned_missing_task_key = True
+            logger.warning(
+                "BeamCore offers missing task_key (dashboard correlation). "
+                "offer_keys=%s",
+                sorted(str(k) for k in missing_task_key_sample.keys()),
+            )
 
         delivered = await self._drain_overflow_queue()
         still_pending = len(self._overflow_offers)
+        oldest_wait_ms = 0.0
+        if still_pending and self._overflow_offers:
+            oldest_wait_ms = max(
+                offer_queue_wait_ms(o) for o in self._overflow_offers
+            )
 
         logger.info(
             "_workers | batch queued=%s delivered=%s pending=%s failed=%s "
+            "oldest_queue_wait_ms=%.0f oldest_queue_wait_s=%.3f "
             "(queue-first dispatch)",
             queued,
             delivered,
             still_pending,
             failed,
+            oldest_wait_ms,
+            oldest_wait_ms / 1000.0,
         )
         # Remaining offers wait for task_done → mark_worker_idle → drain.
         return delivered, failed

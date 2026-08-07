@@ -29,6 +29,8 @@ from core.cloudflare_transfer import (
 from core.relay_log import (
     chunk_id_from_transfer_context,
     short_id,
+    stamp_offer_task_key,
+    task_key_log_label,
     transfer_context_range_label,
     transfer_context_urls,
 )
@@ -47,12 +49,12 @@ def _log_embedded_task_offer(
     transfer_context: dict,
     path: str,
     beamcore_worker_id: str = "",
+    task_key: str = "",
 ) -> None:
     # Short start log only; hash/etag land on task_done.
     chunk_id = chunk_id_from_transfer_context(transfer_context)
     fields = [
-        f"{_WORKERS_LOG} task_start task={short_id(task_id)}",
-        f"offer={short_id(offer_id)}",
+        f"{_WORKERS_LOG} task_start {task_key_log_label(task_key=task_key, task_id=task_id, offer_id=offer_id)}",
         f"worker_slot={worker_slot}",
         f"chunk_id={chunk_id if chunk_id is not None else '?'}",
         f"range={transfer_context_range_label(transfer_context)}",
@@ -79,18 +81,18 @@ def _log_embedded_task_done(
     etag_ms: float = 0.0,
     fetch_ms: float = 0.0,
     send_ms: float = 0.0,
+    task_key: str = "",
 ) -> None:
     chunk_id = chunk_id_from_transfer_context(transfer_context)
     src, dest = transfer_context_urls(transfer_context)
     total_ms = load_ms + hash_ms + etag_ms + fetch_ms + send_ms
     logger.info(
-        "%s task_done task=%s offer=%s chunk_id=%s src=%s dest=%s "
+        "%s task_done %s chunk_id=%s src=%s dest=%s "
         "range=%s hash=%s etag_real=%s etag_local=%s "
         "cached=%s path=%s hash_source=%s "
         "load_ms=%.1f hash_ms=%.1f etag_ms=%.1f fetch_ms=%.1f send_ms=%.1f wall_ms=%.1f",
         _WORKERS_LOG,
-        short_id(task_id),
-        short_id(offer_id),
+        task_key_log_label(task_key=task_key, task_id=task_id, offer_id=offer_id),
         chunk_id if chunk_id is not None else "?",
         src,
         dest,
@@ -136,15 +138,15 @@ def _log_embedded_task_failed(
     chunk_hash: str = "",
     etag: str = "",
     cached: Optional[bool] = None,
+    task_key: str = "",
 ) -> None:
     src, dest = transfer_context_urls(transfer_context)
     cached_label = "?" if cached is None else str(cached).lower()
     logger.warning(
-        "%s failed task=%s offer=%s reason=%s src=%s dest=%s "
+        "%s failed %s reason=%s src=%s dest=%s "
         "range=%s hash=%s etag=%s cached=%s",
         _WORKERS_LOG,
-        short_id(task_id),
-        short_id(offer_id),
+        task_key_log_label(task_key=task_key, task_id=task_id, offer_id=offer_id),
         reason,
         src,
         dest,
@@ -1014,6 +1016,7 @@ class EmbeddedWorkerPool:
                 worker_slot=worker.slot,
                 transfer_context=transfer_context,
                 path=path,
+                task_key=stamp_offer_task_key(offer),
             )
             task = asyncio.create_task(
                 self._handle_offer(
@@ -1086,19 +1089,21 @@ class EmbeddedWorkerPool:
                 short_id(offer_id),
             )
             return False
+        task_key = stamp_offer_task_key(offer)
         self._overflow.append(
             {
                 "offer": dict(offer),
                 "transfer_context": dict(transfer_context),
                 "path": path,
                 "batch_id": batch_id,
+                "queued_at": time.monotonic(),
+                "task_key": task_key,
             }
         )
         self._overflow_ids.add(offer_id)
         logger.info(
-            "_workers | embedded_overflow_enqueue task=%s offer=%s pending=%d",
-            short_id(offer.get("task_id")),
-            short_id(offer_id),
+            "_workers | embedded_overflow_enqueue %s pending=%d",
+            task_key_log_label(task_key=task_key, task_id=offer.get("task_id"), offer_id=offer_id),
             len(self._overflow),
         )
         return True
@@ -1165,6 +1170,7 @@ class EmbeddedWorkerPool:
                 worker_slot=worker.slot,
                 transfer_context=transfer_context,
                 path=path,
+                task_key=str(item.get("task_key") or "") or stamp_offer_task_key(offer),
             )
             task = asyncio.create_task(
                 self._handle_offer(
@@ -1182,12 +1188,26 @@ class EmbeddedWorkerPool:
             )
             task.add_done_callback(self._task_handles.discard)
             delivered += 1
+            try:
+                queued_at = float(item.get("queued_at") or 0.0)
+            except (TypeError, ValueError):
+                queued_at = 0.0
+            wait_ms = (
+                max(0.0, (time.monotonic() - queued_at) * 1000.0) if queued_at > 0 else 0.0
+            )
             logger.info(
-                "_workers | embedded_overflow_deliver task=%s offer=%s worker=%s pending=%d",
-                short_id(task_id),
-                short_id(offer_id),
+                "_workers | embedded_overflow_deliver %s worker=%s "
+                "pending=%d queue_wait_ms=%.0f queue_wait_s=%.3f",
+                task_key_log_label(
+                    offer,
+                    task_key=item.get("task_key"),
+                    task_id=task_id,
+                    offer_id=offer_id,
+                ),
                 short_id(worker.worker_id),
                 len(self._overflow),
+                wait_ms,
+                wait_ms / 1000.0,
             )
         return delivered
 
@@ -1501,6 +1521,7 @@ class EmbeddedWorkerPool:
             hash_source="response_etag",
             fetch_ms=result.fetch_ms,
             send_ms=result.send_ms,
+            task_key=stamp_offer_task_key(offer),
         )
 
     async def _handle_predefined_etag_offer(
@@ -1617,6 +1638,7 @@ class EmbeddedWorkerPool:
             etag_ms=getattr(outcome, "etag_ms", 0.0) or 0.0,
             fetch_ms=outcome.fetch_ms,
             send_ms=outcome.send_ms,
+            task_key=stamp_offer_task_key(offer),
         )
         if outcome.used_cache and transfer.WORKER_PREDEFINED_ETAG_EARLY_SUBMIT and (
             getattr(outcome, "send_ms", 0.0) or 0.0
@@ -1735,6 +1757,7 @@ class EmbeddedWorkerPool:
                 hash_source="response_etag",
                 fetch_ms=result.fetch_ms,
                 send_ms=result.send_ms,
+                task_key=stamp_offer_task_key(offer),
             )
         else:
             self._log_task_failed(

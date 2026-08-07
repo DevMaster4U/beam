@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 from typing import Any, Optional
@@ -34,6 +35,72 @@ def short_id(value: Any, length: int = 16) -> str:
         return text
     return f"{text[:length]}..."
 
+
+def _read_task_key_field(offer: Any) -> str:
+    """Cheap read of an already-resolved task_key (no hashing)."""
+    if not isinstance(offer, dict):
+        return ""
+    for key in ("task_key", "taskKey", "_orch_task_key"):
+        text = str(offer.get(key) or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def stamp_offer_task_key(offer: dict) -> str:
+    """Resolve dashboard task_key once and cache on the offer (enqueue-time only).
+
+    Prefer BeamCore ``task_key``; else derive sha256(idempotency_key) and store as
+    ``_orch_task_key`` so deliver/result paths never hash.
+    """
+    existing = _read_task_key_field(offer)
+    if existing:
+        return existing
+    idem = str(
+        offer.get("idempotency_key") or offer.get("idempotencyKey") or ""
+    ).strip()
+    if not idem:
+        return ""
+    derived = hashlib.sha256(idem.encode("utf-8")).hexdigest()
+    # Private cache only — do not mutate BeamCore wire fields on the hot path copy.
+    offer["_orch_task_key"] = derived
+    return derived
+
+
+def offer_task_key(offer: Any) -> str:
+    """Return cached/dashboard task_key. Does not hash unless stamping a dict."""
+    existing = _read_task_key_field(offer)
+    if existing:
+        return existing
+    if isinstance(offer, dict):
+        return stamp_offer_task_key(offer)
+    return ""
+
+
+def task_key_log_label(
+    offer: Any = None,
+    *,
+    task_key: Any = None,
+    task_id: Any = None,
+    offer_id: Any = None,
+) -> str:
+    """Primary log id matching data.b1m.ai task_key. Never hashes (read-only)."""
+    key = str(task_key or "").strip() or _read_task_key_field(offer)
+    if key:
+        return f"task_key={key}"
+    tid = ""
+    oid = ""
+    if isinstance(offer, dict):
+        tid = str(offer.get("task_id") or "").strip()
+        oid = str(offer.get("offer_id") or "").strip()
+    tid = str(task_id or tid or "").strip()
+    oid = str(offer_id or oid or "").strip()
+    parts: list[str] = []
+    if tid:
+        parts.append(f"task={tid}")
+    if oid:
+        parts.append(f"offer={oid}")
+    return " ".join(parts) if parts else "task_key=-"
 
 def redact_capability_url(url: Any) -> str:
     """Drop query parameters from signed URLs before logging."""
@@ -136,8 +203,7 @@ def format_task_offer_batch_lines(batch_id: Any, offers: list[dict]) -> list[str
         transfer_id = offer.get("transfer_id")
         lines.append(
             "  "
-            f"offer[{index}] task={short_id(offer.get('task_id'))} "
-            f"offer={short_id(offer.get('offer_id'))} "
+            f"offer[{index}] {task_key_log_label(offer)} "
             f"transfer={short_id(transfer_id) if transfer_id else '-'} "
             f"chunk_size={chunk_size if chunk_size is not None else '?'} "
             f"range={_offer_range_label(offer)} "
