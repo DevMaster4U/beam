@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+import shutil
 import tarfile
 from pathlib import Path
 from typing import Iterable
@@ -76,10 +77,42 @@ def _hotkey_exists(wallet_path: Path, wallet_name: str, hotkey: str) -> bool:
 
 
 def _extract_wallet_bundle(wallet_path: Path, wallet_name: str, payload: bytes) -> None:
+    """Extract into wallets/<name>/{coldkey,hotkeys/...}, unwrapping legacy <name>/ prefix."""
     target = wallet_path / wallet_name
+    if target.exists():
+        shutil.rmtree(target)
     target.mkdir(parents=True, exist_ok=True)
+
+    prefix = f"{wallet_name}/"
     with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as tar:
-        tar.extractall(path=target)
+        members = [m for m in tar.getmembers() if m.name and m.name not in (".", "./")]
+        names = [m.name.replace("\\", "/").lstrip("./") for m in members]
+        strip_prefix = bool(names) and all(
+            n == wallet_name or n.startswith(prefix) for n in names
+        )
+        for member in members:
+            if not member.isfile() and not member.isdir():
+                continue
+            name = member.name.replace("\\", "/").lstrip("./")
+            if strip_prefix:
+                if name == wallet_name:
+                    continue
+                if name.startswith(prefix):
+                    name = name[len(prefix) :]
+                else:
+                    continue
+            if not name or name.startswith("/") or ".." in Path(name).parts:
+                continue
+            dest = target / name
+            if member.isdir():
+                dest.mkdir(parents=True, exist_ok=True)
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            source = tar.extractfile(member)
+            if source is None:
+                continue
+            with source, dest.open("wb") as out:
+                shutil.copyfileobj(source, out)
 
 
 def ensure_wallet_from_control_server(

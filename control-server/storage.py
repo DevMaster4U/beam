@@ -6,6 +6,7 @@ import copy
 import hashlib
 import io
 import json
+import shutil
 import sys
 import tarfile
 import threading
@@ -565,7 +566,13 @@ def wallet_exists(wallet_name: str) -> bool:
 
 
 def list_wallet_hotkeys(wallet_name: str) -> list[str]:
-    hotkeys_dir = wallet_dir(wallet_name) / "hotkeys"
+    root = wallet_dir(wallet_name)
+    hotkeys_dir = root / "hotkeys"
+    # Legacy nested layout: wallets/<name>/<name>/hotkeys
+    if not hotkeys_dir.is_dir():
+        nested = root / wallet_name / "hotkeys"
+        if nested.is_dir():
+            hotkeys_dir = nested
     if not hotkeys_dir.is_dir():
         return []
     return sorted(
@@ -576,23 +583,82 @@ def list_wallet_hotkeys(wallet_name: str) -> list[str]:
 
 
 def wallet_hotkey_exists(wallet_name: str, hotkey: str) -> bool:
-    return (wallet_dir(wallet_name) / "hotkeys" / hotkey).is_file()
+    root = wallet_dir(wallet_name)
+    if (root / "hotkeys" / hotkey).is_file():
+        return True
+    return (root / wallet_name / "hotkeys" / hotkey).is_file()
 
 
 def build_wallet_tarball(wallet_name: str) -> bytes:
     root = wallet_dir(wallet_name)
     if not root.is_dir():
         raise FileNotFoundError(wallet_name)
+    # Prefer flat layout; unwrap legacy wallets/<name>/<name>/... if present.
+    content_root = root
+    nested = root / wallet_name
+    if nested.is_dir() and (nested / "hotkeys").is_dir() and not (root / "hotkeys").is_dir():
+        content_root = nested
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
-        for path in root.rglob("*"):
+        for path in content_root.rglob("*"):
             if path.is_file():
-                tar.add(path, arcname=str(path.relative_to(root)))
+                tar.add(path, arcname=str(path.relative_to(content_root)))
     return buffer.getvalue()
 
 
+def _wallet_tar_member_name(member_name: str, wallet_name: str, *, strip_prefix: bool) -> str | None:
+    """Return a safe path relative to the wallet root, or None to skip."""
+    name = member_name.replace("\\", "/").lstrip("./")
+    if not name or name in (".", ".."):
+        return None
+    prefix = f"{wallet_name}/"
+    if strip_prefix:
+        if name == wallet_name:
+            return None
+        if name.startswith(prefix):
+            name = name[len(prefix) :]
+        else:
+            return None
+    if not name or name.startswith("/") or ".." in Path(name).parts:
+        return None
+    return name
+
+
 def extract_wallet_tarball(wallet_name: str, payload: bytes) -> None:
+    """Extract wallet files into wallets/<name>/{coldkey,hotkeys/...}.
+
+    Accepts either:
+      - flat members: coldkey, hotkeys/...
+      - wrapped members: <name>/coldkey, <name>/hotkeys/...  (legacy upload)
+    """
     root = wallet_dir(wallet_name)
+    if root.exists():
+        shutil.rmtree(root)
     root.mkdir(parents=True, exist_ok=True)
+
     with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as tar:
-        tar.extractall(path=root)
+        members = [m for m in tar.getmembers() if m.name and m.name not in (".", "./")]
+        prefix = f"{wallet_name}/"
+        names = [m.name.replace("\\", "/").lstrip("./") for m in members]
+        strip_prefix = bool(names) and all(
+            n == wallet_name or n.startswith(prefix) for n in names
+        )
+
+        for member in members:
+            if not member.isfile() and not member.isdir():
+                continue
+            rel = _wallet_tar_member_name(
+                member.name, wallet_name, strip_prefix=strip_prefix
+            )
+            if rel is None:
+                continue
+            dest = root / rel
+            if member.isdir():
+                dest.mkdir(parents=True, exist_ok=True)
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            source = tar.extractfile(member)
+            if source is None:
+                continue
+            with source, dest.open("wb") as out:
+                shutil.copyfileobj(source, out)
