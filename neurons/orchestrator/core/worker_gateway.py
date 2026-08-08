@@ -1314,14 +1314,16 @@ class WorkerGateway:
             require_nc = bool(
                 offer_id and offer_id in self._offer_require_non_cached
             )
-            # Hit → prefer cache-only (non_cached_file=false) when not forcing miss path.
+            # Hit → use full worker pool (dest Mbps); miss-capable workers often
+            # also have local cache and should not sit idle on hits.
             prefer_nc: Optional[bool]
             if require_nc or coverage == "miss":
                 prefer_nc = True
             elif coverage == "hit":
-                prefer_nc = False
-            else:
                 prefer_nc = None
+            else:
+                # unknown: keep reject→reoffer bias from env
+                prefer_nc = True if PREFER_NON_CACHED_WORKERS else False
             if prefer and prefer not in excluded and (
                 self._worker_is_free(prefer)
                 or (
@@ -1979,7 +1981,7 @@ class WorkerGateway:
         ``prefer_non_cached_capable``:
           True  → rank workers with non_cached_file=true first (miss-capable)
           False → rank cache-only workers first (non_cached_file=false)
-          None  → use ORCH_PREFER_NON_CACHED_WORKERS default
+          None  → no non_cached bias (rank by load / dest Mbps only)
 
         ``require_non_cached_capable``: only workers with non_cached_file=true
         (used after a cache_miss_not_accepted reject).
@@ -2007,8 +2009,7 @@ class WorkerGateway:
         allow_busy_reuse = ALLOW_BUSY_WORKER_REUSE or force_allow_busy
         cap = int(assign_cap) if assign_cap is not None and assign_cap > 0 else None
         dest_g = str(dest_group or "").strip() if DEST_AFFINITY_ENABLED else ""
-        if prefer_non_cached_capable is None:
-            prefer_non_cached_capable = PREFER_NON_CACHED_WORKERS
+        # None = no non_cached bias (caller must pass True/False for preference).
 
         def _batch_count(worker_id: str) -> int:
             if counts is not None:
@@ -2037,11 +2038,12 @@ class WorkerGateway:
             return self._get_profile(worker_id).average_mbps
 
         def _non_cached_rank(worker_id: str) -> int:
-            """0 = preferred for this offer's non_cached policy."""
+            """0 = preferred; None prefer_non_cached_capable → all equal."""
+            if prefer_non_cached_capable is None:
+                return 0
             capable = self._get_profile(worker_id).non_cached_file
             if prefer_non_cached_capable:
                 return 0 if capable else 1
-            # Prefer cache-only workers first when not forcing miss-capable.
             return 0 if not capable else 1
 
         def _eligible(
