@@ -325,6 +325,32 @@ async def get_worker_stats():
     return {"error": "Orchestrator not initialized"}
 
 
+@app.get("/workers/affinity")
+async def get_dest_affinity():
+    """Dest×worker Mbps affinity stats summary (survives orch restart until cleared)."""
+    if not orchestrator:
+        return {"error": "Orchestrator not initialized"}
+    gateway = getattr(orchestrator, "worker_gateway", None)
+    if gateway is None or not hasattr(gateway, "dest_affinity_stats_summary"):
+        return {"error": "Worker gateway unavailable"}
+    return gateway.dest_affinity_stats_summary()
+
+
+@app.post("/workers/affinity/clear")
+async def clear_dest_affinity():
+    """Clear dest affinity EMA/penalties in memory and delete the stats JSON file.
+
+    Restart alone does not clear affinity. Prefer this or start with
+    ``--clear-affinity`` / ``ORCH_DEST_AFFINITY_CLEAR_ON_START=true``.
+    """
+    if not orchestrator:
+        return {"error": "Orchestrator not initialized"}
+    gateway = getattr(orchestrator, "worker_gateway", None)
+    if gateway is None or not hasattr(gateway, "clear_dest_worker_stats"):
+        return {"error": "Worker gateway unavailable"}
+    return gateway.clear_dest_worker_stats(reason="api")
+
+
 @app.get("/metrics")
 async def metrics():
     """Prometheus metrics endpoint."""

@@ -41,6 +41,11 @@ def _extract_env_file_arg(argv: list[str]) -> tuple[Optional[Path], list[str]]:
             env_file = Path(arg.split("=", 1)[1]).expanduser()
             idx += 1
             continue
+        if arg in ("--clear-affinity", "--clear-dest-affinity"):
+            # Wipe dest×worker Mbps EMA on start (see WorkerGateway.clear_dest_worker_stats).
+            os.environ["ORCH_DEST_AFFINITY_CLEAR_ON_START"] = "true"
+            idx += 1
+            continue
         cleaned.append(arg)
         idx += 1
     return env_file, cleaned

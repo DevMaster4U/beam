@@ -124,11 +124,12 @@ def _resolve_stats_path(raw: str) -> Optional[Path]:
 
 
 DEST_AFFINITY_STATS_PATH = _resolve_stats_path(_DEST_STATS_PATH_RAW)
-_DEST_SEED_CSV_RAW = os.environ.get(
-    "ORCH_DEST_AFFINITY_SEED_CSV",
-    "logs/orchestrators/orch5_worker_dest_avg.csv",
-).strip()
+# Explicit only — a non-empty default used to re-seed after every restart/clear.
+_DEST_SEED_CSV_RAW = os.environ.get("ORCH_DEST_AFFINITY_SEED_CSV", "").strip()
 DEST_AFFINITY_SEED_CSV = _resolve_stats_path(_DEST_SEED_CSV_RAW) if _DEST_SEED_CSV_RAW else None
+# Wipe JSON (+ skip CSV seed) before first load. Also: --clear-affinity on main.py /
+# ORCH_DEST_AFFINITY_CLEAR_ON_START=true, or POST /workers/affinity/clear at runtime.
+DEST_AFFINITY_CLEAR_ON_START = _env_bool("ORCH_DEST_AFFINITY_CLEAR_ON_START", False)
 try:
     DEST_AFFINITY_SAVE_INTERVAL_S = max(
         1.0, float(os.environ.get("ORCH_DEST_AFFINITY_SAVE_INTERVAL_S", "10"))
@@ -453,7 +454,14 @@ class WorkerGateway:
         self._dest_worker_stats: Dict[str, Dict[str, dict]] = {}
         self._dest_stats_dirty = False
         self._dest_stats_last_save = 0.0
-        self._load_dest_worker_stats()
+        # Re-read env: --clear-affinity sets ORCH_DEST_AFFINITY_CLEAR_ON_START in config
+        # before this module is imported; runtime check covers late env injection too.
+        if DEST_AFFINITY_CLEAR_ON_START or _env_bool(
+            "ORCH_DEST_AFFINITY_CLEAR_ON_START", False
+        ):
+            self.clear_dest_worker_stats(reason="clear_on_start")
+        else:
+            self._load_dest_worker_stats()
 
     def set_upstream(self, upstream: object) -> None:
         self._upstream = upstream
@@ -669,6 +677,54 @@ class WorkerGateway:
         """Persist dest_group→worker history (call on orch stop/restart)."""
         self._dest_stats_dirty = True
         self._maybe_save_dest_worker_stats(force=True)
+
+    def dest_affinity_stats_summary(self) -> dict:
+        """Observability snapshot for /workers/affinity."""
+        rows = sum(len(v) for v in self._dest_worker_stats.values())
+        return {
+            "enabled": DEST_AFFINITY_ENABLED,
+            "makespan": DEST_AFFINITY_MAKESPAN,
+            "stats_path": str(DEST_AFFINITY_STATS_PATH) if DEST_AFFINITY_STATS_PATH else None,
+            "seed_csv": str(DEST_AFFINITY_SEED_CSV) if DEST_AFFINITY_SEED_CSV else None,
+            "dest_groups": len(self._dest_worker_stats),
+            "worker_dest_rows": rows,
+        }
+
+    def clear_dest_worker_stats(self, *, reason: str = "api") -> dict:
+        """Drop in-memory dest affinity + delete JSON file; do not re-seed from CSV.
+
+        Restart alone does not clear affinity — EMA/penalties reload from
+        ``ORCH_DEST_AFFINITY_STATS_PATH`` (and optional seed CSV).
+        """
+        before = self.dest_affinity_stats_summary()
+        self._dest_worker_stats.clear()
+        self._dest_stats_dirty = False
+        self._dest_stats_last_save = 0.0
+        deleted = False
+        path = DEST_AFFINITY_STATS_PATH
+        if path is not None and path.is_file():
+            try:
+                path.unlink()
+                deleted = True
+            except Exception as exc:
+                logger.warning(
+                    "dest affinity clear: failed to delete path=%s: %s", path, exc
+                )
+        logger.info(
+            "dest affinity cleared reason=%s rows_before=%d file_deleted=%s path=%s",
+            reason,
+            before.get("worker_dest_rows") or 0,
+            deleted,
+            path or "-",
+        )
+        after = self.dest_affinity_stats_summary()
+        return {
+            "ok": True,
+            "reason": reason,
+            "file_deleted": deleted,
+            "before": before,
+            "after": after,
+        }
 
     def observe_dest_transfer(
         self,
