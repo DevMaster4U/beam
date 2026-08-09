@@ -1,0 +1,398 @@
+"""
+BEAM Orchestrator Entry Point
+
+Run with: python -m neurons.orchestrator.main
+
+The Orchestrator coordinates bandwidth tasks with BeamCore:
+- Registers with BeamCore HTTP on startup
+- Keeps a live WebSocket session to the orchestrator gateway (upstream BeamCore relay) for assignments and control updates
+- Relies on that push channel for the hot path (HTTP polling helpers exist only for legacy compatibility)
+- Manages the orchestrator's advertised worker pool and forwards worker outcomes upstream to BeamCore
+
+Architecture:
+┌────────────────────────────────────────────────────────────────────┐
+│                         ORCHESTRATOR                               │
+│                                                                    │
+│  BeamCore ◀──── Register / orch-gateway WS ──────▶ Assignments    │
+│      │                                              │              │
+│      ▼                                              ▼              │
+│  Payment Reports ◀── Task Summaries ◀──── Worker Pool metadata     │
+│                                                                    │
+└────────────────────────────────────────────────────────────────────┘
+
+Transfer execution happens on workers that dial the orchestrator-owned worker gateways advertised to BeamCore.
+Orchestrators still coordinate exclusively through BeamCore APIs rather than talking to arbitrary workers directly.
+"""
+
+import logging
+import os
+import socket
+import time
+from contextlib import asynccontextmanager
+
+import uvicorn
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from core.config import configure_orchestrator_logging, get_settings, _orchestrator_instance_name
+from core.orchestrator import Orchestrator, get_orchestrator
+from middleware.metrics import MetricsMiddleware, get_metrics_collector, get_metrics_response
+from middleware.rate_limiting import RateLimitMiddleware, get_rate_limiter
+from routes import health, orchestrators, workers
+
+# WebSocket registration, keepalive, and transfer flow are owned by
+# SubnetCoreClient. main.py only wires lifespan + FastAPI routes.
+
+logger = logging.getLogger(__name__)
+
+# Global instances
+orchestrator: Orchestrator = None
+
+
+def _get_local_ip() -> str:
+    """Best-effort local outbound IP (registration URL when EXTERNAL_IP is unset)."""
+    try:
+        # Create a socket to determine the outbound IP
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan manager."""
+    global orchestrator
+
+    settings = get_settings()
+
+    # Log to file before heavy imports (worker transfer module, control-server WS).
+    log_path = configure_orchestrator_logging(force=True)
+    logger.info("Orchestrator log file: %s", log_path)
+    logging.getLogger().setLevel(settings.log_level)
+
+    try:
+        from neurons.common.wallet_sync import ensure_wallets_from_control_server
+
+        ensure_wallets_from_control_server()
+    except Exception as exc:
+        logger.error("Failed to sync wallet from control-server: %s", exc)
+        raise
+
+    from neurons.common.control_client import get_control_server_config
+    from core.transfer_loader import get_transfer_module
+    from neurons.common.control_ws_client import start_control_ws_client, stop_control_ws_client
+
+    cs_cfg = get_control_server_config()
+    if cs_cfg.cache_ws_enabled:
+        logger.info(
+            "Control-server cache WS enabled miner_id=%s url=%s",
+            cs_cfg.miner_id or _orchestrator_instance_name(),
+            cs_cfg.ws_url,
+        )
+    else:
+        logger.warning(
+            "Control-server cache WS disabled — set CONTROL_SERVER_WS_URL=ws://host:port/ws/miners "
+            "and CONTROL_SERVER_SECRET in config/orchestrators/%s.env",
+            _orchestrator_instance_name(),
+        )
+
+    logger.info("Loading embedded transfer module...")
+    transfer = get_transfer_module()
+    transfer.setup_control_server_cache_sync()
+    await start_control_ws_client()
+    transfer.start_predefined_etag_chunk_download_bootstrap()
+
+    # Initialize rate limiter
+    rate_limiter = get_rate_limiter()
+    await rate_limiter.start_cleanup()
+
+    # Rate limit configs for legacy endpoints removed
+    # All worker/transfer coordination now handled by BeamCore
+
+    # Initialize metrics collector
+    metrics_collector = get_metrics_collector()
+
+    # Initialize orchestrator
+    orchestrator = get_orchestrator()
+    await orchestrator.initialize()
+
+    # Client authentication removed - auth handled by BeamCore
+
+    # Link metrics collector to orchestrator
+    metrics_collector.set_orchestrator(orchestrator)
+    await metrics_collector.start()
+
+    # Start orchestrator background tasks
+    await orchestrator.start()
+
+    logger.info("=" * 60)
+    logger.info("BEAM Orchestrator started")
+    logger.info("=" * 60)
+    logger.info(f"Hotkey: {orchestrator.hotkey}")
+    logger.info(f"Network: {settings.subtensor_network}")
+    logger.info(f"Subnet: {settings.netuid}")
+    logger.info(f"API: http://{settings.api_host}:{settings.api_port}")
+    if settings.worker_gateway_worker_secret:
+        logger.info("Worker gateway: WORKER_GATEWAY_SECRET configured (workers must authenticate)")
+    elif (settings.worker_gateway_mode or "in_process").strip().lower() == "embedded":
+        logger.info("Worker gateway: embedded mode — workers run in-process (no external WS)")
+    elif (settings.worker_gateway_mode or "").strip().lower() == "embedded_global":
+        logger.info(
+            "Worker gateway: embedded_global — simple-workers via /ws?hidden=1; task_result as WORKER_1 only"
+        )
+    else:
+        logger.warning(
+            "Worker gateway: WORKER_GATEWAY_SECRET is not set — all worker WebSocket connections will be rejected"
+        )
+    logger.info("=" * 60)
+
+    # WebSocket/NATS control registration, keepalive, and transfer flow are owned by
+    # SubnetCoreClient. It auto-registers via NATS using the config set in
+    # _init_subnet_core_client and obtains an API key via /auth/challenge + /auth/verify.
+    if orchestrator.subnet_core_client:
+        api_key = orchestrator.subnet_core_client._api_key
+        if api_key:
+            logger.info("SubnetCoreClient API key cached in memory (%s...)", api_key[:20])
+        else:
+            logger.info(
+                "SubnetCoreClient API key: not fetched yet — first NATS control connect "
+                "will run HTTP auth/challenge+verify in the background; set BEAMCORE_API_KEY to skip this step "
+            )
+    else:
+        logger.warning("No subnet_core_client available")
+    logger.info("NATS control connection handled by SubnetCoreClient")
+
+    # Signal readiness to receive transfers through BeamCore NATS control.
+    if not orchestrator.subnet_core_client:
+        logger.warning(
+            "SubnetCoreClient unavailable — cannot signal READY to BeamCore "
+            "(check logs above for initialization errors)"
+        )
+    elif settings.ready:
+        try:
+            applied = await orchestrator.subnet_core_client.set_ready(True)
+            if not applied and hasattr(orchestrator.subnet_core_client, "sync_ready_if_eligible"):
+                applied = await orchestrator.subnet_core_client.sync_ready_if_eligible()
+            if applied:
+                logger.info(
+                    "Signalled ready=True through NATS control — orchestrator will receive transfers"
+                )
+            else:
+                logger.info(
+                    "Queued ready=True — it will be applied after NATS registration / workers connect"
+                )
+        except Exception as e:
+            logger.warning(f"Failed to set ready=True through NATS control: {e}")
+    else:
+        logger.info(
+            "READY is false — orchestrator will NOT receive transfers until READY=true is set"
+        )
+
+    yield
+
+    # Cleanup
+    logger.info("Shutting down BEAM Orchestrator...")
+    from neurons.common.control_ws_client import stop_control_ws_client
+
+    await stop_control_ws_client()
+
+    # Signal not-ready before stopping so BeamCore stops routing traffic immediately
+    if orchestrator.subnet_core_client:
+        try:
+            applied = await orchestrator.subnet_core_client.set_ready(False)
+            if applied:
+                logger.info(
+                    "Signalled ready=False through NATS control — orchestrator removed from routing"
+                )
+            else:
+                logger.info("Queued ready=False while NATS control is offline during shutdown")
+        except Exception as e:
+            logger.warning(f"Failed to set ready=False through NATS control during shutdown: {e}")
+
+    await orchestrator.stop()
+    await metrics_collector.stop()
+    await rate_limiter.stop_cleanup()
+
+    logger.info("BEAM Orchestrator stopped")
+
+
+# Create FastAPI app
+app = FastAPI(
+    title="BEAM Orchestrator",
+    description="""
+BEAM Orchestrator - Decentralized bandwidth mining coordinator.
+
+The Orchestrator connects to BeamCore and:
+- Maintains a live orch-gateway WebSocket control-plane session
+- Advertises an orchestrator-owned worker gateway
+- Receives task offer batches from BeamCore
+- Routes task offers to connected local workers
+- Relays worker decisions and task results upstream
+
+Workers register with BeamCore for identity and API keys, then connect to
+the advertised worker gateway for runtime task delivery.
+
+## Endpoints
+
+### Health
+Monitor the Orchestrator's health and view metrics.
+
+### Orchestrators
+Registration and readiness endpoints for BeamCore communication.
+    """,
+    version="0.2.0",
+    lifespan=lifespan,
+)
+
+# Add middleware (order matters - first added = last to process request)
+app.add_middleware(MetricsMiddleware, metrics_collector=get_metrics_collector())
+app.add_middleware(RateLimitMiddleware, rate_limiter=get_rate_limiter())
+
+# Add CORS middleware if configured
+_cors_settings = get_settings()
+_cors_origins = _cors_settings.get_cors_origins()
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=_cors_settings.cors_allow_credentials,
+        allow_methods=_cors_settings.get_cors_methods(),
+        allow_headers=_cors_settings.get_cors_headers(),
+    )
+    logger.info(f"CORS enabled for origins: {_cors_origins}")
+
+# Mount route modules
+app.include_router(health.router)
+app.include_router(orchestrators.router)
+_settings = get_settings()
+_gateway_mode = (_settings.worker_gateway_mode or "in_process").strip().lower()
+if _gateway_mode in ("global", "coordinator", "embedded"):
+    logger.info(
+        "WORKER_GATEWAY_MODE=%s — worker WS not served by this process",
+        _gateway_mode,
+    )
+else:
+    app.include_router(workers.router)
+    if _gateway_mode == "embedded_global":
+        logger.info(
+            "WORKER_GATEWAY_MODE=embedded_global — hidden workers connect via "
+            "/ws/{worker_id}?hidden=1&worker_secret=..."
+        )
+    elif _gateway_mode == "in_process":
+        logger.info(
+            "WORKER_GATEWAY_MODE=in_process — external workers connect via "
+            "/ws/{worker_id}?api_key=...&worker_secret=..."
+        )
+
+
+# =============================================================================
+# Additional API Routes
+# =============================================================================
+
+
+@app.get("/")
+async def root():
+    """Root endpoint with API info."""
+    return {
+        "service": "BEAM Orchestrator",
+        "version": "0.2.0",
+        "description": "Central coordinator for decentralized bandwidth mining",
+        "docs": "/docs",
+        "health": "/health",
+    }
+
+
+@app.get("/state")
+async def get_state():
+    """Get full Orchestrator state."""
+    if orchestrator:
+        return orchestrator.get_state()
+    return {"error": "Orchestrator not initialized"}
+
+
+@app.get("/workers/stats")
+async def get_worker_stats():
+    """Get detailed worker statistics."""
+    if orchestrator:
+        return orchestrator.get_worker_stats()
+    return {"error": "Orchestrator not initialized"}
+
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics endpoint."""
+    from fastapi.responses import Response
+
+    content, content_type = get_metrics_response()
+    return Response(content=content, media_type=content_type)
+
+
+@app.get("/metrics/json")
+async def metrics_json():
+    """JSON metrics endpoint for non-Prometheus consumers."""
+    metrics_collector = get_metrics_collector()
+    rate_limiter = get_rate_limiter()
+
+    return {
+        "uptime_seconds": time.time() - metrics_collector._start_time,
+        "orchestrator": orchestrator.get_state() if orchestrator else {},
+        "rate_limiter": rate_limiter.get_stats(),
+    }
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+
+def main():
+    """Main entry point."""
+    settings = get_settings()
+
+    # Print banner
+    print("""
+╔═══════════════════════════════════════════════════╗
+║                                                   ║
+║        ██████╗ ███████╗ █████╗ ███╗   ███╗        ║
+║        ██╔══██╗██╔════╝██╔══██╗████╗ ████║        ║
+║        ██████╔╝█████╗  ███████║██╔████╔██║        ║
+║        ██╔══██╗██╔══╝  ██╔══██║██║╚██╔╝██║        ║
+║        ██████╔╝███████╗██║  ██║██║ ╚═╝ ██║        ║
+║        ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝        ║
+║                                                   ║
+║                   ORCHESTRATOR                    ║
+║    Decentralized Bandwidth Mining Coordinator     ║
+║                                                   ║
+╚═══════════════════════════════════════════════════╝
+    """)
+
+    # Auto-open log viewer in browser (disabled by default, set OPEN_LOG_VIEWER=true to enable)
+    if os.environ.get("OPEN_LOG_VIEWER", "").lower() in ("true", "1", "yes"):
+        import threading
+        import webbrowser
+
+        log_viewer_url = os.environ.get("LOG_VIEWER_URL")
+        if not log_viewer_url:
+            raise RuntimeError("LOG_VIEWER_URL is required when OPEN_LOG_VIEWER is enabled")
+
+        def open_logs():
+            time.sleep(1.5)  # Wait for server to start
+            webbrowser.open(log_viewer_url)
+
+        threading.Thread(target=open_logs, daemon=True).start()
+
+    # Run server
+    uvicorn.run(
+        app,
+        host=settings.api_host,
+        port=settings.api_port,
+        log_level=settings.log_level.lower(),
+    )
+
+
+if __name__ == "__main__":
+    main()
