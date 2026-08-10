@@ -520,10 +520,23 @@ class EmbeddedWorkerPool:
         # Local embedded stops taking work; simple-workers do transfers.
         if self.workers:
             self.workers[0].max_concurrent_tasks = 0
+        hidden_n = 0
+        gateway = self._hidden_worker_gateway
+        if gateway is not None and hasattr(gateway, "connected_hidden_worker_ids"):
+            try:
+                hidden_n = len(gateway.connected_hidden_worker_ids())
+            except Exception:
+                hidden_n = 0
         logger.info(
             "embedded_global: cache sync done — all tasks via simple-workers; "
-            "task_result uses WORKER_S only"
+            "task_result uses WORKER_S only; hidden_connected=%d",
+            hidden_n,
         )
+        if hidden_n <= 0:
+            logger.warning(
+                "embedded_global: no hidden/simple workers connected yet — "
+                "offers will queue until a worker connects with ?hidden=1"
+            )
         self._schedule_overflow_drain()
 
     def _routing_workers(self) -> List[EmbeddedWorker]:

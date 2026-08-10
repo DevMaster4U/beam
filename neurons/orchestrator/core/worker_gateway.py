@@ -457,6 +457,14 @@ class WorkerGateway:
     def connected_count(self) -> int:
         return len(self._sessions)
 
+    def connected_hidden_worker_ids(self) -> list[str]:
+        """Worker ids currently connected with hidden=1 (simple-workers)."""
+        return [
+            wid
+            for wid in self._sessions
+            if self._get_profile(wid).hidden
+        ]
+
     @property
     def worker_ids(self) -> list:
         return list(self._sessions.keys())

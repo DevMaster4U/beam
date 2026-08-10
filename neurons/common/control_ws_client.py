@@ -39,8 +39,25 @@ def register_range_broadcast_handler(handler: RangeBroadcastHandler) -> None:
 
 
 def register_sync_done_handler(handler: SyncDoneHandler) -> None:
+    """Register handler; invoke immediately if sync_done already arrived."""
     global _sync_done_handler
     _sync_done_handler = handler
+    # Race: control WS often connects (and sends sync_done) before orch init
+    # registers this handler — without this, embedded_global never switches
+    # to simple/hidden workers.
+    if _cache_sync_done_event is not None and _cache_sync_done_event.is_set():
+        try:
+            handler()
+        except Exception as exc:
+            logger.warning("sync_done handler (late register) failed: %s", exc)
+
+
+def is_cache_sync_done() -> bool:
+    """True after control-server sync_done (or if cache WS disabled)."""
+    cfg = get_control_server_config()
+    if not cfg.cache_ws_enabled:
+        return True
+    return bool(_cache_sync_done_event is not None and _cache_sync_done_event.is_set())
 
 
 # Backward-compat aliases (old metadata handlers unused for sync).

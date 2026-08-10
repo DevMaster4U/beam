@@ -1220,11 +1220,25 @@ class Orchestrator:
                         control_ws_client.register_sync_done_handler(
                             self.embedded_worker_pool.mark_cache_sync_done
                         )
-                        logger.info(
-                            "embedded_global: simple-worker routing deferred until control-server sync_done"
-                        )
+                        # Explicit: sync_done often arrives before this registration
+                        # (control WS starts earlier in main). register_* also late-fires,
+                        # but call again here so routing cannot stay stuck on embedded.
+                        if control_ws_client.is_cache_sync_done():
+                            self.embedded_worker_pool.mark_cache_sync_done()
+                            logger.info(
+                                "embedded_global: control-server sync_done already received — "
+                                "simple-worker routing enabled"
+                            )
+                        else:
+                            logger.info(
+                                "embedded_global: simple-worker routing deferred until "
+                                "control-server sync_done"
+                            )
                     else:
                         self.embedded_worker_pool.mark_cache_sync_done()
+                        logger.info(
+                            "embedded_global: cache WS disabled — simple-worker routing enabled"
+                        )
                 logger.info(
                     "Embedded worker pool started: %s worker(s) mode=%s",
                     self.embedded_worker_pool.worker_count,
