@@ -1386,6 +1386,8 @@ class EmbeddedWorkerPool:
         # Count offers already dispatched in this drain pass so _select_worker
         # does not over-book a worker before active_offer_ids is updated.
         batch_assigned_counts: dict[str, int] = {}
+        # Spread across unique hidden-worker IPs before giving anyone a 2nd task.
+        batch_used_ips: set[str] = set()
         while self._overflow:
             item = self._overflow[0]
             offer = item["offer"]
@@ -1396,7 +1398,10 @@ class EmbeddedWorkerPool:
 
             # embedded_global after sync_done: drain to free simple/hidden workers.
             if self.uses_overflow_routing and self._hidden_worker_gateway is not None:
-                hidden_id = self._hidden_worker_gateway.select_hidden_worker_round_robin()
+                hidden_id = self._hidden_worker_gateway.select_hidden_worker_round_robin(
+                    batch_used_ips=batch_used_ips,
+                    batch_assigned_counts=batch_assigned_counts,
+                )
                 if not hidden_id:
                     break
                 self._overflow.pop(0)
@@ -1404,6 +1409,14 @@ class EmbeddedWorkerPool:
                 # Reserve immediately so the next select cannot double-book.
                 if offer_id and hasattr(self._hidden_worker_gateway, "mark_worker_busy"):
                     self._hidden_worker_gateway.mark_worker_busy(hidden_id, offer_id)
+                batch_assigned_counts[hidden_id] = (
+                    batch_assigned_counts.get(hidden_id, 0) + 1
+                )
+                hidden_ip = _gateway_worker_ip(
+                    self._hidden_worker_gateway, hidden_id
+                )
+                if hidden_ip:
+                    batch_used_ips.add(hidden_ip)
                 beamcore_worker = self._beamcore_worker_for_overflow()
                 task = asyncio.create_task(
                     self._handle_overflow_offer(
@@ -1412,6 +1425,7 @@ class EmbeddedWorkerPool:
                         transfer_context,
                         path=path,
                         hidden_worker_id=hidden_id,
+                        batch_used_ips=batch_used_ips,
                         enqueue_if_no_capacity=True,
                     )
                 )
@@ -1428,8 +1442,7 @@ class EmbeddedWorkerPool:
                     "ip_address=%s pending=%d",
                     short_id(task_id),
                     short_id(offer_id),
-                    _gateway_worker_ip(self._hidden_worker_gateway, hidden_id)
-                    or short_id(hidden_id),
+                    hidden_ip or short_id(hidden_id),
                     len(self._overflow),
                 )
                 continue

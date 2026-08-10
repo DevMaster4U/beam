@@ -1884,8 +1884,18 @@ class WorkerGateway:
         self,
         batch_used_ips: Optional[set[str]] = None,
         batch_assigned_workers: Optional[set[str]] = None,
+        batch_assigned_counts: Optional[dict[str, int]] = None,
     ) -> Optional[str]:
-        """Pick the next hidden overflow worker with capacity."""
+        """Pick the next hidden overflow worker with capacity.
+
+        Within a drain/batch wave:
+          1. Prefer idle workers on a fresh IP (not yet used this wave)
+          2. Prefer any worker not yet assigned this wave (fresh IP optional)
+          3. Only then reuse the least-loaded worker (min batch count, then active)
+
+        This yields 1-per-worker first when tasks > workers (e.g. 6 tasks / 5
+        workers → one worker gets 2, every other free worker gets 1).
+        """
         connected = [
             wid for wid in self._ordered_connected_worker_ids()
             if self._get_profile(wid).hidden
@@ -1895,13 +1905,38 @@ class WorkerGateway:
 
         pool_size = len(connected)
         start = self._hidden_cursor % pool_size
-        in_batch = batch_used_ips is not None or batch_assigned_workers is not None
+        in_batch = (
+            batch_used_ips is not None
+            or batch_assigned_workers is not None
+            or batch_assigned_counts is not None
+        )
+        counts = batch_assigned_counts
 
-        def _eligible(worker_id: str, *, allow_used_ip: bool) -> bool:
+        def _batch_count(worker_id: str) -> int:
+            if counts is not None:
+                return int(counts.get(worker_id, 0))
+            if batch_assigned_workers and worker_id in batch_assigned_workers:
+                return 1
+            return 0
+
+        def _load(worker_id: str) -> int:
+            profile = self._get_profile(worker_id)
+            return max(profile.active_count, _batch_count(worker_id))
+
+        def _eligible(
+            worker_id: str,
+            *,
+            allow_used_ip: bool,
+            allow_worker_reuse: bool,
+            require_idle: bool,
+        ) -> bool:
             profile = self._get_profile(worker_id)
             if not profile.hidden or not profile.has_capacity:
                 return False
-            if batch_assigned_workers and worker_id in batch_assigned_workers:
+            load = _load(worker_id)
+            if require_idle and load > 0:
+                return False
+            if not allow_worker_reuse and _batch_count(worker_id) > 0:
                 return False
             ip = profile.ip.strip()
             if (
@@ -1913,22 +1948,61 @@ class WorkerGateway:
                 return False
             return True
 
-        def _pick(allow_used_ip: bool) -> Optional[str]:
+        def _pick(
+            *,
+            allow_used_ip: bool,
+            allow_worker_reuse: bool,
+            require_idle: bool,
+        ) -> Optional[str]:
+            # (load, batch_n, offset, worker_id) — least loaded, then RR
+            candidates: list[tuple[int, int, int, str]] = []
             for offset in range(pool_size):
                 idx = (start + offset) % pool_size
                 worker_id = connected[idx]
-                if not _eligible(worker_id, allow_used_ip=allow_used_ip):
+                if not _eligible(
+                    worker_id,
+                    allow_used_ip=allow_used_ip,
+                    allow_worker_reuse=allow_worker_reuse,
+                    require_idle=require_idle,
+                ):
                     continue
-                self._hidden_cursor = (idx + 1) % pool_size
-                return worker_id
-            return None
+                candidates.append(
+                    (_load(worker_id), _batch_count(worker_id), offset, worker_id)
+                )
+            if not candidates:
+                return None
+            candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+            worker_id = candidates[0][3]
+            idx = connected.index(worker_id)
+            self._hidden_cursor = (idx + 1) % pool_size
+            return worker_id
 
-        if in_batch:
-            worker_id = _pick(allow_used_ip=False)
-            if worker_id:
-                return worker_id
-            return _pick(allow_used_ip=True)
-        return _pick(allow_used_ip=True)
+        if not in_batch:
+            return _pick(
+                allow_used_ip=True, allow_worker_reuse=True, require_idle=False
+            )
+
+        # Wave 1: idle + fresh IP
+        worker_id = _pick(
+            allow_used_ip=False, allow_worker_reuse=False, require_idle=True
+        )
+        if worker_id:
+            return worker_id
+        # Wave 2: any not-yet-assigned this wave (fresh IP preferred via sort)
+        worker_id = _pick(
+            allow_used_ip=False, allow_worker_reuse=False, require_idle=False
+        )
+        if worker_id:
+            return worker_id
+        worker_id = _pick(
+            allow_used_ip=True, allow_worker_reuse=False, require_idle=False
+        )
+        if worker_id:
+            return worker_id
+        # Wave 3: reuse least-loaded (tasks > free workers)
+        return _pick(
+            allow_used_ip=True, allow_worker_reuse=True, require_idle=False
+        )
 
     async def deliver_transfer_offer(self, worker_id: str, offer: dict) -> bool:
         ws = self._sessions.get(worker_id)
