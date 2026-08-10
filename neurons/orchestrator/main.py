@@ -142,7 +142,7 @@ async def lifespan(app: FastAPI):
         logger.info("Worker gateway: embedded mode — workers run in-process (no external WS)")
     elif (settings.worker_gateway_mode or "").strip().lower() == "embedded_global":
         logger.info(
-            "Worker gateway: embedded_global — simple-workers via /ws?hidden=1; task_result as WORKER_1 only"
+            "Worker gateway: embedded_global — simple-workers via /ws?hidden=1; task_result as WORKER_S only"
         )
     else:
         logger.warning(

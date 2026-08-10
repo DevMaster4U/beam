@@ -7,7 +7,7 @@ attached for overflow: prefer a fresh-IP external worker before reusing an
 embedded worker IP within the same batch.
 
 embedded_global: after control-server sync_done, all work goes to simple/hidden
-workers on orchestrator WS; BeamCore task_result always uses WORKER_1 (one hotkey).
+workers on orchestrator WS; BeamCore task_result always uses WORKER_S (one hotkey).
 """
 
 from __future__ import annotations
@@ -31,6 +31,8 @@ from core.cloudflare_transfer import (
 )
 from core.relay_log import (
     chunk_id_from_transfer_context,
+    format_ts_utc,
+    queue_wait_ms,
     short_id,
     transfer_context_range_label,
     transfer_context_urls,
@@ -40,6 +42,20 @@ from core.transfer_loader import get_transfer_module
 logger = logging.getLogger(__name__)
 
 _WORKERS_LOG = "_workers |"
+
+
+def _stamp_ctx_queued(transfer_context: dict) -> None:
+    if "_queued_at" not in transfer_context:
+        transfer_context["_queued_at"] = time.time()
+
+
+def _stamp_ctx_started(transfer_context: dict, worker_id: str = "") -> None:
+    now = time.time()
+    if "_queued_at" not in transfer_context:
+        transfer_context["_queued_at"] = now
+    transfer_context["_started_at"] = now
+    if worker_id:
+        transfer_context["_worker_id"] = str(worker_id)
 
 
 def _log_embedded_task_offer(
@@ -85,19 +101,39 @@ def _log_embedded_task_done(
     etag_ms: float = 0.0,
     fetch_ms: float = 0.0,
     send_ms: float = 0.0,
+    worker_id: str = "",
 ) -> None:
     chunk_id = chunk_id_from_transfer_context(transfer_context)
     src, dest = transfer_context_urls(transfer_context)
     total_ms = load_ms + hash_ms + etag_ms + fetch_ms + send_ms
+    completed_at = time.time()
+    started_at = transfer_context.get("_started_at")
+    queued_at = transfer_context.get("_queued_at")
+    wait_ms = queue_wait_ms(queued_at, started_at)
+    try:
+        exec_ms = (
+            (completed_at - float(started_at)) * 1000.0 if started_at else 0.0
+        )
+    except (TypeError, ValueError):
+        exec_ms = 0.0
+    result_worker = str(
+        worker_id or transfer_context.get("_worker_id") or ""
+    )
     logger.info(
-        "%s task_done task=%s offer=%s chunk_id=%s src=%s dest=%s "
-        "range=%s hash=%s etag_real=%s etag_local=%s "
+        "%s task_done task=%s offer=%s chunk_id=%s worker_id=%s "
+        "started_at=%s completed_at=%s queue_wait_ms=%.0f exec_ms=%.1f "
+        "src=%s dest=%s range=%s hash=%s etag_real=%s etag_local=%s "
         "cached=%s path=%s hash_source=%s "
         "load_ms=%.1f hash_ms=%.1f etag_ms=%.1f fetch_ms=%.1f send_ms=%.1f wall_ms=%.1f",
         _WORKERS_LOG,
         short_id(task_id),
         short_id(offer_id),
         chunk_id if chunk_id is not None else "?",
+        short_id(result_worker) if result_worker else "-",
+        format_ts_utc(started_at),
+        format_ts_utc(completed_at),
+        wait_ms,
+        exec_ms,
         src,
         dest,
         transfer_context_range_label(transfer_context),
@@ -213,74 +249,112 @@ class EmbeddedWorker:
         return (1, self.worker_id)
 
 
-def parse_embedded_worker_configs(settings: OrchestratorSettings) -> List[EmbeddedWorkerConfig]:
-    """Parse WORKER_1, WORKER_2, ... from the orchestrator env file."""
-    configs: List[EmbeddedWorkerConfig] = []
+def _parse_worker_env_slot(
+    settings: OrchestratorSettings,
+    *,
+    prefix: str,
+    slot: int,
+    default_order: int = 0,
+) -> Optional[EmbeddedWorkerConfig]:
+    """Parse WORKER_S / WORKER_1 / … from env (``wallet:hotkey`` or ``*_HOTKEY``)."""
     default_wallet = os.environ.get("WORKER_WALLET_NAME", settings.wallet_name).strip()
     default_max_tasks = max(1, int(os.environ.get("WORKER_MAX_CONCURRENT_TASKS", "4")))
 
+    combined = os.environ.get(prefix, "").strip()
+    hotkey = os.environ.get(f"{prefix}_HOTKEY", "").strip()
+    wallet_name = os.environ.get(f"{prefix}_WALLET_NAME", "").strip()
+
+    if combined:
+        if ":" in combined:
+            wallet_part, hotkey_part = combined.split(":", 1)
+            wallet_name = wallet_name or wallet_part.strip()
+            hotkey = hotkey or hotkey_part.strip()
+        elif not hotkey:
+            hotkey = combined
+
+    if not hotkey:
+        return None
+    if not wallet_name:
+        wallet_name = default_wallet
+
+    order_raw = os.environ.get(f"{prefix}_ORDER", str(default_order)).strip()
+    try:
+        initial_order = int(order_raw)
+    except ValueError:
+        initial_order = default_order
+
+    max_tasks_raw = os.environ.get(f"{prefix}_MAX_CONCURRENT_TASKS", "").strip()
+    if max_tasks_raw:
+        try:
+            max_concurrent = max(1, int(max_tasks_raw))
+        except ValueError:
+            max_concurrent = default_max_tasks
+    else:
+        max_concurrent = default_max_tasks
+
+    cf_raw = os.environ.get(f"{prefix}_CF_TRANSFER_ENABLED", "").strip()
+    if cf_raw:
+        cf_transfer_enabled = _env_bool(cf_raw, False)
+    else:
+        cf_transfer_enabled = bool(getattr(settings, "cf_transfer_enabled", False))
+
+    cf_transfer_worker_urls = parse_cf_transfer_urls(
+        os.environ.get(f"{prefix}_CF_TRANSFER_WORKER_URLS", ""),
+        os.environ.get(f"{prefix}_CF_TRANSFER_WORKER_URL", ""),
+    )
+
+    return EmbeddedWorkerConfig(
+        slot=slot,
+        wallet_name=wallet_name,
+        hotkey=hotkey,
+        initial_order=initial_order,
+        max_concurrent_tasks=max_concurrent,
+        cf_transfer_enabled=cf_transfer_enabled,
+        cf_transfer_worker_urls=cf_transfer_worker_urls,
+    )
+
+
+def parse_s_worker_config(settings: OrchestratorSettings) -> Optional[EmbeddedWorkerConfig]:
+    """BeamCore identity for simple-worker mode: WORKER_S (wallet:hotkey)."""
+    return _parse_worker_env_slot(settings, prefix="WORKER_S", slot=1, default_order=0)
+
+
+def parse_embedded_worker_configs(settings: OrchestratorSettings) -> List[EmbeddedWorkerConfig]:
+    """Parse embedded worker slots from the orchestrator env file.
+
+    - ``embedded_global``: prefer ``WORKER_S`` (register + task_result hotkey).
+      Falls back to ``WORKER_1`` if ``WORKER_S`` is unset.
+    - other modes: ``WORKER_1``, ``WORKER_2``, …
+    """
+    mode = (getattr(settings, "worker_gateway_mode", None) or "").strip().lower()
+    if mode == "embedded_global":
+        s_worker = parse_s_worker_config(settings)
+        if s_worker is not None:
+            return [s_worker]
+        fallback = _parse_worker_env_slot(
+            settings, prefix="WORKER_1", slot=1, default_order=0
+        )
+        if fallback is not None:
+            logger.warning(
+                "embedded_global: WORKER_S unset — falling back to WORKER_1 for "
+                "BeamCore register/task_result (set WORKER_S=wallet:hotkey)"
+            )
+            return [fallback]
+        return []
+
+    configs: List[EmbeddedWorkerConfig] = []
     idx = 1
     while True:
-        combined = os.environ.get(f"WORKER_{idx}", "").strip()
-        hotkey = os.environ.get(f"WORKER_{idx}_HOTKEY", "").strip()
-        wallet_name = os.environ.get(f"WORKER_{idx}_WALLET_NAME", "").strip()
-
-        if combined:
-            if ":" in combined:
-                wallet_part, hotkey_part = combined.split(":", 1)
-                wallet_name = wallet_name or wallet_part.strip()
-                hotkey = hotkey or hotkey_part.strip()
-            elif not hotkey:
-                hotkey = combined
-
-        if not hotkey:
+        cfg = _parse_worker_env_slot(
+            settings,
+            prefix=f"WORKER_{idx}",
+            slot=idx,
+            default_order=idx - 1,
+        )
+        if cfg is None:
             break
-
-        if not wallet_name:
-            wallet_name = default_wallet
-
-        order_raw = os.environ.get(f"WORKER_{idx}_ORDER", str(idx - 1)).strip()
-        try:
-            initial_order = int(order_raw)
-        except ValueError:
-            initial_order = idx - 1
-
-        max_tasks_raw = os.environ.get(f"WORKER_{idx}_MAX_CONCURRENT_TASKS", "").strip()
-        if max_tasks_raw:
-            try:
-                max_concurrent = max(1, int(max_tasks_raw))
-            except ValueError:
-                max_concurrent = default_max_tasks
-        else:
-            max_concurrent = default_max_tasks
-
-        # Per-worker CF transfer; falls back to global CF_TRANSFER_ENABLED.
-        cf_raw = os.environ.get(f"WORKER_{idx}_CF_TRANSFER_ENABLED", "").strip()
-        if cf_raw:
-            cf_transfer_enabled = _env_bool(cf_raw, False)
-        else:
-            cf_transfer_enabled = bool(
-                getattr(settings, "cf_transfer_enabled", False)
-            )
-
-        cf_transfer_worker_urls = parse_cf_transfer_urls(
-            os.environ.get(f"WORKER_{idx}_CF_TRANSFER_WORKER_URLS", ""),
-            os.environ.get(f"WORKER_{idx}_CF_TRANSFER_WORKER_URL", ""),
-        )
-
-        configs.append(
-            EmbeddedWorkerConfig(
-                slot=idx,
-                wallet_name=wallet_name,
-                hotkey=hotkey,
-                initial_order=initial_order,
-                max_concurrent_tasks=max_concurrent,
-                cf_transfer_enabled=cf_transfer_enabled,
-                cf_transfer_worker_urls=cf_transfer_worker_urls,
-            )
-        )
+        configs.append(cfg)
         idx += 1
-
     return configs
 
 
@@ -436,7 +510,7 @@ class EmbeddedWorkerPool:
 
     @property
     def s_worker(self) -> Optional[EmbeddedWorker]:
-        """Single BeamCore identity (WORKER_1) for every task_result."""
+        """Single BeamCore identity (WORKER_S) for every task_result."""
         return self.workers[0] if self.workers else None
 
     def mark_cache_sync_done(self) -> None:
@@ -448,8 +522,9 @@ class EmbeddedWorkerPool:
             self.workers[0].max_concurrent_tasks = 0
         logger.info(
             "embedded_global: cache sync done — all tasks via simple-workers; "
-            "task_result uses WORKER_1 only"
+            "task_result uses WORKER_S only"
         )
+        self._schedule_overflow_drain()
 
     def _routing_workers(self) -> List[EmbeddedWorker]:
         # After sync_done, no local embedded execution — only s-worker identity.
@@ -460,7 +535,7 @@ class EmbeddedWorkerPool:
     def _beamcore_worker_for_overflow(self, embedded: Optional[EmbeddedWorker] = None) -> EmbeddedWorker:
         worker = self.s_worker or embedded
         if worker is None:
-            raise RuntimeError("WORKER_1 required for BeamCore task_result identity")
+            raise RuntimeError("WORKER_S required for BeamCore task_result identity")
         return worker
 
     def set_hidden_worker_gateway(self, gateway: Any) -> None:
@@ -468,18 +543,22 @@ class EmbeddedWorkerPool:
         self._hidden_worker_gateway = gateway
         if hasattr(gateway, "set_transfer_result_handler"):
             gateway.set_transfer_result_handler(self.handle_transfer_result)
+        if hasattr(gateway, "set_hidden_capacity_handler"):
+            gateway.set_hidden_capacity_handler(self._schedule_overflow_drain)
 
     async def handle_transfer_result(self, worker_id: str, message: dict) -> None:
         offer_id = str(message.get("offer_id") or message.get("task_id") or "")
         future = self._transfer_waiters.pop(offer_id, None)
         if future is not None and not future.done():
             future.set_result(message)
-            return
-        logger.warning(
-            "Unexpected transfer_result from hidden worker=%s offer=%s",
-            short_id(worker_id),
-            short_id(offer_id),
-        )
+        else:
+            logger.warning(
+                "Unexpected transfer_result from hidden worker=%s offer=%s",
+                short_id(worker_id),
+                short_id(offer_id),
+            )
+        # Free slot may unblock offers waiting for hidden capacity.
+        self._schedule_overflow_drain()
 
     def set_worker_gateway(self, gateway: Any) -> None:
         """Overflow task offers to external workers connected on orchestrator WS."""
@@ -542,16 +621,22 @@ class EmbeddedWorkerPool:
         configs = parse_embedded_worker_configs(self.settings)
         if not configs:
             mode = (self.settings.worker_gateway_mode or "embedded").strip().lower()
+            if mode == "embedded_global":
+                raise ValueError(
+                    "WORKER_GATEWAY_MODE=embedded_global requires WORKER_S "
+                    "(or WORKER_S_HOTKEY); WORKER_1 is accepted as fallback"
+                )
             raise ValueError(
                 f"WORKER_GATEWAY_MODE={mode} requires WORKER_1 (or WORKER_1_HOTKEY) in env"
             )
 
         if self.hybrid_mode:
+            s = configs[0]
             logger.info(
-                "embedded_global: WORKER_1 is the only BeamCore hotkey; "
-                "embedded transfer until sync_done, then all work via simple-workers "
-                "(%d worker slot(s) configured)",
-                len(configs),
+                "embedded_global: WORKER_S BeamCore hotkey=%s wallet=%s; "
+                "embedded transfer until sync_done, then all work via simple-workers",
+                s.hotkey,
+                s.wallet_name,
             )
 
         self.http_client = httpx.AsyncClient(
@@ -977,7 +1062,8 @@ class EmbeddedWorkerPool:
                 else "standard"
             )
 
-            # After sync_done: every offer → simple-worker; task_result as WORKER_1.
+            # After sync_done: every offer → simple-worker queue; drain to free
+            # hidden workers (extras wait — no silent drop / no BeamCore fail).
             if (
                 self.uses_overflow_routing
                 and self._hidden_worker_gateway is not None
@@ -992,24 +1078,36 @@ class EmbeddedWorkerPool:
                     path=f"{path}:simple",
                     beamcore_worker_id=beamcore_worker.worker_id,
                 )
-                task = asyncio.create_task(
-                    self._handle_overflow_offer(
-                        beamcore_worker,
-                        offer,
-                        transfer_context,
-                        path=path,
-                        batch_used_ips=batch_used_ips,
-                        batch_assigned_workers=hidden_batch_assigned,
-                    )
+                if self._enqueue_overflow(
+                    offer=offer,
+                    transfer_context=transfer_context,
+                    path=f"{path}:simple",
+                    batch_id=str(batch_id or ""),
+                ):
+                    queued += 1
+                    continue
+                logger.warning(
+                    "Simple-worker overflow queue full: batch=%s task=%s offer=%s",
+                    short_id(batch_id, 12),
+                    short_id(task_id),
+                    short_id(offer_id),
                 )
-                self._task_handles.add(task)
-                task.add_done_callback(
-                    lambda t, tid=task_id, oid=offer_id: self._log_offer_task_done(
-                        t, task_id=tid, offer_id=oid
-                    )
+                self._log_task_failed(
+                    transfer,
+                    transfer_context,
+                    task_id=task_id,
+                    offer_id=offer_id,
+                    reason="no_hidden_worker_capacity",
                 )
-                task.add_done_callback(self._task_handles.discard)
-                delivered += 1
+                await self._send_result(
+                    beamcore_worker,
+                    task_id,
+                    offer_id,
+                    success=False,
+                    error="simple_overflow_queue_full",
+                    transfer_context=transfer_context,
+                )
+                failed += 1
                 continue
 
             # in_process hybrid: maximize parallel bandwidth so last task finishes
@@ -1176,12 +1274,14 @@ class EmbeddedWorkerPool:
 
         if not OVERFLOW_QUEUE_ENABLED:
             return False
-        # Prefer gateway overflow when hybrid external workers exist.
-        gateway = self._worker_gateway
-        if gateway is not None and hasattr(gateway, "_enqueue_overflow"):
-            if gateway._enqueue_overflow(offer):
-                gateway._schedule_overflow_drain()
-                return True
+        # Simple-worker mode: always hold on the embedded queue (drained to hidden WS).
+        # in_process hybrid: prefer gateway overflow when external workers exist.
+        if not self.uses_overflow_routing:
+            gateway = self._worker_gateway
+            if gateway is not None and hasattr(gateway, "_enqueue_overflow"):
+                if gateway._enqueue_overflow(offer):
+                    gateway._schedule_overflow_drain()
+                    return True
         offer_id = str(offer.get("offer_id") or offer.get("task_id") or "").strip()
         if not offer_id:
             return False
@@ -1194,6 +1294,7 @@ class EmbeddedWorkerPool:
                 short_id(offer_id),
             )
             return False
+        _stamp_ctx_queued(transfer_context)
         self._overflow.append(
             {
                 "offer": dict(offer),
@@ -1204,10 +1305,11 @@ class EmbeddedWorkerPool:
         )
         self._overflow_ids.add(offer_id)
         logger.info(
-            "_workers | embedded_overflow_enqueue task=%s offer=%s pending=%d",
+            "_workers | embedded_overflow_enqueue task=%s offer=%s pending=%d path=%s",
             short_id(offer.get("task_id")),
             short_id(offer_id),
             len(self._overflow),
+            path,
         )
         return True
 
@@ -1245,6 +1347,45 @@ class EmbeddedWorkerPool:
             path = str(item.get("path") or "standard")
             offer_id = str(offer.get("offer_id") or offer.get("task_id") or "")
             task_id = str(offer.get("task_id") or offer_id)
+
+            # embedded_global after sync_done: drain to free simple/hidden workers.
+            if self.uses_overflow_routing and self._hidden_worker_gateway is not None:
+                hidden_id = self._hidden_worker_gateway.select_hidden_worker_round_robin()
+                if not hidden_id:
+                    break
+                self._overflow.pop(0)
+                self._overflow_ids.discard(offer_id)
+                # Reserve immediately so the next select cannot double-book.
+                if offer_id and hasattr(self._hidden_worker_gateway, "mark_worker_busy"):
+                    self._hidden_worker_gateway.mark_worker_busy(hidden_id, offer_id)
+                beamcore_worker = self._beamcore_worker_for_overflow()
+                task = asyncio.create_task(
+                    self._handle_overflow_offer(
+                        beamcore_worker,
+                        offer,
+                        transfer_context,
+                        path=path,
+                        hidden_worker_id=hidden_id,
+                        enqueue_if_no_capacity=True,
+                    )
+                )
+                self._task_handles.add(task)
+                task.add_done_callback(
+                    lambda t, tid=task_id, oid=offer_id: self._log_offer_task_done(
+                        t, task_id=tid, offer_id=oid
+                    )
+                )
+                task.add_done_callback(self._task_handles.discard)
+                delivered += 1
+                logger.info(
+                    "_workers | simple_overflow_deliver task=%s offer=%s "
+                    "hidden_worker=%s pending=%d",
+                    short_id(task_id),
+                    short_id(offer_id),
+                    short_id(hidden_id),
+                    len(self._overflow),
+                )
+                continue
 
             worker = self._select_worker()
             if worker is None:
@@ -1366,6 +1507,7 @@ class EmbeddedWorkerPool:
                 return
 
             worker.active_offer_ids.add(str(offer_id or ""))
+            _stamp_ctx_started(transfer_context, worker.worker_id)
 
             skip_reasons = transfer.predefined_etag_early_submit_skip_reasons(transfer_context)
             if skip_reasons:
@@ -1485,8 +1627,14 @@ class EmbeddedWorkerPool:
         path: str,
         batch_used_ips: Optional[set[str]] = None,
         batch_assigned_workers: Optional[set[str]] = None,
+        hidden_worker_id: Optional[str] = None,
+        enqueue_if_no_capacity: bool = True,
     ) -> None:
-        """Simple-worker transfer; orch submits task_result as WORKER_1 only."""
+        """Simple-worker transfer; orch submits task_result as WORKER_S only.
+
+        When no hidden worker is free, enqueue and wait (do not fail BeamCore)
+        unless the overflow queue is full or the gateway is missing.
+        """
         transfer = get_transfer_module()
         task_id = str(offer.get("task_id") or offer.get("offer_id") or "")
         offer_id = str(offer.get("offer_id") or task_id or "")
@@ -1501,19 +1649,51 @@ class EmbeddedWorkerPool:
                 offer_id=offer_id,
                 reason="hidden_worker_gateway_unavailable",
             )
+            await self._send_result(
+                beamcore_worker,
+                task_id,
+                offer_id,
+                success=False,
+                error="hidden_worker_gateway_unavailable",
+                transfer_context=transfer_context,
+            )
             return
 
-        hidden_worker_id = gateway.select_hidden_worker_round_robin(
-            batch_used_ips=batch_used_ips,
-            batch_assigned_workers=batch_assigned_workers,
-        )
         if not hidden_worker_id:
+            hidden_worker_id = gateway.select_hidden_worker_round_robin(
+                batch_used_ips=batch_used_ips,
+                batch_assigned_workers=batch_assigned_workers,
+            )
+        if not hidden_worker_id:
+            if enqueue_if_no_capacity and self._enqueue_overflow(
+                offer=offer,
+                transfer_context=transfer_context,
+                path=path,
+                batch_id="",
+            ):
+                logger.info(
+                    "%s no_hidden_worker_capacity; queued task=%s offer=%s pending=%d",
+                    _WORKERS_LOG,
+                    short_id(task_id),
+                    short_id(offer_id),
+                    len(self._overflow),
+                )
+                self._schedule_overflow_drain()
+                return
             self._log_task_failed(
                 transfer,
                 transfer_context,
                 task_id=task_id,
                 offer_id=offer_id,
                 reason="no_hidden_worker_capacity",
+            )
+            await self._send_result(
+                beamcore_worker,
+                task_id,
+                offer_id,
+                success=False,
+                error="no_hidden_worker_capacity",
+                transfer_context=transfer_context,
             )
             return
 
@@ -1538,11 +1718,36 @@ class EmbeddedWorkerPool:
             path,
         )
 
+        # Reserve before await so concurrent drain/batch selects skip this worker.
+        if offer_id and hasattr(gateway, "mark_worker_busy"):
+            gateway.mark_worker_busy(hidden_worker_id, offer_id)
+
         dispatched = await gateway.deliver_transfer_offer(hidden_worker_id, offer)
         if not dispatched:
             self._transfer_waiters.pop(offer_id, None)
             if batch_assigned_workers is not None:
                 batch_assigned_workers.discard(hidden_worker_id)
+            if hasattr(gateway, "mark_worker_idle"):
+                gateway.mark_worker_idle(
+                    hidden_worker_id, offer_id, drain_overflow=False
+                )
+            if enqueue_if_no_capacity and self._enqueue_overflow(
+                offer=offer,
+                transfer_context=transfer_context,
+                path=path,
+                batch_id="",
+            ):
+                logger.warning(
+                    "%s hidden_worker_dispatch_failed; re-queued task=%s offer=%s "
+                    "from=%s pending=%d",
+                    _WORKERS_LOG,
+                    short_id(task_id),
+                    short_id(offer_id),
+                    short_id(hidden_worker_id),
+                    len(self._overflow),
+                )
+                self._schedule_overflow_drain()
+                return
             await self._send_result(
                 beamcore_worker,
                 task_id,
@@ -1552,6 +1757,8 @@ class EmbeddedWorkerPool:
                 transfer_context=transfer_context,
             )
             return
+
+        _stamp_ctx_started(transfer_context, hidden_worker_id)
 
         timeout = float(os.environ.get("WORKER_OVERFLOW_TRANSFER_TIMEOUT", "120"))
         try:
@@ -1605,6 +1812,7 @@ class EmbeddedWorkerPool:
                 fetch_ms=float(result_msg.get("fetch_ms") or 0.0),
                 send_ms=float(result_msg.get("put_ms") or result_msg.get("send_ms") or 0.0),
                 path=path,
+                worker_id=hidden_worker_id or "",
             )
             if chunk_hash and cached is not True:
                 transfer.maybe_store_predefined_etag_cache_on_success(
@@ -1731,6 +1939,7 @@ class EmbeddedWorkerPool:
             hash_source="response_etag",
             fetch_ms=result.fetch_ms,
             send_ms=result.send_ms,
+            worker_id=worker.worker_id,
         )
 
     async def _handle_predefined_etag_offer(
@@ -1847,6 +2056,7 @@ class EmbeddedWorkerPool:
             etag_ms=getattr(outcome, "etag_ms", 0.0) or 0.0,
             fetch_ms=outcome.fetch_ms,
             send_ms=outcome.send_ms,
+            worker_id=worker.worker_id,
         )
         if outcome.used_cache and transfer.WORKER_PREDEFINED_ETAG_EARLY_SUBMIT and (
             getattr(outcome, "send_ms", 0.0) or 0.0
@@ -1965,6 +2175,7 @@ class EmbeddedWorkerPool:
                 hash_source="response_etag",
                 fetch_ms=result.fetch_ms,
                 send_ms=result.send_ms,
+                worker_id=worker.worker_id,
             )
         else:
             self._log_task_failed(

@@ -4852,6 +4852,25 @@ async def handle_ws_transfer_offer(state: WorkerState, websocket, task: dict) ->
             cached=cached,
             transfer_mbps=transfer_mbps,
         )
+        # Match public WS early-submit: report etag first, then PUT in background.
+        if (
+            success
+            and cached
+            and WORKER_PREDEFINED_ETAG_EARLY_SUBMIT
+            and put_ms <= 0
+            and uses_predefined_etag_early_submit(transfer_context)
+        ):
+            track_ws_task(
+                state,
+                _await_predefined_etag_background_transfer_task(
+                    state,
+                    task,
+                    str(task_id),
+                    str(offer_id),
+                    transfer_context,
+                    int(deadline_us or 0),
+                ),
+            )
         return success
     finally:
         release_ws_capacity(state, task_key, estimated_bytes, reserved_capacity)

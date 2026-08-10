@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Any, Optional
 from urllib.parse import urlsplit, urlunsplit
 
@@ -33,6 +34,35 @@ def short_id(value: Any, length: int = 16) -> str:
     if len(text) <= length:
         return text
     return f"{text[:length]}..."
+
+
+def format_ts_utc(ts: Optional[float]) -> str:
+    """Format unix seconds as UTC ISO-8601 with milliseconds."""
+    if ts is None:
+        return "-"
+    try:
+        value = float(ts)
+    except (TypeError, ValueError):
+        return "-"
+    if value <= 0:
+        return "-"
+    return (
+        datetime.fromtimestamp(value, tz=timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def queue_wait_ms(queued_at: Optional[float], started_at: Optional[float]) -> float:
+    """Milliseconds from enqueue to deliver/start (0 if either stamp missing)."""
+    try:
+        q = float(queued_at or 0.0)
+        s = float(started_at or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if q <= 0 or s <= 0 or s < q:
+        return 0.0
+    return (s - q) * 1000.0
 
 
 def redact_capability_url(url: Any) -> str:

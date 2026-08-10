@@ -19,7 +19,9 @@ from urllib.parse import urlsplit
 
 from core.relay_log import (
     chunk_id_from_transfer_context,
+    format_ts_utc,
     log_relay,
+    queue_wait_ms,
     short_id,
     transfer_context_range_label,
     transfer_context_urls,
@@ -402,6 +404,8 @@ class WorkerGateway:
         self._upstream: Optional[object] = None  # SubnetCoreClient ref
         self._outbound_send: Optional[Callable] = None
         self._transfer_result_handler: Optional[TransferResultHandler] = None
+        # Fired when a hidden worker connects or frees a slot (embedded_global queue).
+        self._hidden_capacity_handler: Optional[Callable[[], None]] = None
         self._result_forward_tasks: Dict[str, asyncio.Task] = {}
         self._terminal_result_acks: Dict[str, dict] = {}
         self._terminal_result_order = deque()
@@ -431,6 +435,19 @@ class WorkerGateway:
 
     def set_transfer_result_handler(self, handler: TransferResultHandler) -> None:
         self._transfer_result_handler = handler
+
+    def set_hidden_capacity_handler(self, handler: Optional[Callable[[], None]]) -> None:
+        """Notify when hidden workers gain capacity (connect / idle)."""
+        self._hidden_capacity_handler = handler
+
+    def _notify_hidden_capacity(self) -> None:
+        handler = self._hidden_capacity_handler
+        if handler is None:
+            return
+        try:
+            handler()
+        except Exception as exc:
+            logger.warning("hidden capacity handler failed: %s", exc)
 
     def set_outbound_sender(self, sender: Callable) -> None:
         """Send payloads to workers via global gateway (or other external transport)."""
@@ -1063,6 +1080,8 @@ class WorkerGateway:
         if was_empty and self._on_ready_change:
             self._on_ready_change(True)
         self._schedule_overflow_drain()
+        if profile.hidden:
+            self._notify_hidden_capacity()
         return True
 
     def note_worker_version(self, worker_id: str, worker_version: str) -> None:
@@ -1118,6 +1137,8 @@ class WorkerGateway:
             # Prefer giving the next queued offer to the worker that just freed.
             self._overflow_prefer_worker = worker_id
             self._schedule_overflow_drain()
+        if profile.hidden:
+            self._notify_hidden_capacity()
 
     def _block_worker_dispatch(self, worker_id: str, *, cooldown_s: float = 1.0) -> None:
         """Skip worker for dispatch after queue_full until cooldown or success."""
@@ -1180,6 +1201,7 @@ class WorkerGateway:
         self._pending_offers[offer_id] = payload
         self._offer_attempted_workers.setdefault(offer_id, set())
         self._remember_offer_context(payload)
+        self._stamp_offer_queued(offer_id)
         if not quiet:
             logger.info(
                 "_workers | queue_enqueue task=%s offer=%s pending=%d",
@@ -1393,7 +1415,13 @@ class WorkerGateway:
         offer_id = str(offer.get("offer_id") or offer.get("task_id") or "").strip()
         if not offer_id:
             return
-        ctx: dict = {}
+        # Preserve timing stamps across remember calls.
+        prev = self._offer_contexts.get(offer_id) or {}
+        ctx: dict = {
+            k: v
+            for k, v in prev.items()
+            if k in ("_queued_at", "_started_at", "_worker_id")
+        }
         source_url = offer.get("source_url")
         dest_url = offer.get("dest_url")
         if isinstance(source_url, str) and source_url.strip():
@@ -1426,8 +1454,27 @@ class WorkerGateway:
             while len(self._offer_contexts) > 5000:
                 self._offer_contexts.pop(next(iter(self._offer_contexts)), None)
 
+    def _stamp_offer_queued(self, offer_id: str) -> None:
+        oid = str(offer_id or "").strip()
+        if not oid:
+            return
+        ctx = self._offer_contexts.setdefault(oid, {})
+        if "_queued_at" not in ctx:
+            ctx["_queued_at"] = time.time()
+
+    def _stamp_offer_started(self, offer_id: str, worker_id: str) -> None:
+        oid = str(offer_id or "").strip()
+        if not oid:
+            return
+        ctx = self._offer_contexts.setdefault(oid, {})
+        now = time.time()
+        if "_queued_at" not in ctx:
+            ctx["_queued_at"] = now
+        ctx["_started_at"] = now
+        ctx["_worker_id"] = str(worker_id or "")
+
     def _log_external_task_result(self, worker_id: str, msg: dict) -> None:
-        """Log hash/etag for external worker completions (after upload)."""
+        """Log detailed task_done for external worker completions (after upload)."""
         task_id = msg.get("task_id")
         offer_id = str(msg.get("offer_id") or task_id or "")
         ctx = self._offer_contexts.pop(offer_id, {}) if offer_id else {}
@@ -1438,6 +1485,19 @@ class WorkerGateway:
         src, dest = transfer_context_urls(ctx) if ctx else ("-", "-")
         range_label = transfer_context_range_label(ctx) if ctx else "-"
         chunk_id = chunk_id_from_transfer_context(ctx) if ctx else None
+        completed_at = time.time()
+        started_at = ctx.get("_started_at")
+        queued_at = ctx.get("_queued_at")
+        wait_ms = queue_wait_ms(queued_at, started_at)
+        try:
+            exec_ms = (
+                (completed_at - float(started_at)) * 1000.0
+                if started_at
+                else 0.0
+            )
+        except (TypeError, ValueError):
+            exec_ms = 0.0
+        result_worker = str(ctx.get("_worker_id") or worker_id or "")
         if success:
             try:
                 load_ms = float(msg.get("load_ms") or 0.0)
@@ -1459,25 +1519,48 @@ class WorkerGateway:
                 send_ms = float(msg.get("send_ms") or 0.0)
             except (TypeError, ValueError):
                 send_ms = 0.0
+            try:
+                bytes_n = int(
+                    msg.get("bytes_transferred")
+                    or msg.get("bytes")
+                    or 0
+                )
+            except (TypeError, ValueError):
+                bytes_n = 0
+            try:
+                transfer_mbps = float(msg.get("transfer_mbps") or 0.0)
+            except (TypeError, ValueError):
+                transfer_mbps = 0.0
+            if transfer_mbps <= 0 and send_ms > 0 and bytes_n > 0:
+                transfer_mbps = (bytes_n * 8) / (send_ms * 1000.0)
             total_ms = load_ms + hash_ms + etag_ms + fetch_ms + send_ms
             cached_label = (
                 str(bool(cached)).lower() if cached is not None else "?"
             )
             path_label = str(msg.get("path") or "external")
             hash_source = str(msg.get("hash_source") or "-")
+            dest_group = dest_group_from_url(dest) if dest and dest != "-" else "-"
             logger.info(
-                "_workers | task_done task=%s offer=%s chunk_id=%s worker=%s "
-                "src=%s dest=%s range=%s hash=%s etag_real=%s "
-                "cached=%s path=%s hash_source=%s "
+                "_workers | task_done task=%s offer=%s chunk_id=%s worker_id=%s "
+                "started_at=%s completed_at=%s queue_wait_ms=%.0f exec_ms=%.1f "
+                "src=%s dest=%s dest_group=%s range=%s bytes=%d mbps=%.1f "
+                "hash=%s etag_real=%s cached=%s path=%s hash_source=%s "
                 "load_ms=%.1f hash_ms=%.1f etag_ms=%.1f fetch_ms=%.1f "
                 "send_ms=%.1f wall_ms=%.1f",
                 short_id(task_id),
                 short_id(offer_id),
                 chunk_id if chunk_id is not None else "?",
-                short_id(worker_id),
+                short_id(result_worker or worker_id),
+                format_ts_utc(started_at),
+                format_ts_utc(completed_at),
+                wait_ms,
+                exec_ms,
                 src,
                 dest,
+                dest_group,
                 range_label,
+                bytes_n,
+                transfer_mbps,
                 chunk_hash,
                 etag,
                 cached_label,
@@ -1492,11 +1575,11 @@ class WorkerGateway:
             )
         else:
             logger.warning(
-                "_workers | failed task=%s offer=%s worker=%s reason=%s "
-                "src=%s dest=%s range=%s hash=%s etag=%s",
+                "_workers | failed task=%s offer=%s worker_id=%s "
+                "reason=%s src=%s dest=%s range=%s hash=%s etag=%s",
                 short_id(task_id),
                 short_id(offer_id),
-                short_id(worker_id),
+                short_id(result_worker or worker_id),
                 msg.get("error") or "external_task_failed",
                 src,
                 dest,
@@ -1743,11 +1826,11 @@ class WorkerGateway:
                     await result
             self._remember_offer_context(offer)
             self._remember_pending_offer(worker_id, offer)
-            if mark_busy:
-                offer_id = offer.get("offer_id") or offer.get("task_id")
-                if offer_id:
-                    self.mark_worker_busy(worker_id, str(offer_id))
             offer_id = str(offer.get("offer_id") or offer.get("task_id") or "")
+            if mark_busy and offer_id:
+                self.mark_worker_busy(worker_id, offer_id)
+            if offer_id:
+                self._stamp_offer_started(offer_id, worker_id)
             task_id = str(offer.get("task_id") or "")
             ctx = self._offer_contexts.get(offer_id) or {}
             chunk_id = chunk_id_from_transfer_context(ctx) if ctx else None
@@ -1832,16 +1915,18 @@ class WorkerGateway:
             return False
         try:
             await ws.send_text(json.dumps({"type": "transfer_offer", **offer}))
-            offer_id = offer.get("offer_id") or offer.get("task_id")
+            offer_id = str(offer.get("offer_id") or offer.get("task_id") or "")
             task_id = offer.get("task_id") or offer_id
+            self._remember_offer_context(offer)
+            if offer_id:
+                self.mark_worker_busy(worker_id, offer_id)
+                self._stamp_offer_started(offer_id, worker_id)
             logger.info(
                 "deliver_transfer_offer: hidden_worker=%s task=%s offer=%s",
                 short_id(worker_id),
                 short_id(task_id),
                 short_id(offer_id),
             )
-            if offer_id:
-                self.mark_worker_busy(worker_id, str(offer_id))
             return True
         except Exception as exc:
             logger.warning("deliver_transfer_offer send failed for %s: %s", worker_id, exc)

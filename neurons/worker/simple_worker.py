@@ -8,7 +8,7 @@ Usage:
     python3 simple_worker.py --env-file config/workers/hidden1.env
     ./scripts/run-worker.sh hidden1 --foreground   # if env has WORKER_HIDDEN=true
 
-Orch submits BeamCore task_result under WORKER_1; this process only does work.
+Orch submits BeamCore task_result under WORKER_S; this process only does work.
 """
 
 from __future__ import annotations
