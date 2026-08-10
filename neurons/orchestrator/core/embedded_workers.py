@@ -49,13 +49,36 @@ def _stamp_ctx_queued(transfer_context: dict) -> None:
         transfer_context["_queued_at"] = time.time()
 
 
-def _stamp_ctx_started(transfer_context: dict, worker_id: str = "") -> None:
+def _stamp_ctx_started(
+    transfer_context: dict,
+    worker_id: str = "",
+    *,
+    ip_address: str = "",
+) -> None:
     now = time.time()
     if "_queued_at" not in transfer_context:
         transfer_context["_queued_at"] = now
     transfer_context["_started_at"] = now
     if worker_id:
         transfer_context["_worker_id"] = str(worker_id)
+    if ip_address:
+        transfer_context["_worker_ip"] = str(ip_address)
+
+
+def _gateway_worker_ip(gateway: Any, worker_id: str) -> str:
+    if not gateway or not worker_id:
+        return ""
+    if hasattr(gateway, "worker_ip"):
+        try:
+            return str(gateway.worker_ip(worker_id) or "").strip()
+        except Exception:
+            return ""
+    if hasattr(gateway, "_get_profile"):
+        try:
+            return str(gateway._get_profile(worker_id).ip or "").strip()
+        except Exception:
+            return ""
+    return ""
 
 
 def _log_embedded_task_offer(
@@ -67,6 +90,7 @@ def _log_embedded_task_offer(
     path: str,
     beamcore_worker_id: str = "",
     hidden_worker_id: str = "",
+    ip_address: str = "",
 ) -> None:
     # Short start log only; hash/etag land on task_done.
     chunk_id = chunk_id_from_transfer_context(transfer_context)
@@ -80,8 +104,10 @@ def _log_embedded_task_offer(
     ]
     if beamcore_worker_id:
         fields.append(f"beamcore_worker={short_id(beamcore_worker_id)}")
-    if hidden_worker_id:
-        fields.append(f"hidden_worker={short_id(hidden_worker_id)}")
+    if ip_address:
+        fields.append(f"ip_address={ip_address}")
+    elif hidden_worker_id:
+        fields.append(f"ip_address={short_id(hidden_worker_id)}")
     logger.info(" ".join(fields))
 
 
@@ -102,6 +128,7 @@ def _log_embedded_task_done(
     fetch_ms: float = 0.0,
     send_ms: float = 0.0,
     worker_id: str = "",
+    ip_address: str = "",
 ) -> None:
     chunk_id = chunk_id_from_transfer_context(transfer_context)
     src, dest = transfer_context_urls(transfer_context)
@@ -116,11 +143,14 @@ def _log_embedded_task_done(
         )
     except (TypeError, ValueError):
         exec_ms = 0.0
-    result_worker = str(
-        worker_id or transfer_context.get("_worker_id") or ""
+    ip_label = (
+        str(ip_address or "").strip()
+        or str(transfer_context.get("_worker_ip") or "").strip()
+        or short_id(str(worker_id or transfer_context.get("_worker_id") or ""))
+        or "-"
     )
     logger.info(
-        "%s task_done task=%s offer=%s chunk_id=%s worker_id=%s "
+        "%s task_done task=%s offer=%s chunk_id=%s ip_address=%s "
         "started_at=%s completed_at=%s queue_wait_ms=%.0f exec_ms=%.1f "
         "src=%s dest=%s range=%s hash=%s etag_real=%s etag_local=%s "
         "cached=%s path=%s hash_source=%s "
@@ -129,7 +159,7 @@ def _log_embedded_task_done(
         short_id(task_id),
         short_id(offer_id),
         chunk_id if chunk_id is not None else "?",
-        short_id(result_worker) if result_worker else "-",
+        ip_label,
         format_ts_utc(started_at),
         format_ts_utc(completed_at),
         wait_ms,
@@ -1395,10 +1425,11 @@ class EmbeddedWorkerPool:
                 delivered += 1
                 logger.info(
                     "_workers | simple_overflow_deliver task=%s offer=%s "
-                    "hidden_worker=%s pending=%d",
+                    "ip_address=%s pending=%d",
                     short_id(task_id),
                     short_id(offer_id),
-                    short_id(hidden_id),
+                    _gateway_worker_ip(self._hidden_worker_gateway, hidden_id)
+                    or short_id(hidden_id),
                     len(self._overflow),
                 )
                 continue
@@ -1738,19 +1769,18 @@ class EmbeddedWorkerPool:
         self._transfer_waiters[offer_id] = result_future
         if batch_assigned_workers is not None:
             batch_assigned_workers.add(hidden_worker_id)
-        hidden_ip = ""
-        if hasattr(gateway, "_get_profile"):
-            hidden_ip = gateway._get_profile(hidden_worker_id).ip.strip()
+        hidden_ip = _gateway_worker_ip(gateway, hidden_worker_id)
         if hidden_ip and batch_used_ips is not None:
             batch_used_ips.add(hidden_ip)
 
         logger.info(
-            "%s overflow_dispatch task=%s offer=%s beamcore_worker=%s hidden_worker=%s path=%s",
+            "%s overflow_dispatch task=%s offer=%s beamcore_worker=%s "
+            "ip_address=%s path=%s",
             _WORKERS_LOG,
             short_id(task_id),
             short_id(offer_id),
             short_id(beamcore_worker.worker_id),
-            short_id(hidden_worker_id),
+            hidden_ip or short_id(hidden_worker_id),
             path,
         )
 
@@ -1775,11 +1805,11 @@ class EmbeddedWorkerPool:
             ):
                 logger.warning(
                     "%s hidden_worker_dispatch_failed; re-queued task=%s offer=%s "
-                    "from=%s pending=%d",
+                    "ip_address=%s pending=%d",
                     _WORKERS_LOG,
                     short_id(task_id),
                     short_id(offer_id),
-                    short_id(hidden_worker_id),
+                    hidden_ip or short_id(hidden_worker_id),
                     len(self._overflow),
                 )
                 self._schedule_overflow_drain()
@@ -1794,7 +1824,9 @@ class EmbeddedWorkerPool:
             )
             return
 
-        _stamp_ctx_started(transfer_context, hidden_worker_id)
+        _stamp_ctx_started(
+            transfer_context, hidden_worker_id, ip_address=hidden_ip
+        )
 
         timeout = float(os.environ.get("WORKER_OVERFLOW_TRANSFER_TIMEOUT", "120"))
         try:
@@ -1847,8 +1879,14 @@ class EmbeddedWorkerPool:
                 cached=bool(cached),
                 fetch_ms=float(result_msg.get("fetch_ms") or 0.0),
                 send_ms=float(result_msg.get("put_ms") or result_msg.get("send_ms") or 0.0),
+                load_ms=float(result_msg.get("load_ms") or 0.0),
+                hash_ms=float(result_msg.get("hash_ms") or 0.0),
+                etag_ms=float(result_msg.get("etag_ms") or 0.0),
                 path=path,
+                hash_source=str(result_msg.get("hash_source") or ""),
                 worker_id=hidden_worker_id or "",
+                ip_address=str(transfer_context.get("_worker_ip") or "")
+                or _gateway_worker_ip(self._hidden_worker_gateway, hidden_worker_id or ""),
             )
             if chunk_hash and cached is not True:
                 transfer.maybe_store_predefined_etag_cache_on_success(

@@ -479,6 +479,12 @@ class WorkerGateway:
             self._profiles[worker_id] = profile
         return profile
 
+    def worker_ip(self, worker_id: str) -> str:
+        """Connected worker peer/public IP, or empty when unknown."""
+        if not worker_id:
+            return ""
+        return self._get_profile(worker_id).ip.strip()
+
     def _load_dest_worker_stats(self) -> None:
         """Load dest_group→worker Mbps history from JSON (or CSV seed)."""
         path = DEST_AFFINITY_STATS_PATH
@@ -1428,7 +1434,7 @@ class WorkerGateway:
         ctx: dict = {
             k: v
             for k, v in prev.items()
-            if k in ("_queued_at", "_started_at", "_worker_id")
+            if k in ("_queued_at", "_started_at", "_worker_id", "_worker_ip")
         }
         source_url = offer.get("source_url")
         dest_url = offer.get("dest_url")
@@ -1480,6 +1486,9 @@ class WorkerGateway:
             ctx["_queued_at"] = now
         ctx["_started_at"] = now
         ctx["_worker_id"] = str(worker_id or "")
+        ip = self.worker_ip(worker_id)
+        if ip:
+            ctx["_worker_ip"] = ip
 
     def _log_external_task_result(self, worker_id: str, msg: dict) -> None:
         """Log detailed task_done for external worker completions (after upload)."""
@@ -1505,7 +1514,12 @@ class WorkerGateway:
             )
         except (TypeError, ValueError):
             exec_ms = 0.0
-        result_worker = str(ctx.get("_worker_id") or worker_id or "")
+            result_worker = str(ctx.get("_worker_id") or worker_id or "")
+        ip_address = (
+            str(ctx.get("_worker_ip") or "").strip()
+            or self.worker_ip(result_worker or worker_id)
+            or "-"
+        )
         if success:
             try:
                 load_ms = float(msg.get("load_ms") or 0.0)
@@ -1549,7 +1563,7 @@ class WorkerGateway:
             hash_source = str(msg.get("hash_source") or "-")
             dest_group = dest_group_from_url(dest) if dest and dest != "-" else "-"
             logger.info(
-                "_workers | task_done task=%s offer=%s chunk_id=%s worker_id=%s "
+                "_workers | task_done task=%s offer=%s chunk_id=%s ip_address=%s "
                 "started_at=%s completed_at=%s queue_wait_ms=%.0f exec_ms=%.1f "
                 "src=%s dest=%s dest_group=%s range=%s bytes=%d mbps=%.1f "
                 "hash=%s etag_real=%s cached=%s path=%s hash_source=%s "
@@ -1558,7 +1572,7 @@ class WorkerGateway:
                 short_id(task_id),
                 short_id(offer_id),
                 chunk_id if chunk_id is not None else "?",
-                short_id(result_worker or worker_id),
+                ip_address,
                 format_ts_utc(started_at),
                 format_ts_utc(completed_at),
                 wait_ms,
@@ -1583,11 +1597,11 @@ class WorkerGateway:
             )
         else:
             logger.warning(
-                "_workers | failed task=%s offer=%s worker_id=%s "
+                "_workers | failed task=%s offer=%s ip_address=%s "
                 "reason=%s src=%s dest=%s range=%s hash=%s etag=%s",
                 short_id(task_id),
                 short_id(offer_id),
-                short_id(result_worker or worker_id),
+                ip_address,
                 msg.get("error") or "external_task_failed",
                 src,
                 dest,
@@ -1930,8 +1944,8 @@ class WorkerGateway:
                 self.mark_worker_busy(worker_id, offer_id)
                 self._stamp_offer_started(offer_id, worker_id)
             logger.info(
-                "deliver_transfer_offer: hidden_worker=%s task=%s offer=%s",
-                short_id(worker_id),
+                "deliver_transfer_offer: ip_address=%s task=%s offer=%s",
+                self.worker_ip(worker_id) or short_id(worker_id),
                 short_id(task_id),
                 short_id(offer_id),
             )

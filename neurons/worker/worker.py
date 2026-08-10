@@ -2136,7 +2136,7 @@ def load_predefined_etag_chunk_cache() -> None:
                 continue
             chunk_hash = str(item.get("chunk_hash") or "").strip()
             etag = str(item.get("etag") or PREDEFINED_ETAG).strip()
-            if chunk_hash:
+            if chunk_hash or etag:
                 _PREDEFINED_ETAG_CHUNK_CACHE[key] = PredefinedETagChunkCacheEntry(
                     chunk_hash=chunk_hash,
                     etag=etag,
@@ -2538,13 +2538,17 @@ def derive_predefined_etag_from_range_data(
 def resolve_predefined_etag_cache(
     transfer_context: dict,
 ) -> tuple[Optional[PredefinedETagChunkCacheEntry], Optional[str]]:
-    """Resolve hash/etag: env → derive from range_data bytes only."""
+    """Resolve hash/etag: env → JSON cache (no range_data re-hash)."""
     env_entry = get_predefined_etag_env_entry(transfer_context)
     if env_entry is not None:
         return env_entry, "env"
-    derived = derive_predefined_etag_from_range_data(transfer_context)
-    if derived is not None:
-        return derived, "range_data"
+    try:
+        key = predefined_etag_cache_key(transfer_context)
+    except (KeyError, TypeError, ValueError):
+        return None, None
+    cached = _PREDEFINED_ETAG_CHUNK_CACHE.get(key)
+    if cached is not None and (cached.chunk_hash or cached.etag):
+        return cached, "cache"
     return None, None
 
 
@@ -2573,14 +2577,18 @@ def store_predefined_etag_cache(
     """Persist hash/etag to JSON when a chunk was not cached and transfer succeeded."""
     if get_predefined_etag_env_entry(transfer_context) is not None:
         return False
-    if not chunk_hash:
+    resolved_etag = (etag or "").strip()
+    if not chunk_hash and not resolved_etag:
         return False
+    if not resolved_etag:
+        resolved_etag = PREDEFINED_ETAG
     key = predefined_etag_cache_key(transfer_context)
-    if key in _PREDEFINED_ETAG_CHUNK_CACHE:
+    existing = _PREDEFINED_ETAG_CHUNK_CACHE.get(key)
+    if existing is not None and existing.chunk_hash and existing.etag:
         return False
     _PREDEFINED_ETAG_CHUNK_CACHE[key] = PredefinedETagChunkCacheEntry(
-        chunk_hash=chunk_hash,
-        etag=etag or PREDEFINED_ETAG,
+        chunk_hash=chunk_hash or (existing.chunk_hash if existing else ""),
+        etag=resolved_etag,
     )
     save_predefined_etag_chunk_cache()
     if push_to_control_server:
@@ -2648,8 +2656,8 @@ def maybe_store_predefined_etag_cache_on_success(
     skip_reasons: list[str] = []
     if predefined_etag_known_source(transfer_context) is not None:
         skip_reasons.append("already_known")
-    if not chunk_hash:
-        skip_reasons.append("missing_chunk_hash")
+    if not chunk_hash and not etag:
+        skip_reasons.append("missing_chunk_hash_and_etag")
     if not predefined_etag_transfer_eligible(transfer_context):
         skip_reasons.append("not_eligible")
 
@@ -3126,13 +3134,94 @@ async def predefined_etag_submit_flow(
         etag_ms = 0.0
         load_ms = 0.0
         chunk_hash = ""
+        hash_source = ""
         expected = offer_expected_chunk_hash(offer)
 
-        if WORKER_VERIFY_CHUNK_HASH:
+        # Prefer stored hash/etag (env or JSON cache) — avoid re-hashing ~40MB.
+        stored = get_predefined_etag_env_entry(transfer_context)
+        if stored is not None:
+            hash_source = "env"
+        else:
+            cache_key = predefined_etag_cache_key(transfer_context)
+            stored = _PREDEFINED_ETAG_CHUNK_CACHE.get(cache_key)
+            if stored is not None:
+                hash_source = "cache"
+
+        if stored is not None:
+            chunk_hash = stored.chunk_hash or ""
+            if (
+                WORKER_VERIFY_CHUNK_HASH
+                and expected
+                and chunk_hash
+                and chunk_hash.lower() != expected.lower()
+            ):
+                return PredefinedETagSubmitOutcome(
+                    success=False,
+                    chunk_hash=chunk_hash,
+                    used_cache=True,
+                    error=(
+                        f"chunk hash mismatch: expected {expected}, got {chunk_hash}"
+                    ),
+                    load_ms=0.0,
+                    hash_ms=0.0,
+                    hash_source=hash_source,
+                )
+            if WORKER_PREDEFINED_ETAG_EARLY_SUBMIT:
+                await wait_predefined_etag_min_submit_delay(started_at, transfer_context)
+                return PredefinedETagSubmitOutcome(
+                    success=True,
+                    chunk_hash=chunk_hash,
+                    etag=stored.etag or PREDEFINED_ETAG,
+                    etag_local=stored.etag or PREDEFINED_ETAG,
+                    used_cache=True,
+                    hash_source=hash_source or "cache",
+                    load_ms=0.0,
+                    hash_ms=0.0,
+                    etag_ms=0.0,
+                    fetch_ms=0.0,
+                    send_ms=0.0,
+                )
+            ok, send_ms, etag_real, err = await stream_cache_upload_to_dest(
+                state,
+                transfer_context,
+                chunk_hash=chunk_hash,
+                task_id=task_id,
+                offer_id=offer_id,
+                log_prefix=log_prefix,
+            )
+            if not ok:
+                return PredefinedETagSubmitOutcome(
+                    success=False,
+                    chunk_hash=chunk_hash,
+                    used_cache=True,
+                    error=err or "cache_upload_failed",
+                    load_ms=0.0,
+                    hash_ms=0.0,
+                    hash_source=hash_source,
+                    send_ms=send_ms,
+                )
+            await wait_predefined_etag_min_submit_delay(started_at, transfer_context)
+            return PredefinedETagSubmitOutcome(
+                success=True,
+                chunk_hash=chunk_hash,
+                etag=etag_real,
+                etag_local=None,
+                used_cache=True,
+                hash_source=hash_source or "response_etag",
+                load_ms=0.0,
+                hash_ms=0.0,
+                etag_ms=0.0,
+                fetch_ms=0.0,
+                send_ms=send_ms,
+            )
+
+        # No stored metadata: only sha256 when there is an expected hash to verify.
+        if WORKER_VERIFY_CHUNK_HASH and expected:
             hash_started = time.perf_counter()
             chunk_hash = await _hash_cache_stream(transfer_context, algo="sha256")
             hash_ms = (time.perf_counter() - hash_started) * 1000
-            if expected and chunk_hash.lower() != expected.lower():
+            hash_source = "computed"
+            if chunk_hash.lower() != expected.lower():
                 return PredefinedETagSubmitOutcome(
                     success=False,
                     chunk_hash=chunk_hash,
@@ -3142,6 +3231,7 @@ async def predefined_etag_submit_flow(
                     ),
                     load_ms=0.0,
                     hash_ms=hash_ms,
+                    hash_source=hash_source,
                 )
 
         if WORKER_PREDEFINED_ETAG_EARLY_SUBMIT:
@@ -3156,7 +3246,7 @@ async def predefined_etag_submit_flow(
                 etag=etag_local,
                 etag_local=etag_local,
                 used_cache=True,
-                hash_source="range_data",
+                hash_source=hash_source or "range_data",
                 load_ms=0.0,
                 hash_ms=hash_ms,
                 etag_ms=etag_ms,
@@ -3181,6 +3271,7 @@ async def predefined_etag_submit_flow(
                 error=err or "cache_upload_failed",
                 load_ms=0.0,
                 hash_ms=hash_ms,
+                hash_source=hash_source,
                 send_ms=send_ms,
             )
         await wait_predefined_etag_min_submit_delay(started_at, transfer_context)
@@ -3190,7 +3281,7 @@ async def predefined_etag_submit_flow(
             etag=etag_real,
             etag_local=None,
             used_cache=True,
-            hash_source="response_etag",
+            hash_source=hash_source or "response_etag",
             load_ms=0.0,
             hash_ms=hash_ms,
             etag_ms=0.0,
@@ -4251,8 +4342,13 @@ async def ws_send_transfer_result(
     error: Optional[str] = None,
     fetch_ms: float = 0.0,
     put_ms: float = 0.0,
+    load_ms: float = 0.0,
+    hash_ms: float = 0.0,
+    etag_ms: float = 0.0,
     cached: Optional[bool] = None,
     transfer_mbps: float = 0.0,
+    path: str = "",
+    hash_source: str = "",
 ) -> bool:
     """Send transfer-only completion (hidden worker; no BeamCore task_result)."""
     try:
@@ -4271,6 +4367,12 @@ async def ws_send_transfer_result(
             msg["etag"] = etag
         if error:
             msg["error"] = error
+        if load_ms > 0:
+            msg["load_ms"] = round(load_ms, 1)
+        if hash_ms > 0:
+            msg["hash_ms"] = round(hash_ms, 1)
+        if etag_ms > 0:
+            msg["etag_ms"] = round(etag_ms, 1)
         if fetch_ms > 0:
             msg["fetch_ms"] = round(fetch_ms, 1)
         if put_ms > 0:
@@ -4278,6 +4380,10 @@ async def ws_send_transfer_result(
             msg["send_ms"] = round(put_ms, 1)
         if cached is not None:
             msg["cached"] = cached
+        if path:
+            msg["path"] = path
+        if hash_source:
+            msg["hash_source"] = hash_source
         await ws_send_json(websocket, state, msg)
         logging.getLogger("worker").info(
             "[Worker] [WS] transfer_result sent task=%s offer=%s success=%s",
@@ -4804,7 +4910,22 @@ async def handle_ws_transfer_offer(state: WorkerState, websocket, task: dict) ->
             )
             fetch_ms = outcome.fetch_ms
             put_ms = outcome.send_ms
+            load_ms = outcome.load_ms
+            hash_ms = outcome.hash_ms
+            etag_ms = getattr(outcome, "etag_ms", 0.0) or 0.0
+            hash_source = outcome.hash_source
             cached = outcome.used_cache
+            # Persist computed hash/etag so the next cache hit skips re-hash.
+            if success and (chunk_hash or etag):
+                store_predefined_etag_cache(
+                    transfer_context,
+                    chunk_hash or "",
+                    etag,
+                    log_prefix="[Hidden]",
+                    task_id=str(task_id),
+                    offer_id=str(offer_id),
+                    push_to_control_server=False,
+                )
         else:
             result = await execute_task_with_metrics(
                 state,
@@ -4821,6 +4942,10 @@ async def handle_ws_transfer_offer(state: WorkerState, websocket, task: dict) ->
             bytes_transferred = result.bytes_transferred
             fetch_ms = result.fetch_ms
             put_ms = result.send_ms
+            load_ms = 0.0
+            hash_ms = 0.0
+            etag_ms = 0.0
+            hash_source = ""
             cached = False
             if success and chunk_hash:
                 maybe_store_predefined_etag_cache_on_success(
@@ -4837,6 +4962,11 @@ async def handle_ws_transfer_offer(state: WorkerState, websocket, task: dict) ->
         if put_ms > 0 and bytes_transferred > 0:
             transfer_mbps = (bytes_transferred * 8) / (put_ms * 1000)
 
+        path_label = resolve_task_path(
+            transfer_context,
+            used_cache=bool(cached),
+            send_ms=put_ms,
+        )
         await ws_send_transfer_result(
             websocket,
             state,
@@ -4849,8 +4979,13 @@ async def handle_ws_transfer_offer(state: WorkerState, websocket, task: dict) ->
             error=error,
             fetch_ms=fetch_ms,
             put_ms=put_ms,
+            load_ms=load_ms,
+            hash_ms=hash_ms,
+            etag_ms=etag_ms,
             cached=cached,
             transfer_mbps=transfer_mbps,
+            path=path_label,
+            hash_source=hash_source,
         )
         # Match public WS early-submit: report etag first, then PUT in background.
         if (
