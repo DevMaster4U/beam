@@ -1,0 +1,31 @@
+[Unit]
+Description=BEAM Worker (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@BEAM_USER@
+Group=@BEAM_GROUP@
+WorkingDirectory=@BEAM_ROOT@/neurons/worker
+Environment="PATH=@BEAM_VENV@/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONPATH=@BEAM_ROOT@"
+Environment="LOG_DIR=@BEAM_ROOT@/logs"
+Environment="PYTHONUNBUFFERED=1"
+EnvironmentFile=-@BEAM_ROOT@/.env
+EnvironmentFile=-@BEAM_ROOT@/config/workers/%i.env
+# Fix root-owned logs/cache left by `sudo … --foreground` (ubuntu cannot write otherwise).
+ExecStartPre=+/bin/mkdir -p @BEAM_ROOT@/logs/workers/predefined_etag_range_data/.tmp @BEAM_ROOT@/logs/workers/predefined_etag_chunk_data
+ExecStartPre=+/bin/chown -R @BEAM_USER@:@BEAM_GROUP@ @BEAM_ROOT@/logs/workers
+# run-worker.sh picks simple_worker.py when WORKER_HIDDEN=true, else worker.py.
+ExecStart=@BEAM_ROOT@/scripts/run-worker.sh %i --foreground
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+
+# Application logs go to ${LOG_DIR}/workers/%i.log.
+StandardOutput=null
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

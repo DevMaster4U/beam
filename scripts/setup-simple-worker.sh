@@ -1,28 +1,22 @@
 #!/usr/bin/env bash
-# Bootstrap a simple/hidden worker (transfer + cache only; no bittensor).
+# Setup a simple/hidden worker in an existing checkout (transfer + cache only).
 #
-# Fresh EC2 example:
-#   curl -fsSL https://raw.githubusercontent.com/DevMaster4U/beam/simple-worker/scripts/setup-simple-worker.sh \
-#     | bash -s -- \
-#         --server ec2 \
-#         --source https://github.com/DevMaster4U/beam.git \
-#         --gateway ws://3.21.114.106:8020 \
-#         --control-server ws://88.216.195.66:8010/ws/miners \
-#         --miner_id worker_h1 \
-#         --worker_instance worker_h1
-#
-# Or from an existing checkout:
+# Download/checkout the repo first, then run from the tree:
+#   git clone -b simple-worker https://github.com/DevMaster4U/beam.git ~/sn105
+#   cd ~/sn105
 #   ./scripts/setup-simple-worker.sh --server ec2 \
-#       --gateway http://ORCH:9007 \
-#       --control-server ws://CONTROL:8010/ws/miners \
-#       --worker_instance worker_h1
+#       --gateway ws://3.21.114.106:8020 \
+#       --control-server ws://88.216.195.66:8010/ws/miners \
+#       --miner_id worker_h1 \
+#       --worker_instance worker_h1 \
+#       --start
 #
-# Defaults: clone to ~/sn105 on branch simple-worker; secrets wgs / css
+# Defaults: --gateway-secret wgs, --control-secret css
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
 SERVER="ec2"
-SOURCE=""
-INSTALL_DIR=""
 GATEWAY=""
 GATEWAY_SECRET="wgs"
 CONTROL_SERVER=""
@@ -32,17 +26,14 @@ WORKER_INSTANCE=""
 START=0
 FOREGROUND=0
 INSTALL_SYSTEMD=1
-BRANCH="simple-worker"
-DEFAULT_DIR_NAME="sn105"
 
 usage() {
   cat <<EOF
 Usage: $0 [options]
 
+Run from a downloaded beam/sn105 checkout (this script does not clone).
+
   --server TYPE              Host profile: ec2 | local  (default: ec2)
-  --source URL               Git repo to clone when not already in a checkout
-  --dir PATH                 Clone/install directory (default: ~/${DEFAULT_DIR_NAME})
-  --branch NAME              Git branch (default: simple-worker)
   --gateway URL              Orch worker gateway (http:// or ws:// host:port)
   --gateway-secret SECRET    WORKER_GATEWAY_SECRET (default: wgs)
   --control-server URL       Control-server WS (ws://host:8010/ws/miners)
@@ -55,8 +46,9 @@ Usage: $0 [options]
   -h, --help                 Show this help
 
 Example:
+  git clone -b simple-worker https://github.com/DevMaster4U/beam.git ~/sn105
+  cd ~/sn105
   $0 --server ec2 \\
-      --source https://github.com/DevMaster4U/beam.git \\
       --gateway ws://3.21.114.106:8020 \\
       --control-server ws://88.216.195.66:8010/ws/miners \\
       --miner_id worker_h1 \\
@@ -71,12 +63,6 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --server)
       SERVER="${2:-}"; shift 2 ;;
-    --source)
-      SOURCE="${2:-}"; shift 2 ;;
-    --dir)
-      INSTALL_DIR="${2:-}"; shift 2 ;;
-    --branch)
-      BRANCH="${2:-}"; shift 2 ;;
     --gateway)
       GATEWAY="${2:-}"; shift 2 ;;
     --gateway-secret|--gateway_secret)
@@ -95,6 +81,10 @@ while [[ $# -gt 0 ]]; do
       FOREGROUND=1; shift ;;
     --no-systemd)
       INSTALL_SYSTEMD=0; shift ;;
+    # Removed; keep friendly errors if old flags are passed.
+    --source|--dir|--branch)
+      die "$1 removed: clone/checkout the repo yourself first, then re-run this script"
+      ;;
     -h|--help)
       usage; exit 0 ;;
     *)
@@ -113,6 +103,9 @@ case "$SERVER" in
   *) die "--server must be ec2 or local" ;;
 esac
 
+[[ -f "${ROOT}/neurons/worker/simple_worker.py" ]] \
+  || die "missing neurons/worker/simple_worker.py under ${ROOT} (download the repo first)"
+
 # Normalize gateway to http(s) origin for WORKER_GATEWAY_URL.
 normalize_gateway() {
   local url="$1"
@@ -121,7 +114,6 @@ normalize_gateway() {
     ws://*) url="http://${url#ws://}" ;;
     wss://*) url="https://${url#wss://}" ;;
   esac
-  # Drop accidental /ws/... path; worker appends /ws/{id}.
   url="${url%%/ws*}"
   printf '%s' "$url"
 }
@@ -143,36 +135,6 @@ normalize_control() {
 GATEWAY_URL="$(normalize_gateway "$GATEWAY")"
 CONTROL_WS="$(normalize_control "$CONTROL_SERVER")"
 
-resolve_root() {
-  local here script_root
-  if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
-    script_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-    if [[ -f "${script_root}/neurons/worker/simple_worker.py" ]]; then
-      printf '%s' "$script_root"
-      return 0
-    fi
-  fi
-  return 1
-}
-
-clone_or_update() {
-  local dest="$1"
-  if [[ -d "${dest}/.git" ]]; then
-    echo "Updating existing checkout: ${dest}"
-    git -C "$dest" fetch --depth 1 origin "$BRANCH" || true
-    git -C "$dest" checkout "$BRANCH" || true
-    git -C "$dest" pull --ff-only origin "$BRANCH" || true
-    return 0
-  fi
-  [[ -n "$SOURCE" ]] || die "not in a beam checkout; pass --source <git-url>"
-  echo "Cloning ${SOURCE} -> ${dest} (branch=${BRANCH})"
-  mkdir -p "$(dirname "$dest")"
-  if [[ -d "$dest" ]] && [[ -z "$(ls -A "$dest" 2>/dev/null || true)" ]]; then
-    rmdir "$dest" 2>/dev/null || true
-  fi
-  git clone --branch "$BRANCH" --depth 1 "$SOURCE" "$dest"
-}
-
 install_os_packages() {
   if [[ "$SERVER" != "ec2" ]]; then
     echo "Skipping OS packages (--server local)"
@@ -182,27 +144,25 @@ install_os_packages() {
   echo "Installing OS packages..."
   sudo apt-get update
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    python3 python3-venv python3-pip git curl
+    python3 python3-venv python3-pip curl
 }
 
 setup_venv() {
-  local root="$1"
-  local venv="${root}/.venv"
-  if [[ -x "${root}/venv/bin/python" ]]; then
-    venv="${root}/venv"
+  local venv="${ROOT}/.venv"
+  if [[ -x "${ROOT}/venv/bin/python" ]]; then
+    venv="${ROOT}/venv"
   elif [[ ! -x "${venv}/bin/python" ]]; then
     echo "Creating virtualenv at ${venv}..."
     python3 -m venv "$venv"
   fi
   echo "Installing simple-worker deps..."
   "${venv}/bin/pip" install -U pip
-  "${venv}/bin/pip" install -r "${root}/neurons/worker/requirements-simple.txt"
+  "${venv}/bin/pip" install -r "${ROOT}/neurons/worker/requirements-simple.txt"
 }
 
 write_env() {
-  local root="$1"
-  local env_file="${root}/config/workers/${WORKER_INSTANCE}.env"
-  mkdir -p "${root}/config/workers" "${root}/logs/workers"
+  local env_file="${ROOT}/config/workers/${WORKER_INSTANCE}.env"
+  mkdir -p "${ROOT}/config/workers" "${ROOT}/logs/workers"
   cat >"$env_file" <<EOF
 # Generated by scripts/setup-simple-worker.sh
 WORKER_HIDDEN=true
@@ -221,6 +181,7 @@ EOF
 }
 
 echo "=== BEAM simple-worker setup ==="
+echo "  repo:            ${ROOT}"
 echo "  server:          ${SERVER}"
 echo "  gateway:         ${GATEWAY_URL}"
 echo "  control:         ${CONTROL_WS}"
@@ -229,27 +190,8 @@ echo "  miner_id:        ${MINER_ID}"
 echo
 
 install_os_packages
-
-ROOT=""
-if ROOT="$(resolve_root)"; then
-  echo "Using existing checkout: ${ROOT}"
-  if git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    echo "Checking out branch: ${BRANCH}"
-    git -C "$ROOT" fetch --depth 1 origin "$BRANCH" || true
-    git -C "$ROOT" checkout "$BRANCH" || die "failed to checkout ${BRANCH}"
-    git -C "$ROOT" pull --ff-only origin "$BRANCH" || true
-  fi
-else
-  INSTALL_DIR="${INSTALL_DIR:-${HOME}/${DEFAULT_DIR_NAME}}"
-  clone_or_update "$INSTALL_DIR"
-  ROOT="$INSTALL_DIR"
-fi
-
-[[ -f "${ROOT}/neurons/worker/simple_worker.py" ]] \
-  || die "missing neurons/worker/simple_worker.py under ${ROOT}"
-
-setup_venv "$ROOT"
-write_env "$ROOT"
+setup_venv
+write_env
 
 if [[ "$INSTALL_SYSTEMD" -eq 1 ]]; then
   if [[ -x "${ROOT}/scripts/install-systemd.sh" ]]; then
@@ -265,8 +207,7 @@ fi
 
 echo
 echo "Setup complete."
-echo "  repo: ${ROOT}"
-echo "  env:  ${ROOT}/config/workers/${WORKER_INSTANCE}.env"
+echo "  env: ${ROOT}/config/workers/${WORKER_INSTANCE}.env"
 echo
 
 if [[ "$FOREGROUND" -eq 1 ]]; then
