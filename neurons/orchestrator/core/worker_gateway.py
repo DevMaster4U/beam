@@ -90,16 +90,9 @@ try:
 except ValueError:
     OVERFLOW_BUSY_MAX_PER_WORKER = 5
 
-# Prefer free workers that historically upload faster to this dest_group
-# (R2 host / destinations/<group>/…). Off by default: live waves showed
-# stale EMA + post-hoc penalties often miss contention; use free-worker RR.
-DEST_AFFINITY_ENABLED = _env_bool("ORCH_DEST_AFFINITY", False)
-try:
-    DEST_AFFINITY_EMA = min(
-        1.0, max(0.05, float(os.environ.get("ORCH_DEST_AFFINITY_EMA", "0.35")))
-    )
-except ValueError:
-    DEST_AFFINITY_EMA = 0.35
+# Prefer free workers with the highest average Mbps for this dest_group
+# (R2 host / destinations/<group>/…). Stats: running avg per (dest, worker).
+DEST_AFFINITY_ENABLED = _env_bool("ORCH_DEST_AFFINITY", True)
 try:
     DEST_AFFINITY_MIN_SAMPLES = max(
         1, int(os.environ.get("ORCH_DEST_AFFINITY_MIN_SAMPLES", "1"))
@@ -136,41 +129,6 @@ try:
     )
 except ValueError:
     DEST_AFFINITY_SAVE_INTERVAL_S = 10.0
-# Soft-ban workers that are slow on a dest bucket so select/makespan hop away.
-# Absolute floor (0=off) and/or relative to best EMA in that bucket (0=off).
-try:
-    DEST_PENALTY_MBPS = max(
-        0.0, float(os.environ.get("ORCH_DEST_PENALTY_MBPS", "150"))
-    )
-except ValueError:
-    DEST_PENALTY_MBPS = 150.0
-try:
-    DEST_PENALTY_REL = min(
-        1.0, max(0.0, float(os.environ.get("ORCH_DEST_PENALTY_REL", "0.65")))
-    )
-except ValueError:
-    DEST_PENALTY_REL = 0.65
-try:
-    DEST_PENALTY_S = max(
-        0.0, float(os.environ.get("ORCH_DEST_PENALTY_S", "900"))
-    )
-except ValueError:
-    DEST_PENALTY_S = 900.0
-# Fallback effective Mbps only when forcing a penalty with no sample
-# (e.g. slow_net_wait abort). Normal penalties use the observed sample Mbps.
-try:
-    DEST_PENALTY_FALLBACK_MBPS = max(
-        1.0, float(os.environ.get("ORCH_DEST_PENALTY_FALLBACK_MBPS", "8"))
-    )
-except ValueError:
-    DEST_PENALTY_FALLBACK_MBPS = 8.0
-# Compat alias
-DEST_PENALTY_EFF_MBPS = DEST_PENALTY_FALLBACK_MBPS
-# Batch-assign free workers↔offers to minimize expected last completion
-# (makespan), not greedy max-Mbps per offer. Binary-search + matching.
-# Requires ORCH_DEST_AFFINITY=true; default off → round-robin drain.
-DEST_AFFINITY_MAKESPAN = _env_bool("ORCH_DEST_AFFINITY_MAKESPAN", False)
-_DEFAULT_OFFER_BYTES = 64.0 * 1024 * 1024
 
 
 def dest_group_from_url(dest_url: object) -> str:
@@ -260,116 +218,6 @@ def transfer_mbps_from_result(msg: dict) -> Optional[float]:
     return (nbytes * 8.0) / (send_ms / 1000.0) / 1_000_000.0
 
 
-def offer_byte_size(offer: dict) -> float:
-    """Best-effort payload size from range fields / Range header."""
-    if not isinstance(offer, dict):
-        return _DEFAULT_OFFER_BYTES
-    start = offer.get("range_start")
-    end = offer.get("range_end")
-    if start is None or end is None:
-        headers = offer.get("source_headers") or {}
-        if isinstance(headers, dict):
-            range_hdr = str(headers.get("Range") or headers.get("range") or "")
-            if range_hdr.lower().startswith("bytes="):
-                try:
-                    start_s, end_s = range_hdr.split("=", 1)[1].split("-", 1)
-                    start = int(start_s)
-                    end = int(end_s)
-                except (TypeError, ValueError):
-                    start, end = None, None
-    try:
-        if start is not None and end is not None:
-            size = float(int(end) - int(start) + 1)
-            if size > 0:
-                return size
-    except (TypeError, ValueError):
-        pass
-    return _DEFAULT_OFFER_BYTES
-
-
-def expected_transfer_seconds(nbytes: float, mbps: float) -> float:
-    """Wall seconds for nbytes at mbps (megabits/sec)."""
-    rate = max(float(mbps), 1.0)
-    return (max(float(nbytes), 1.0) * 8.0) / (rate * 1_000_000.0)
-
-
-def min_makespan_assignment(
-    costs: list[list[float]],
-) -> tuple[list[int], float]:
-    """Assign each task to a distinct worker minimizing max cost (makespan).
-
-    ``costs[t][w]`` = expected seconds. Returns (task→worker index, makespan).
-    Requires ``len(tasks) <= len(workers)``. Hungarian minimizes sum; this is the
-    bottleneck/makespan analogue (binary search + bipartite matching).
-    """
-    n_tasks = len(costs)
-    if n_tasks == 0:
-        return [], 0.0
-    n_workers = len(costs[0]) if costs else 0
-    if n_workers < n_tasks:
-        raise ValueError("min_makespan_assignment needs workers >= tasks")
-
-    thresholds = sorted({float(c) for row in costs for c in row})
-    if not thresholds:
-        return [-1] * n_tasks, 0.0
-
-    def _matching(limit: float) -> Optional[list[int]]:
-        match_w = [-1] * n_workers
-
-        def dfs(task: int, seen: list[bool]) -> bool:
-            for w in range(n_workers):
-                if costs[task][w] > limit or seen[w]:
-                    continue
-                seen[w] = True
-                if match_w[w] < 0 or dfs(match_w[w], seen):
-                    match_w[w] = task
-                    return True
-            return False
-
-        for t in range(n_tasks):
-            if not dfs(t, [False] * n_workers):
-                return None
-        assign = [-1] * n_tasks
-        for w, t in enumerate(match_w):
-            if t >= 0:
-                assign[t] = w
-        return assign
-
-    best_assign: Optional[list[int]] = None
-    best_t = thresholds[-1]
-    lo, hi = 0, len(thresholds) - 1
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        limit = thresholds[mid]
-        assign = _matching(limit)
-        if assign is not None:
-            best_assign = assign
-            best_t = limit
-            hi = mid - 1
-        else:
-            lo = mid + 1
-
-    if best_assign is None:
-        # Should not happen if finite costs; fall back to greedy by row min.
-        best_assign = []
-        used: set[int] = set()
-        makespan = 0.0
-        for t in range(n_tasks):
-            order = sorted(range(n_workers), key=lambda w: costs[t][w])
-            pick = next((w for w in order if w not in used), -1)
-            best_assign.append(pick)
-            if pick >= 0:
-                used.add(pick)
-                makespan = max(makespan, costs[t][pick])
-        return best_assign, makespan
-
-    makespan = 0.0
-    for t, w in enumerate(best_assign):
-        if w >= 0:
-            makespan = max(makespan, costs[t][w])
-    return best_assign, makespan
-
-
 @dataclass
 class _WorkerProfile:
     worker_id: str
@@ -450,7 +298,7 @@ class WorkerGateway:
         # Workers that recently returned queue_full — skip until success or cooldown.
         self._dispatch_blocked: Set[str] = set()
         self._dispatch_unblock_tasks: Dict[str, asyncio.Task] = {}
-        # dest_group → worker_id → {ema, n, updated_at}
+        # dest_group → worker_id → {avg_mbps, n, updated_at}
         self._dest_worker_stats: Dict[str, Dict[str, dict]] = {}
         self._dest_stats_dirty = False
         self._dest_stats_last_save = 0.0
@@ -539,18 +387,16 @@ class WorkerGateway:
                 if not wid:
                     continue
                 try:
-                    ema = float(entry.get("ema") or entry.get("avg_mbps") or 0.0)
+                    avg = float(entry.get("avg_mbps") or entry.get("ema") or 0.0)
                     n = int(entry.get("n") or 0)
                 except (TypeError, ValueError):
                     continue
-                if ema <= 0 or n <= 0:
+                if avg <= 0 or n <= 0:
                     continue
                 bucket[wid] = {
-                    "ema": ema,
+                    "avg_mbps": avg,
                     "n": n,
                     "updated_at": float(entry.get("updated_at") or 0.0),
-                    "penalty_until": float(entry.get("penalty_until") or 0.0),
-                    "penalty_mbps": float(entry.get("penalty_mbps") or 0.0),
                 }
                 loaded += 1
         return loaded
@@ -579,13 +425,13 @@ class WorkerGateway:
                 continue
             try:
                 n = int(float(n_s))
-                ema = float(avg_s)
+                avg = float(avg_s)
             except (TypeError, ValueError):
                 continue
-            if n <= 0 or ema <= 0:
+            if n <= 0 or avg <= 0:
                 continue
             bucket = self._dest_worker_stats.setdefault(group, {})
-            bucket[wid] = {"ema": ema, "n": n, "updated_at": 0.0}
+            bucket[wid] = {"avg_mbps": avg, "n": n, "updated_at": 0.0}
             loaded += 1
         return loaded
 
@@ -683,7 +529,7 @@ class WorkerGateway:
         rows = sum(len(v) for v in self._dest_worker_stats.values())
         return {
             "enabled": DEST_AFFINITY_ENABLED,
-            "makespan": DEST_AFFINITY_MAKESPAN,
+            "mode": "fastest_avg_mbps",
             "stats_path": str(DEST_AFFINITY_STATS_PATH) if DEST_AFFINITY_STATS_PATH else None,
             "seed_csv": str(DEST_AFFINITY_SEED_CSV) if DEST_AFFINITY_SEED_CSV else None,
             "dest_groups": len(self._dest_worker_stats),
@@ -693,7 +539,7 @@ class WorkerGateway:
     def clear_dest_worker_stats(self, *, reason: str = "api") -> dict:
         """Drop in-memory dest affinity + delete JSON file; do not re-seed from CSV.
 
-        Restart alone does not clear affinity — EMA/penalties reload from
+        Restart alone does not clear affinity — averages reload from
         ``ORCH_DEST_AFFINITY_STATS_PATH`` (and optional seed CSV).
         """
         before = self.dest_affinity_stats_summary()
@@ -732,7 +578,7 @@ class WorkerGateway:
         worker_id: str,
         transfer_mbps: Optional[float],
     ) -> None:
-        """Update EMA Mbps for (dest_group, worker) after a successful upload."""
+        """Update running average Mbps for (dest_group, worker)."""
         if not DEST_AFFINITY_ENABLED:
             return
         group = str(dest_group or "").strip()
@@ -749,160 +595,22 @@ class WorkerGateway:
         bucket = self._dest_worker_stats.setdefault(group, {})
         entry = bucket.get(wid)
         if entry is None:
-            entry = {"ema": mbps, "n": 1, "updated_at": time.time()}
-            bucket[wid] = entry
+            bucket[wid] = {"avg_mbps": mbps, "n": 1, "updated_at": time.time()}
         else:
-            prev = float(entry.get("ema") or mbps)
-            n = int(entry.get("n") or 0) + 1
-            entry["ema"] = (DEST_AFFINITY_EMA * mbps) + ((1.0 - DEST_AFFINITY_EMA) * prev)
-            entry["n"] = n
+            prev = float(entry.get("avg_mbps") or entry.get("ema") or mbps)
+            n = int(entry.get("n") or 0)
+            n_next = n + 1
+            entry["avg_mbps"] = ((prev * n) + mbps) / n_next
+            entry["n"] = n_next
+            entry.pop("ema", None)
+            entry.pop("penalty_until", None)
+            entry.pop("penalty_mbps", None)
             entry["updated_at"] = time.time()
-        self._maybe_apply_dest_penalty(group, wid, entry, mbps)
         self._dest_stats_dirty = True
         self._maybe_save_dest_worker_stats()
-
-    def _bucket_best_ema(self, dest_group: str) -> float:
-        bucket = self._dest_worker_stats.get(dest_group) or {}
-        best = 0.0
-        for entry in bucket.values():
-            if not isinstance(entry, dict):
-                continue
-            try:
-                ema = float(entry.get("ema") or 0.0)
-            except (TypeError, ValueError):
-                continue
-            if ema > best:
-                best = ema
-        return best
-
-    def _should_penalize_mbps(self, mbps: float, best_ema: float) -> bool:
-        if DEST_PENALTY_S <= 0:
-            return False
-        if DEST_PENALTY_MBPS > 0 and mbps < DEST_PENALTY_MBPS:
-            return True
-        if (
-            DEST_PENALTY_REL > 0
-            and best_ema > 0
-            and mbps < (best_ema * DEST_PENALTY_REL)
-        ):
-            return True
-        return False
-
-    def _maybe_apply_dest_penalty(
-        self,
-        dest_group: str,
-        worker_id: str,
-        entry: dict,
-        sample_mbps: float,
-    ) -> None:
-        """Soft-ban slow workers on this bucket using the observed sample Mbps."""
-        if DEST_PENALTY_S <= 0:
-            return
-        best = self._bucket_best_ema(dest_group)
-        now = time.time()
-        if self._should_penalize_mbps(sample_mbps, best):
-            until = now + DEST_PENALTY_S
-            prev_until = float(entry.get("penalty_until") or 0.0)
-            entry["penalty_until"] = max(prev_until, until)
-            # Penalty strength = observed Mbps (keep the slower sample if already set).
-            prev_pen = float(entry.get("penalty_mbps") or 0.0)
-            if prev_pen > 0 and prev_until > now:
-                entry["penalty_mbps"] = min(prev_pen, float(sample_mbps))
-            else:
-                entry["penalty_mbps"] = float(sample_mbps)
-            logger.info(
-                "dest penalty apply dest=%s worker=%s mbps=%.1f best=%.1f "
-                "until_in=%.0fs penalty_mbps=%.1f",
-                dest_group,
-                short_id(worker_id),
-                sample_mbps,
-                best,
-                entry["penalty_until"] - now,
-                entry["penalty_mbps"],
-            )
-        elif float(entry.get("penalty_until") or 0.0) > now:
-            # Fast sample clears an active penalty for this bucket.
-            entry["penalty_until"] = 0.0
-            entry["penalty_mbps"] = 0.0
-            logger.info(
-                "dest penalty clear dest=%s worker=%s mbps=%.1f best=%.1f",
-                dest_group,
-                short_id(worker_id),
-                sample_mbps,
-                best,
-            )
-
-    def penalize_dest_worker(
-        self,
-        dest_group: str,
-        worker_id: str,
-        *,
-        reason: str = "",
-        sample_mbps: Optional[float] = None,
-    ) -> None:
-        """Force a soft-ban for (dest_group, worker) — e.g. slow_net_wait abort."""
-        if not DEST_AFFINITY_ENABLED or DEST_PENALTY_S <= 0:
-            return
-        group = str(dest_group or "").strip()
-        wid = str(worker_id or "").strip()
-        if not group or not wid:
-            return
-        self._remap_dest_stats_worker_id(wid)
-        bucket = self._dest_worker_stats.setdefault(group, {})
-        mbps = (
-            float(sample_mbps)
-            if sample_mbps is not None and float(sample_mbps) > 0
-            else DEST_PENALTY_FALLBACK_MBPS
-        )
-        entry = bucket.get(wid)
-        if entry is None:
-            entry = {
-                "ema": mbps,
-                "n": 1,
-                "updated_at": time.time(),
-            }
-            bucket[wid] = entry
-        now = time.time()
-        until = now + DEST_PENALTY_S
-        prev_until = float(entry.get("penalty_until") or 0.0)
-        entry["penalty_until"] = max(prev_until, until)
-        prev_pen = float(entry.get("penalty_mbps") or 0.0)
-        if prev_pen > 0 and prev_until > now:
-            entry["penalty_mbps"] = min(prev_pen, mbps)
-        else:
-            entry["penalty_mbps"] = mbps
-        entry["updated_at"] = now
-        # Pull EMA toward the slow sample so ranking stays realistic after cooldown.
-        prev_ema = float(entry.get("ema") or mbps)
-        entry["ema"] = (DEST_AFFINITY_EMA * mbps) + ((1.0 - DEST_AFFINITY_EMA) * prev_ema)
-        entry["n"] = int(entry.get("n") or 0) + 1
-        self._dest_stats_dirty = True
-        self._maybe_save_dest_worker_stats()
-        logger.info(
-            "dest penalty force dest=%s worker=%s reason=%s "
-            "penalty_mbps=%.1f until_in=%.0fs",
-            group,
-            short_id(wid),
-            reason or "manual",
-            entry["penalty_mbps"],
-            entry["penalty_until"] - now,
-        )
-
-    def dest_worker_penalized(self, dest_group: str, worker_id: str) -> bool:
-        entry = self._lookup_dest_entry(dest_group, worker_id)
-        if entry is None:
-            return False
-        try:
-            return float(entry.get("penalty_until") or 0.0) > time.time()
-        except (TypeError, ValueError):
-            return False
 
     def dest_worker_mbps(self, dest_group: str, worker_id: str) -> float:
-        """Historical Mbps for worker on dest_group; falls back to global avg.
-
-        While ``penalty_until`` is active, returns the observed ``penalty_mbps``
-        (not a fixed floor) so slower samples rank worse than mildly slow ones.
-        """
+        """Average Mbps for worker on dest_group; falls back to global avg."""
         group = str(dest_group or "").strip()
         wid = str(worker_id or "").strip()
         if DEST_AFFINITY_ENABLED and group and wid:
@@ -910,221 +618,12 @@ class WorkerGateway:
             if entry is not None:
                 try:
                     n = int(entry.get("n") or 0)
-                    ema = float(entry.get("ema") or 0.0)
-                    penalty_until = float(entry.get("penalty_until") or 0.0)
-                    penalty_mbps = float(entry.get("penalty_mbps") or 0.0)
+                    avg = float(entry.get("avg_mbps") or entry.get("ema") or 0.0)
                 except (TypeError, ValueError):
-                    n, ema, penalty_until, penalty_mbps = 0, 0.0, 0.0, 0.0
-                if penalty_until > time.time():
-                    # Prefer stored sample Mbps; fall back to EMA / constant.
-                    if penalty_mbps > 0:
-                        return penalty_mbps
-                    if ema > 0:
-                        return ema
-                    return DEST_PENALTY_FALLBACK_MBPS
-                if n >= DEST_AFFINITY_MIN_SAMPLES and ema > 0:
-                    return ema
+                    n, avg = 0, 0.0
+                if n >= DEST_AFFINITY_MIN_SAMPLES and avg > 0:
+                    return avg
         return self._get_profile(wid).average_mbps
-
-    def _free_workers_for_affinity_wave(
-        self, *, dest_group: str = ""
-    ) -> list[str]:
-        """All idle workers for a min-makespan wave (finish the batch ASAP).
-
-        Includes penalized workers. Cost = expected seconds from observed Mbps, so
-        matching leaves slow workers idle when there are enough fast free slots,
-        but uses them when more offers remain than fast free workers.
-        Order: unique-IP non-penalized, unique-IP penalized, then same-IP extras.
-        """
-        used_ips: set[str] = set()
-        unique_good: list[str] = []
-        unique_pen: list[str] = []
-        extras_good: list[str] = []
-        extras_pen: list[str] = []
-        dest_g = str(dest_group or "").strip() if DEST_AFFINITY_ENABLED else ""
-
-        for wid in self._ordered_connected_worker_ids():
-            if not self._worker_is_free(wid):
-                continue
-            penalized = bool(dest_g) and self.dest_worker_penalized(dest_g, wid)
-            ip = self._get_profile(wid).ip.strip()
-            if ip and ip in used_ips:
-                (extras_pen if penalized else extras_good).append(wid)
-                continue
-            if ip:
-                used_ips.add(ip)
-            (unique_pen if penalized else unique_good).append(wid)
-
-        return unique_good + unique_pen + extras_good + extras_pen
-
-    def _offer_expected_seconds(self, offer: dict, worker_id: str) -> float:
-        dest_g = dest_group_from_offer(offer)
-        mbps = self.dest_worker_mbps(dest_g, worker_id) if dest_g else (
-            self._get_profile(worker_id).average_mbps
-        )
-        if mbps <= 0:
-            mbps = 50.0  # cold-start prior — avoid infinite cost
-        return expected_transfer_seconds(offer_byte_size(offer), mbps)
-
-    def _assign_offers_min_makespan(
-        self,
-        offers: list[dict],
-        workers: list[str],
-    ) -> tuple[list[str], float]:
-        """Map offers → workers minimizing expected last completion time.
-
-        Goal: all tasks in this wave finish as soon as possible (min makespan),
-        not max-Mbps on each offer independently.
-        """
-        if not offers or not workers:
-            return [], 0.0
-        n = min(len(offers), len(workers))
-        offers_n = offers[:n]
-        # Full free pool: matching can leave slow workers idle when workers > offers.
-        workers_n = list(workers)
-        costs = [
-            [self._offer_expected_seconds(offer, wid) for wid in workers_n]
-            for offer in offers_n
-        ]
-        assign_idx, makespan = min_makespan_assignment(costs)
-        out: list[str] = []
-        for w_i in assign_idx:
-            if w_i < 0 or w_i >= len(workers_n):
-                out.append("")
-            else:
-                out.append(workers_n[w_i])
-        return out, makespan
-
-    async def _drain_affinity_makespan_wave(
-        self,
-        *,
-        batch_used_ips: set[str],
-        batch_assigned_counts: dict[str, int],
-    ) -> int:
-        """Assign next free-worker wave via min-makespan (last-done objective)."""
-        if not DEST_AFFINITY_ENABLED or not DEST_AFFINITY_MAKESPAN:
-            return 0
-        if not self._overflow_offers:
-            return 0
-
-        # Head dest only affects penalty labeling in the free pool order.
-        head_dest = dest_group_from_offer(self._overflow_offers[0])
-        free = self._free_workers_for_affinity_wave(dest_group=head_dest)
-        if not free:
-            return 0
-
-        n = min(len(free), len(self._overflow_offers))
-        # Need ≥2 free workers for combinatorial assignment to matter.
-        if n <= 1:
-            return 0
-
-        offers = [self._overflow_offers[i] for i in range(n)]
-        # Makespan assumes every free worker is eligible for every head offer.
-        # Offers with prior failures (slow_net_wait) need per-offer excludes → greedy.
-        # Coverage misses must go to non_cached workers → greedy per-offer path.
-        if any(
-            self._offer_attempted_workers.get(self._offer_key(o))
-            or offer_coverage_state(o) == "miss"
-            or self._offer_key(o) in self._offer_require_non_cached
-            for o in offers
-        ):
-            return 0
-        # More free workers than offers: pass the full free pool so matching can
-        # leave the slowest idle (better makespan than forcing a slow pairing).
-        worker_ids, makespan = self._assign_offers_min_makespan(offers, free)
-        if len(worker_ids) != n or any(not w for w in worker_ids):
-            return 0
-        # Guard against duplicate worker assignment (should not happen).
-        if len(set(worker_ids)) != n:
-            logger.warning(
-                "makespan assignment has duplicate workers; falling back to greedy"
-            )
-            return 0
-
-        for _ in range(n):
-            offer = self._overflow_offers.popleft()
-            oid = self._offer_key(offer)
-            if oid:
-                self._overflow_offer_ids.discard(oid)
-
-        # Parallel WS sends — serial await added ~N×RTT delay on first wave.
-        async def _deliver_one(
-            offer: dict, worker_id: str
-        ) -> tuple[dict, str, bool]:
-            ok = await self.deliver_task_offer(worker_id, offer)
-            return offer, worker_id, ok
-
-        results = await asyncio.gather(
-            *[_deliver_one(o, w) for o, w in zip(offers, worker_ids)],
-            return_exceptions=True,
-        )
-
-        delivered = 0
-        undelivered: list[dict] = []
-        for item, fallback in zip(results, zip(offers, worker_ids)):
-            offer_fb, worker_fb = fallback
-            if isinstance(item, BaseException):
-                logger.warning(
-                    "makespan deliver crashed worker=%s: %s",
-                    short_id(worker_fb),
-                    item,
-                )
-                undelivered.append(offer_fb)
-                continue
-            offer, worker_id, ok = item
-            if not ok:
-                undelivered.append(offer)
-                continue
-            delivered += 1
-            batch_assigned_counts[worker_id] = (
-                batch_assigned_counts.get(worker_id, 0) + 1
-            )
-            ip = self._get_profile(worker_id).ip.strip()
-            if ip:
-                batch_used_ips.add(ip)
-            profile = self._get_profile(worker_id)
-            dest_group = dest_group_from_offer(offer)
-            dest_mbps = (
-                self.dest_worker_mbps(dest_group, worker_id) if dest_group else 0.0
-            )
-            exp_s = self._offer_expected_seconds(offer, worker_id)
-            wait_ms = offer_queue_wait_ms(offer)
-            logger.info(
-                "_workers | queue_deliver %s worker=%s "
-                "active=%d pending=%d pressure=%s dest_group=%s dest_mbps=%.1f "
-                "assign=makespan exp_s=%.2f makespan_s=%.2f coverage=%s "
-                "queue_wait_ms=%.0f queue_wait_s=%.3f",
-                task_key_log_label(offer),
-                short_id(worker_id),
-                profile.active_count,
-                len(self._overflow_offers) + len(undelivered),
-                False,
-                dest_group or "-",
-                dest_mbps,
-                exp_s,
-                makespan,
-                offer_coverage_state(offer),
-                wait_ms,
-                wait_ms / 1000.0,
-            )
-
-        for offer in reversed(undelivered):
-            oid = self._offer_key(offer)
-            if oid and oid not in self._overflow_offer_ids:
-                self._overflow_offers.appendleft(offer)
-                self._overflow_offer_ids.add(oid)
-            elif not oid:
-                self._overflow_offers.appendleft(offer)
-
-        if undelivered:
-            logger.warning(
-                "_workers | makespan_wave partial delivered=%d requeued=%d "
-                "pending=%d",
-                delivered,
-                len(undelivered),
-                len(self._overflow_offers),
-            )
-        return delivered
 
     def connect(self, worker_id: str, ws: object, *, ip: str = "") -> bool:
         if self.is_full() and worker_id not in self._sessions:
@@ -1331,20 +830,6 @@ class WorkerGateway:
         # Workers that failed deliver this drain — skip, try other free workers.
         deliver_failed: set[str] = set()
 
-        # First: batch-assign free workers to head offers minimizing expected
-        # last completion (makespan) — finish all queued work ASAP. Greedy
-        # max-Mbps per offer can leave a bad worker×dest as the straggler.
-        pending0 = len(self._overflow_offers)
-        pressure0 = (
-            OVERFLOW_BUSY_THRESHOLD > 0 and pending0 > OVERFLOW_BUSY_THRESHOLD
-        )
-        if not pressure0:
-            wave = await self._drain_affinity_makespan_wave(
-                batch_used_ips=batch_used_ips,
-                batch_assigned_counts=batch_assigned_counts,
-            )
-            delivered += wave
-
         while self._overflow_offers:
             pending = len(self._overflow_offers)
             pressure = (
@@ -1449,7 +934,7 @@ class WorkerGateway:
                     self.dest_worker_mbps(dest_group, worker_id) if dest_group else 0.0
                 )
                 assign_mode = (
-                    "greedy" if DEST_AFFINITY_ENABLED else "round_robin"
+                    "fastest_dest" if DEST_AFFINITY_ENABLED else "round_robin"
                 )
                 wait_ms = offer_queue_wait_ms(offer)
                 logger.info(
@@ -1881,14 +1366,10 @@ class WorkerGateway:
         attempted.add(str(worker_id))
         dest_group = dest_group_from_offer(offer)
         if dest_group:
-            # Prefer observed transfer_mbps from the abort result when present.
+            # Fold slow sample into avg so this worker ranks lower next time.
             sample = transfer_mbps_from_result(msg)
-            self.penalize_dest_worker(
-                dest_group,
-                worker_id,
-                reason=str(msg.get("error") or "slow_net_wait"),
-                sample_mbps=sample if sample is not None else None,
-            )
+            if sample is not None:
+                self.observe_dest_transfer(dest_group, worker_id, sample)
         connected = set(self._sessions.keys())
         # Avoid infinite local loop when every connected worker already failed.
         if connected and attempted.issuperset(connected):
@@ -2016,41 +1497,16 @@ class WorkerGateway:
         prefer_non_cached_capable: Optional[bool] = None,
         require_non_cached_capable: bool = False,
     ) -> Optional[str]:
-        """Pick the next worker with capacity, matching global-gateway batch IP spread.
+        """Pick a worker with capacity.
 
-        Goal: protect first-wave single-stream Mbps (makespan of the first
-        assignment wave), then finish overflow when workers free.
+        When ``ORCH_DEST_AFFINITY`` is on (default) and ``dest_group`` is set:
+          deliver to the **fastest free worker** for that dest (highest avg Mbps).
+          Idle workers beat busy ones; among equals, prefer unused IP then RR.
 
-        When ``ORCH_PREFER_IDLE_WORKERS`` is on (default):
-          1. Prefer idle workers (effective load 0) on a fresh IP
-          2. Then idle workers on any IP
-          3. Only if ``ORCH_ALLOW_BUSY_WORKER_REUSE`` / ``force_allow_busy``,
-             reuse busy workers that still have capacity
+        When affinity is off: free-worker round-robin (optional non_cached bias).
 
-        When ``ORCH_DEST_AFFINITY`` is on and ``dest_group`` is set, among
-        equally-idle eligible workers prefer higher historical Mbps for that
-        destination group (falls back to global average until samples exist).
-        Free non-penalized workers are tried before free penalized ones; if
-        every non-penalized worker is busy, a free penalized worker is still
-        selected (do not stall the queue).
-
-        ``prefer_non_cached_capable``:
-          True  → rank workers with non_cached_file=true first (miss-capable)
-          False → rank cache-only workers first (non_cached_file=false)
-          None  → no non_cached bias (rank by load / dest Mbps only)
-
-        ``require_non_cached_capable``: only workers with non_cached_file=true
-        (used after a cache_miss_not_accepted reject).
-
-        ``assign_cap`` (overflow pressure mode): require ``load < assign_cap``
-        instead of hello ``max_concurrent_tasks`` so backlog can stack up to N
-        tasks per worker.
-
-        Effective load is ``max(active_count, batch_assigned)`` so in-flight
-        work from prior NATS batches and this batch both count.
-
-        When ``allow_used_ip`` is False, stop after step 1 (hybrid overflow).
-        ``exclude_worker_ids`` skips workers already represented by the embedded pool.
+        ``require_non_cached_capable``: only workers with non_cached_file=true.
+        ``assign_cap``: pressure mode — allow load < cap instead of hello max.
         """
         connected = self._ordered_connected_worker_ids()
         if not connected:
@@ -2058,14 +1514,12 @@ class WorkerGateway:
 
         pool_size = len(connected)
         start = self._cursor % pool_size
-        in_batch = batch_used_ips is not None or batch_assigned_workers is not None
         excluded = exclude_worker_ids or set()
         counts = batch_assigned_counts
         prefer_idle = PREFER_IDLE_WORKERS
         allow_busy_reuse = ALLOW_BUSY_WORKER_REUSE or force_allow_busy
         cap = int(assign_cap) if assign_cap is not None and assign_cap > 0 else None
         dest_g = str(dest_group or "").strip() if DEST_AFFINITY_ENABLED else ""
-        # None = no non_cached bias (caller must pass True/False for preference).
 
         def _batch_count(worker_id: str) -> int:
             if counts is not None:
@@ -2076,7 +1530,6 @@ class WorkerGateway:
 
         def _load(worker_id: str) -> int:
             profile = self._get_profile(worker_id)
-            # max(): deliver marks busy before batch_counts update on some paths
             return max(profile.active_count, _batch_count(worker_id))
 
         def _has_assign_capacity(worker_id: str) -> bool:
@@ -2086,7 +1539,6 @@ class WorkerGateway:
             return self._get_profile(worker_id).has_capacity
 
         def _score_mbps(worker_id: str) -> float:
-            # Affinity off → equal scores so cursor/offset is pure round-robin.
             if not DEST_AFFINITY_ENABLED:
                 return 0.0
             if dest_g:
@@ -2094,7 +1546,6 @@ class WorkerGateway:
             return self._get_profile(worker_id).average_mbps
 
         def _non_cached_rank(worker_id: str) -> int:
-            """0 = preferred; None prefer_non_cached_capable → all equal."""
             if prefer_non_cached_capable is None:
                 return 0
             capable = self._get_profile(worker_id).non_cached_file
@@ -2108,8 +1559,6 @@ class WorkerGateway:
             allow_ip_reuse: bool,
             require_idle: bool,
             allow_worker_reuse: bool,
-            exclude_penalized: bool = False,
-            only_penalized: bool = False,
         ) -> bool:
             if worker_id in excluded:
                 return False
@@ -2124,12 +1573,6 @@ class WorkerGateway:
                 return False
             if not allow_worker_reuse and _batch_count(worker_id) > 0:
                 return False
-            if dest_g and (exclude_penalized or only_penalized):
-                penalized = self.dest_worker_penalized(dest_g, worker_id)
-                if exclude_penalized and penalized:
-                    return False
-                if only_penalized and not penalized:
-                    return False
             ip = self._get_profile(worker_id).ip.strip()
             if (
                 not allow_ip_reuse
@@ -2145,11 +1588,10 @@ class WorkerGateway:
             allow_ip_reuse: bool,
             require_idle: bool,
             allow_worker_reuse: bool,
-            exclude_penalized: bool = False,
-            only_penalized: bool = False,
         ) -> Optional[str]:
-            # (non_cached_rank, load, batch_n, -dest_mbps, -initial_order, offset, wid)
-            candidates: list[tuple[int, int, int, float, int, int, str]] = []
+            # Affinity on: highest dest avg Mbps wins among eligible.
+            # Affinity off: non_cached → load → RR offset.
+            candidates: list[tuple] = []
             for offset in range(pool_size):
                 idx = (start + offset) % pool_size
                 worker_id = connected[idx]
@@ -2158,202 +1600,106 @@ class WorkerGateway:
                     allow_ip_reuse=allow_ip_reuse,
                     require_idle=require_idle,
                     allow_worker_reuse=allow_worker_reuse,
-                    exclude_penalized=exclude_penalized,
-                    only_penalized=only_penalized,
                 ):
                     continue
                 profile = self._get_profile(worker_id)
+                mbps = _score_mbps(worker_id)
                 candidates.append(
                     (
                         _non_cached_rank(worker_id),
                         _load(worker_id),
+                        -mbps,
                         _batch_count(worker_id),
-                        -_score_mbps(worker_id),
-                        -profile.initial_order,
                         offset,
                         worker_id,
+                        mbps,
                     )
                 )
             if not candidates:
                 return None
             if DEST_AFFINITY_ENABLED:
-                # non_cached → load → batch → dest Mbps → initial_order → RR
+                # non_cached → idle first → fastest dest avg → RR
                 candidates.sort(
-                    key=lambda item: (
-                        item[0],
-                        item[1],
-                        item[2],
-                        item[3],
-                        item[4],
-                        item[5],
-                    )
+                    key=lambda item: (item[0], item[1], item[2], item[3], item[4])
                 )
             else:
-                # non_cached preference then free-worker round robin
-                candidates.sort(
-                    key=lambda item: (item[0], item[1], item[2], item[5])
-                )
+                candidates.sort(key=lambda item: (item[0], item[1], item[3], item[4]))
             (
                 _nc_rank,
                 _load_n,
-                _bc,
                 _neg_mbps,
-                _neg_order,
+                _bc,
                 offset,
                 worker_id,
+                dest_mbps,
             ) = candidates[0]
             idx = (start + offset) % pool_size
             self._cursor = (idx + 1) % pool_size
             profile = self._get_profile(worker_id)
             logger.debug(
-                "selected worker %s round_robin ip=%s active=%d/%d "
-                "load=%d batch_n=%d mbps=%.1f dest_group=%s dest_mbps=%.1f "
-                "cursor=%d pool=%d batch_ips=%s "
-                "require_idle=%s reuse_worker=%s assign_cap=%s "
-                "exclude_penalized=%s only_penalized=%s "
-                "non_cached=%s prefer_nc=%s require_nc=%s",
+                "selected worker %s ip=%s active=%d/%d load=%d "
+                "dest_group=%s dest_mbps=%.1f assign=%s "
+                "require_idle=%s non_cached=%s",
                 worker_id,
                 profile.ip or "?",
                 profile.active_count,
                 profile.max_concurrent_tasks,
                 _load_n,
-                _bc,
-                profile.average_mbps,
                 dest_g or "-",
-                -_neg_mbps,
-                self._cursor,
-                pool_size,
-                ",".join(sorted(batch_used_ips)) if batch_used_ips else "-",
+                dest_mbps,
+                "fastest_dest" if DEST_AFFINITY_ENABLED else "round_robin",
                 require_idle,
-                allow_worker_reuse,
-                cap if cap is not None else "-",
-                exclude_penalized,
-                only_penalized,
                 profile.non_cached_file,
-                prefer_non_cached_capable,
-                require_non_cached_capable,
             )
             return worker_id
 
-        def _pick_idle(
-            *,
-            allow_ip_reuse: bool,
-            exclude_penalized: bool = False,
-            only_penalized: bool = False,
-        ) -> Optional[str]:
+        def _pick_idle(*, allow_ip_reuse: bool) -> Optional[str]:
             return _pick(
                 allow_ip_reuse=allow_ip_reuse,
                 require_idle=True,
                 allow_worker_reuse=False,
-                exclude_penalized=exclude_penalized,
-                only_penalized=only_penalized,
             )
 
-        def _pick_busy(
-            *,
-            allow_ip_reuse: bool,
-            exclude_penalized: bool = False,
-        ) -> Optional[str]:
+        def _pick_busy(*, allow_ip_reuse: bool) -> Optional[str]:
             return _pick(
                 allow_ip_reuse=allow_ip_reuse,
                 require_idle=False,
                 allow_worker_reuse=True,
-                exclude_penalized=exclude_penalized,
             )
 
-        def _pick_idle_prefer_unpenalized(*, allow_ip_reuse: bool) -> Optional[str]:
-            """Free non-penalized first; if none, free penalized (still assign)."""
-            if dest_g:
-                worker_id = _pick_idle(
-                    allow_ip_reuse=allow_ip_reuse, exclude_penalized=True
-                )
-                if worker_id:
-                    return worker_id
-                return _pick_idle(
-                    allow_ip_reuse=allow_ip_reuse, only_penalized=True
-                )
-            return _pick_idle(allow_ip_reuse=allow_ip_reuse)
-
         if prefer_idle:
-            # Exhaust free non-penalized (fresh IP → any IP), then free penalized,
-            # then busy reuse. Penalized free workers still get work when needed.
-            if dest_g:
-                worker_id = _pick_idle(
-                    allow_ip_reuse=False, exclude_penalized=True
-                )
+            worker_id = _pick_idle(allow_ip_reuse=False)
+            if worker_id:
+                return worker_id
+            if allow_used_ip:
+                worker_id = _pick_idle(allow_ip_reuse=True)
                 if worker_id:
                     return worker_id
-                if allow_used_ip:
-                    worker_id = _pick_idle(
-                        allow_ip_reuse=True, exclude_penalized=True
-                    )
-                    if worker_id:
-                        return worker_id
-                worker_id = _pick_idle(
-                    allow_ip_reuse=False, only_penalized=True
-                )
-                if worker_id:
-                    return worker_id
-                if allow_used_ip:
-                    worker_id = _pick_idle(
-                        allow_ip_reuse=True, only_penalized=True
-                    )
-                    if worker_id:
-                        return worker_id
-            else:
-                worker_id = _pick_idle(allow_ip_reuse=False)
-                if worker_id:
-                    return worker_id
-                if allow_used_ip:
-                    worker_id = _pick_idle(allow_ip_reuse=True)
-                    if worker_id:
-                        return worker_id
             if not allow_busy_reuse:
                 return None
-            # Busy reuse: still prefer non-penalized, then any busy with capacity.
-            if dest_g:
-                worker_id = _pick_busy(
-                    allow_ip_reuse=False, exclude_penalized=True
-                )
-                if worker_id:
-                    return worker_id
             worker_id = _pick_busy(allow_ip_reuse=False)
             if worker_id:
                 return worker_id
             if allow_used_ip:
-                if dest_g:
-                    worker_id = _pick_busy(
-                        allow_ip_reuse=True, exclude_penalized=True
-                    )
-                    if worker_id:
-                        return worker_id
                 return _pick_busy(allow_ip_reuse=True)
             return None
 
-        # Legacy: unused-in-batch first, then reuse capacity.
-        if in_batch:
-            worker_id = _pick(
-                allow_ip_reuse=False,
-                require_idle=False,
-                allow_worker_reuse=False,
-            )
-            if worker_id:
-                return worker_id
-            if not allow_used_ip:
-                return None
-            worker_id = _pick(
-                allow_ip_reuse=True,
-                require_idle=False,
-                allow_worker_reuse=False,
-            )
-            if worker_id:
-                return worker_id
-            return _pick(
-                allow_ip_reuse=True,
-                require_idle=False,
-                allow_worker_reuse=True,
-            )
-
+        worker_id = _pick(
+            allow_ip_reuse=False,
+            require_idle=False,
+            allow_worker_reuse=False,
+        )
+        if worker_id:
+            return worker_id
+        if not allow_used_ip:
+            return None
+        worker_id = _pick(
+            allow_ip_reuse=True,
+            require_idle=False,
+            allow_worker_reuse=False,
+        )
+        if worker_id:
+            return worker_id
         return _pick(
             allow_ip_reuse=True,
             require_idle=False,

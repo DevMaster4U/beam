@@ -338,7 +338,7 @@ async def get_dest_affinity():
 
 @app.post("/workers/affinity/clear")
 async def clear_dest_affinity():
-    """Clear dest affinity EMA/penalties in memory and delete the stats JSON file.
+    """Clear dest affinity averages in memory and delete the stats JSON file.
 
     Restart alone does not clear affinity. Prefer this or start with
     ``--clear-affinity`` / ``ORCH_DEST_AFFINITY_CLEAR_ON_START=true``.
