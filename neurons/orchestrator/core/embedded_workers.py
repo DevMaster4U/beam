@@ -1340,6 +1340,9 @@ class EmbeddedWorkerPool:
 
     async def _drain_overflow_queue(self) -> int:
         delivered = 0
+        # Count offers already dispatched in this drain pass so _select_worker
+        # does not over-book a worker before active_offer_ids is updated.
+        batch_assigned_counts: dict[str, int] = {}
         while self._overflow:
             item = self._overflow[0]
             offer = item["offer"]
@@ -1387,7 +1390,7 @@ class EmbeddedWorkerPool:
                 )
                 continue
 
-            worker = self._select_worker()
+            worker = self._select_worker(batch_assigned_counts=batch_assigned_counts)
             if worker is None:
                 gateway = self._worker_gateway
                 if gateway is not None and hasattr(gateway, "select_worker_round_robin"):
@@ -1403,6 +1406,9 @@ class EmbeddedWorkerPool:
 
             self._overflow.pop(0)
             self._overflow_ids.discard(offer_id)
+            batch_assigned_counts[worker.worker_id] = (
+                batch_assigned_counts.get(worker.worker_id, 0) + 1
+            )
             if (
                 path == "predefined_etag"
                 and self._cf_transfer_active(worker)
@@ -1481,6 +1487,23 @@ class EmbeddedWorkerPool:
                         batch_used_ips=batch_used_ips,
                         batch_assigned_workers=batch_assigned_workers,
                     )
+                    return
+                # Race: drained more than capacity — put back on overflow, do not fail BeamCore.
+                if capacity_error.startswith("queue_full") and self._enqueue_overflow(
+                    offer=offer,
+                    transfer_context=transfer_context,
+                    path=path,
+                    batch_id="",
+                ):
+                    logger.info(
+                        "%s queue_full re-queued task=%s offer=%s worker_slot=%s pending=%d",
+                        _WORKERS_LOG,
+                        short_id(task_id),
+                        short_id(offer_id),
+                        worker.slot,
+                        len(self._overflow),
+                    )
+                    self._schedule_overflow_drain()
                     return
                 logger.warning(
                     "Embedded failing offer: task=%s offer=%s worker_slot=%s reason=%s",
