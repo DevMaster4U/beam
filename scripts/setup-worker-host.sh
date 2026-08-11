@@ -188,6 +188,7 @@ if [[ "$SKIP_PIP" -eq 0 ]]; then
     echo "Creating virtualenv at ${VENV}..."
     python3 -m venv "${VENV}"
   fi
+  beam_fix_install_permissions
   echo "Installing Python dependencies into ${VENV}..."
   "${VENV}/bin/pip" install -U pip wheel setuptools
   if [[ -f "${ROOT}/requirements.txt" ]]; then

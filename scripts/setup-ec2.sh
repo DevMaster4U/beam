@@ -43,6 +43,7 @@ if [[ ! -x "${VENV}/bin/python" ]]; then
   python3 -m venv "${VENV}"
 fi
 
+beam_fix_install_permissions
 echo "Installing Python dependencies into ${VENV}..."
 "${VENV}/bin/pip" install -U pip wheel setuptools
 "${VENV}/bin/pip" install -e "${ROOT}"

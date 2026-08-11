@@ -329,6 +329,11 @@ class WorkerGateway:
     def is_full(self) -> bool:
         return len(self._sessions) >= MAX_WORKERS
 
+    def worker_ip_address(self, worker_id: str) -> str:
+        """Public / reported IP for logging (from hello/connect profile)."""
+        ip = (self._get_profile(worker_id).ip or "").strip()
+        return ip or "-"
+
     def _get_profile(self, worker_id: str) -> _WorkerProfile:
         profile = self._profiles.get(worker_id)
         if profile is None:
@@ -938,11 +943,12 @@ class WorkerGateway:
                 )
                 wait_ms = offer_queue_wait_ms(offer)
                 logger.info(
-                    "_workers | queue_deliver %s worker=%s "
+                    "_workers | queue_deliver %s worker=%s worker_ip_address=%s "
                     "active=%d pending=%d pressure=%s dest_group=%s dest_mbps=%.1f "
                     "assign=%s coverage=%s queue_wait_ms=%.0f queue_wait_s=%.3f",
                     task_key_log_label(offer),
                     short_id(worker_id),
+                    self.worker_ip_address(worker_id),
                     profile.active_count,
                     len(self._overflow_offers),
                     pressure,
@@ -960,10 +966,11 @@ class WorkerGateway:
                     self._overflow_offer_ids.add(offer_id)
                 deliver_failed.add(worker_id)
                 logger.warning(
-                    "_workers | deliver_fail %s worker=%s "
+                    "_workers | deliver_fail %s worker=%s worker_ip_address=%s "
                     "requeued; trying other free workers",
                     task_key_log_label(offer),
                     short_id(worker_id),
+                    self.worker_ip_address(worker_id),
                 )
                 continue
         return delivered
@@ -1080,7 +1087,7 @@ class WorkerGateway:
             path_label = str(msg.get("path") or "external")
             hash_source = str(msg.get("hash_source") or "-")
             logger.info(
-                "_workers | task_done %s chunk_id=%s worker=%s "
+                "_workers | task_done %s chunk_id=%s worker=%s worker_ip_address=%s "
                 "src=%s dest=%s range=%s hash=%s etag_real=%s "
                 "cached=%s path=%s hash_source=%s "
                 "load_ms=%.1f hash_ms=%.1f etag_ms=%.1f fetch_ms=%.1f "
@@ -1088,6 +1095,7 @@ class WorkerGateway:
                 id_label,
                 chunk_id if chunk_id is not None else "?",
                 short_id(worker_id),
+                self.worker_ip_address(worker_id),
                 src,
                 dest,
                 range_label,
@@ -1105,10 +1113,11 @@ class WorkerGateway:
             )
         else:
             logger.warning(
-                "_workers | failed %s worker=%s reason=%s "
+                "_workers | failed %s worker=%s worker_ip_address=%s reason=%s "
                 "src=%s dest=%s range=%s hash=%s etag=%s",
                 id_label,
                 short_id(worker_id),
+                self.worker_ip_address(worker_id),
                 msg.get("error") or "external_task_failed",
                 src,
                 dest,
@@ -1470,10 +1479,11 @@ class WorkerGateway:
                 )
             )
             logger.info(
-                "_workers | task_start %s worker=%s "
+                "_workers | task_start %s worker=%s worker_ip_address=%s "
                 "chunk_id=%s range=%s",
                 task_key_log_label(offer, task_id=task_id, offer_id=offer_id),
                 short_id(worker_id),
+                self.worker_ip_address(worker_id),
                 chunk_id if chunk_id is not None else "?",
                 range_label,
             )

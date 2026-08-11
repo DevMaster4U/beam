@@ -81,9 +81,30 @@ beam_prepare_repo_permissions() {
   group="$(beam_default_service_group)"
   beam_prepare_data_dirs "$user" "$group"
 
-  for dir in venv .venv; do
+  for dir in venv .venv .venv-btcli; do
     beam_chown_if_needed "${BEAM_ROOT}/${dir}" "$user" "$group"
   done
+}
+
+# Fix root-owned venv / egg-info leftovers before pip as ubuntu.
+# Prior sudo pip/setuptools runs leave unwritable site-packages and beam.egg-info.
+beam_fix_install_permissions() {
+  local user group
+  user="$(beam_default_service_user)"
+  group="$(beam_default_service_group)"
+
+  for dir in venv .venv .venv-btcli; do
+    beam_chown_if_needed "${BEAM_ROOT}/${dir}" "$user" "$group"
+  done
+
+  if [[ -e "${BEAM_ROOT}/beam.egg-info" && ! -w "${BEAM_ROOT}/beam.egg-info" ]]; then
+    echo "Fixing unwritable ${BEAM_ROOT}/beam.egg-info (likely root-owned)..."
+    if [[ "${EUID}" -eq 0 ]]; then
+      rm -rf "${BEAM_ROOT}/beam.egg-info"
+    else
+      sudo rm -rf "${BEAM_ROOT}/beam.egg-info"
+    fi
+  fi
 }
 
 beam_require_non_root_interactive() {
