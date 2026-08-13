@@ -4845,7 +4845,7 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
         )
         return False
 
-    await asyncio.sleep(1.5)
+    await asyncio.sleep(0.5)
     log_task_start(
         "[Worker] [WS]",
         task_id,
