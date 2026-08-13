@@ -3468,7 +3468,6 @@ async def fetch_and_send_chunk(
     Returns:
         (bytes_transferred, chunk_hash, etag, response_code, fetch_ms, send_ms)
     """
-    await asyncio.sleep(1)
     fetch_headers = _build_fetch_headers(chunk_offset, chunk_size, total_size)
     if extra_fetch_headers:
         fetch_headers.update(extra_fetch_headers)
@@ -4846,6 +4845,7 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
         )
         return False
 
+    await asyncio.sleep(1.5)
     log_task_start(
         "[Worker] [WS]",
         task_id,
