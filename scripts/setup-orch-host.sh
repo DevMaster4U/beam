@@ -1,24 +1,23 @@
 #!/usr/bin/env bash
-# First-time worker host setup (Ubuntu/Debian — EC2 or normal VPS).
+# First-time orchestrator host setup (Ubuntu/Debian — EC2 or normal VPS).
 #
-# Role script (worker). Same commands on EC2 and normal servers.
-# Optional first: ./scripts/setup-ec2.sh  (host packages/venv only)
-#
-# Automates:
-#   apt packages → .venv → pip install → optional wallet → worker.env → systemd
+# Role script (orch). For host packages/venv only, use setup-ec2.sh first
+# (optional — this script can also install apt/.venv).
 #
 # Prerequisites:
 #   git clone … sn105 && cd sn105 && git checkout <branch>
 #
 # Usage:
-#   ./scripts/setup-worker-host.sh --create-wallet --write-env --install-systemd \
-#     --wallet-name sn105_w --wallet-hotkey sn105_w1 \
-#     --gateway-url ws://ORCH_PUBLIC_IP:9005 --gateway-secret wgs
+#   ./scripts/setup-orch-host.sh \
+#     --create-wallet --wallet-name orchestrator --wallet-hotkey orch1 \
+#     --api-port 9005 \
+#     --gateway-url http://YOUR_PUBLIC_IP:9005 \
+#     --gateway-secret wgs \
+#     --write-env --install-systemd
 #
 # Then:
-#   ./scripts/run-worker.sh worker1
-#
-# See also: setup-orch-host.sh (orchestrator role), setup-ec2.sh (host bootstrap)
+#   ./scripts/register-orchestrator.sh orch1 --write-env   # BeamCore API key
+#   ./scripts/run-orchestrator.sh orch1
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -33,52 +32,43 @@ WRITE_ENV=0
 FORCE_ENV=0
 INSTALL_SYSTEMD=0
 
-WALLET_NAME="${WORKER_WALLET_NAME:-sn105_w}"
-WALLET_HOTKEY="${WORKER_WALLET_HOTKEY:-sn105_w1}"
+WALLET_NAME="${WALLET_NAME:-orchestrator}"
+WALLET_HOTKEY="${WALLET_HOTKEY:-orch1}"
 WALLET_PATH="${WALLET_PATH:-${HOME}/.bittensor/wallets}"
 BTCLI_VERSION="${BTCLI_VERSION:-9.23.1}"
-WORKER_INSTANCE="${WORKER_INSTANCE:-worker1}"
-
-GATEWAY_URL="${WORKER_GATEWAY_URL:-ws://88.216.68.26:9005}"
+ORCH_INSTANCE="${ORCH_INSTANCE:-orch1}"
+API_PORT="${API_PORT:-9005}"
+GATEWAY_URL="${ORCHESTRATOR_WORKER_GATEWAY_URL:-}"
 GATEWAY_SECRET="${WORKER_GATEWAY_SECRET:-wgs}"
-CONTROL_WS_URL="${CONTROL_SERVER_WS_URL:-ws://88.216.195.66:8010/ws/miners}"
-CONTROL_SECRET="${CONTROL_SERVER_SECRET:-css}"
-CONTROL_MINER_ID="${CONTROL_SERVER_MINER_ID:-}"
-REQUIRED_PAYMENT="${WORKER_REQUIRED_PAYMENT:-false}"
-MAX_CONCURRENT="${WORKER_MAX_CONCURRENT_TASKS:-2}"
-MAX_QUEUED="${WORKER_MAX_QUEUED_WS_TASKS:-2}"
-MAX_IN_FLIGHT="${WORKER_MAX_IN_FLIGHT_BYTES:-6710886400}"
-INITIAL_ORDER="${WORKER_INITIAL_ORDER:-10}"
+READY="${READY:-true}"
 
 usage() {
   cat <<EOF
 Usage: $0 [options]
 
-Environment install for a Beam worker host.
+Install a Beam orchestrator on this host (EC2 or normal Ubuntu).
 
 Options:
   --skip-apt              Skip apt-get package install
   --skip-pip              Skip .venv / pip install
   --create-wallet         Create coldkey+hotkey via btcli (no password)
-  --wallet-name NAME      Coldkey name (default: sn105_w)
-  --wallet-hotkey NAME    Hotkey name (default: sn105_w1)
+  --wallet-name NAME      Coldkey name (default: orchestrator)
+  --wallet-hotkey NAME    Hotkey name (default: orch1)
   --wallet-path PATH      Wallet dir (default: ~/.bittensor/wallets)
   --btcli-version VER     bittensor-cli version (default: 9.23.1)
-  --instance NAME         Worker env instance (default: worker1)
-  --gateway-url URL       WORKER_GATEWAY_URL
-  --gateway-secret SEC    WORKER_GATEWAY_SECRET
-  --control-ws URL        CONTROL_SERVER_WS_URL
-  --control-secret SEC    CONTROL_SERVER_SECRET
-  --miner-id ID           CONTROL_SERVER_MINER_ID (default: worker_<ip_last>_1)
-  --write-env             Write config/workers/<instance>.env if missing
-  --force-env             Overwrite existing worker env
-  --install-systemd       Run install-systemd.sh --enable-workers
+  --instance NAME         Orch env instance (default: orch1)
+  --api-port PORT         API_PORT / worker WS port (default: 9005)
+  --gateway-url URL       ORCHESTRATOR_WORKER_GATEWAY_URL (public http/ws origin)
+  --gateway-secret SEC    WORKER_GATEWAY_SECRET (must match workers)
+  --ready true|false      READY flag (default: true)
+  --write-env             Write config/orchestrators/<instance>.env if missing
+  --force-env             Overwrite existing orch env
+  --install-systemd       Run install-systemd.sh --enable-orchestrators
   -h, --help              Show this help
 
 Examples:
-  $0 --create-wallet --write-env --install-systemd
-  $0 --wallet-name sn105_w --wallet-hotkey sn105_w1 \\
-     --gateway-url ws://88.216.68.26:9005 --write-env
+  $0 --create-wallet --write-env --install-systemd \\
+     --gateway-url http://1.2.3.4:9005 --gateway-secret wgs
 EOF
 }
 
@@ -91,12 +81,11 @@ while [[ $# -gt 0 ]]; do
     --wallet-hotkey) WALLET_HOTKEY="${2:?}"; shift 2 ;;
     --wallet-path) WALLET_PATH="${2:?}"; shift 2 ;;
     --btcli-version) BTCLI_VERSION="${2:?}"; shift 2 ;;
-    --instance) WORKER_INSTANCE="${2:?}"; shift 2 ;;
+    --instance) ORCH_INSTANCE="${2:?}"; shift 2 ;;
+    --api-port) API_PORT="${2:?}"; shift 2 ;;
     --gateway-url) GATEWAY_URL="${2:?}"; shift 2 ;;
     --gateway-secret) GATEWAY_SECRET="${2:?}"; shift 2 ;;
-    --control-ws) CONTROL_WS_URL="${2:?}"; shift 2 ;;
-    --control-secret) CONTROL_SECRET="${2:?}"; shift 2 ;;
-    --miner-id) CONTROL_MINER_ID="${2:?}"; shift 2 ;;
+    --ready) READY="${2:?}"; shift 2 ;;
     --write-env) WRITE_ENV=1; shift ;;
     --force-env) FORCE_ENV=1; WRITE_ENV=1; shift ;;
     --install-systemd) INSTALL_SYSTEMD=1; shift ;;
@@ -111,7 +100,7 @@ done
 
 WALLET_PATH="${WALLET_PATH/#\~/${HOME}}"
 
-detect_public_ip_last_octet() {
+detect_public_ip() {
   local ip=""
   if command -v curl >/dev/null 2>&1; then
     ip="$(curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)"
@@ -119,28 +108,27 @@ detect_public_ip_last_octet() {
   if [[ -z "$ip" ]] && command -v hostname >/dev/null 2>&1; then
     ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
   fi
-  if [[ "$ip" =~ ^([0-9]+\.){3}([0-9]+)$ ]]; then
-    printf '%s\n' "${BASH_REMATCH[2]}"
-    return 0
-  fi
-  printf '0\n'
+  printf '%s\n' "${ip}"
 }
 
-if [[ -z "$CONTROL_MINER_ID" ]]; then
-  CONTROL_MINER_ID="worker_$(detect_public_ip_last_octet)_1"
+if [[ -z "$GATEWAY_URL" ]]; then
+  pub="$(detect_public_ip)"
+  if [[ -n "$pub" ]]; then
+    GATEWAY_URL="http://${pub}:${API_PORT}"
+  else
+    GATEWAY_URL="http://127.0.0.1:${API_PORT}"
+  fi
 fi
 
-echo "=== BEAM worker host setup (EC2 or normal Ubuntu) ==="
+echo "=== BEAM orchestrator host setup ==="
 echo "  repo:     ${ROOT}"
 echo "  user:     $(id -un)"
-echo "  instance: ${WORKER_INSTANCE}"
+echo "  instance: ${ORCH_INSTANCE}"
 echo "  wallet:   ${WALLET_NAME}/${WALLET_HOTKEY}"
+echo "  api_port: ${API_PORT}"
 echo "  gateway:  ${GATEWAY_URL}"
-echo "  miner_id: ${CONTROL_MINER_ID}"
 echo
 
-# Systemd units run as ubuntu (or BEAM_USER). Creating wallets as root leaves them
-# under /root/.bittensor, which the worker service cannot read.
 SERVICE_USER="$(beam_default_service_user)"
 SERVICE_HOME="$(getent passwd "$SERVICE_USER" | cut -d: -f6)"
 if [[ -z "$SERVICE_HOME" ]]; then
@@ -154,10 +142,10 @@ echo
 
 if [[ "$(id -u)" -eq 0 && "$SERVICE_USER" != "root" && "$CREATE_WALLET" -eq 1 ]]; then
   echo "Do not run --create-wallet as root." >&2
-  echo "Wallets must be owned by ${SERVICE_USER} (systemd service user)." >&2
+  echo "Wallets must be owned by ${SERVICE_USER}." >&2
   echo "  sudo -iu ${SERVICE_USER}" >&2
   echo "  cd ${ROOT}" >&2
-  echo "  ./scripts/setup-worker-host.sh --create-wallet ..." >&2
+  echo "  ./scripts/setup-orch-host.sh --create-wallet ..." >&2
   exit 1
 fi
 
@@ -199,8 +187,6 @@ if [[ "$SKIP_PIP" -eq 0 ]]; then
 fi
 
 if [[ "$CREATE_WALLET" -eq 1 ]]; then
-  # Keep btcli out of the project venv: bittensor-cli pulls bittensor-drand>=2,
-  # which breaks Beam's pinned bittensor==10.4.0 (ImportError: get_encrypted_commit).
   BTCLI_VENV="${ROOT}/.venv-btcli"
   if [[ ! -x "${BTCLI_VENV}/bin/btcli" ]]; then
     echo "Creating btcli venv at ${BTCLI_VENV} (isolated from project deps)..."
@@ -245,59 +231,41 @@ EOF
   fi
 fi
 
-ENV_FILE="${ROOT}/config/workers/${WORKER_INSTANCE}.env"
+ENV_FILE="${ROOT}/config/orchestrators/${ORCH_INSTANCE}.env"
 if [[ "$WRITE_ENV" -eq 1 ]]; then
   if [[ -f "$ENV_FILE" && "$FORCE_ENV" -eq 0 ]]; then
-    echo "Worker env already exists (use --force-env to overwrite): ${ENV_FILE}"
+    echo "Orch env already exists (use --force-env to overwrite): ${ENV_FILE}"
   else
     mkdir -p "$(dirname "$ENV_FILE")"
     cat >"$ENV_FILE" <<EOF
-# Generated by scripts/setup-worker-host.sh
-# Run: ./scripts/run-worker.sh ${WORKER_INSTANCE}
+# Generated by scripts/setup-orch-host.sh
+# Run: ./scripts/run-orchestrator.sh ${ORCH_INSTANCE}
 
-WORKER_WALLET_NAME=${WALLET_NAME}
-WORKER_WALLET_HOTKEY=${WALLET_HOTKEY}
+WALLET_NAME=${WALLET_NAME}
+WALLET_HOTKEY=${WALLET_HOTKEY}
 WALLET_PATH=${WALLET_PATH}
 
-# Split machine resources across local workers.
-WORKER_MAX_CONCURRENT_TASKS=${MAX_CONCURRENT}
-WORKER_MAX_QUEUED_WS_TASKS=${MAX_QUEUED}
-WORKER_MAX_IN_FLIGHT_BYTES=${MAX_IN_FLIGHT}
+API_PORT=${API_PORT}
+READY=${READY}
 
-# WORKER_EARLY_TRANSFER=true
-# Must stay below BeamCore offer TTL (~5s). Fail fast on hung accept relay.
-WORKER_TASK_ACCEPT_ACK_TIMEOUT=8.0
-# Must exceed orchestrator ORCH_TASK_RESULT_TIMEOUT (30s) plus gateway relay margin.
-WORKER_TASK_RESULT_ACK_TIMEOUT=45.0
+ORCH_GATEWAY_URL=tls://orch-gateway.b1m.ai:4222
+CORE_SERVER_URL=https://beamcore.b1m.ai
 
-# Set false when running on your orchestrator's dedicated gateway.
-WORKER_REQUIRED_PAYMENT=${REQUIRED_PAYMENT}
-
-WORKER_GATEWAY_URL=${GATEWAY_URL}
+WORKER_GATEWAY_MODE=in_process
+ORCHESTRATOR_WORKER_GATEWAY_URL=${GATEWAY_URL}
 WORKER_GATEWAY_SECRET=${GATEWAY_SECRET}
-
-WORKER_INITIAL_ORDER=${INITIAL_ORDER}
-
-WORKER_PREDEFINED_ETAG_EARLY_SUBMIT=false
-WORKER_PREDEFINED_ETAG_MAX_PARALLEL=1
-WORKER_PREDEFINED_ETAG_MAX_SPEED_MBPS=0
-CONTROL_SERVER_WS_URL=${CONTROL_WS_URL}
-CONTROL_SERVER_SECRET=${CONTROL_SECRET}
-CONTROL_SERVER_MINER_ID=${CONTROL_MINER_ID}
-CONTROL_SERVER_CACHE_SYNC_DELAY_SEC=60
-WORKER_VERIFY_CHUNK_HASH=false
-WORKER_USE_CACHE_FILE=true
+ORCH_WORKER_GATEWAY_MAX_WORKERS=100
 EOF
     echo "Wrote ${ENV_FILE}"
   fi
 fi
 
 if [[ "$INSTALL_SYSTEMD" -eq 1 ]]; then
-  echo "Installing worker systemd units..."
+  echo "Installing orchestrator systemd units..."
   if [[ "$(id -u)" -eq 0 ]]; then
-    "${ROOT}/scripts/install-systemd.sh" --enable --enable-workers --instances "${WORKER_INSTANCE}"
+    "${ROOT}/scripts/install-systemd.sh" --enable --enable-orchestrators --instances "${ORCH_INSTANCE}"
   else
-    sudo "${ROOT}/scripts/install-systemd.sh" --enable --enable-workers --instances "${WORKER_INSTANCE}"
+    sudo "${ROOT}/scripts/install-systemd.sh" --enable --enable-orchestrators --instances "${ORCH_INSTANCE}"
   fi
 fi
 
@@ -309,27 +277,23 @@ echo "Setup complete."
 echo
 echo "Next steps:"
 if [[ ! -f "$ENV_FILE" ]]; then
-  echo "  1. Write worker env:"
+  echo "  1. Write orch env:"
   echo "       $0 --write-env --wallet-name ${WALLET_NAME} --wallet-hotkey ${WALLET_HOTKEY} \\"
   echo "          --gateway-url ${GATEWAY_URL}"
 else
-  echo "  1. Review ${ENV_FILE}"
+  echo "  1. Review ${ENV_FILE} (public gateway URL must be reachable by workers)"
 fi
-echo "  2. Ensure hotkey is registered on subnet 105"
+echo "  2. Register on BeamCore (once):"
+echo "       ./scripts/register-orchestrator.sh ${ORCH_INSTANCE} --write-env"
+echo "  3. Ensure hotkey is registered on subnet 105"
 if [[ "$INSTALL_SYSTEMD" -eq 0 ]]; then
-  echo "  3. Install systemd:"
-  echo "       sudo ./scripts/install-systemd.sh --enable --enable-workers"
+  echo "  4. Install systemd:"
+  echo "       sudo ./scripts/install-systemd.sh --enable --enable-orchestrators"
 fi
-echo "  4. Start worker:"
-echo "       ./scripts/run-worker.sh ${WORKER_INSTANCE}"
-echo "       # or foreground: ./scripts/run-worker.sh ${WORKER_INSTANCE} --foreground"
+echo "  5. Start orchestrator:"
+echo "       ./scripts/run-orchestrator.sh ${ORCH_INSTANCE}"
+echo "       # or foreground: ./scripts/run-orchestrator.sh ${ORCH_INSTANCE} --foreground"
 echo
+echo "Open firewall / security group for TCP ${API_PORT} (worker WebSocket)."
 echo "Python:  ${VENV}/bin/python"
 echo "Wallets: ${WALLET_PATH}"
-echo "btcli:   ${ROOT}/.venv-btcli/bin/btcli"
-if [[ -d /root/.bittensor/wallets && "${WALLET_PATH}" != /root/.bittensor/wallets ]]; then
-  echo
-  echo "NOTE: /root/.bittensor/wallets exists. If wallets were created as root earlier, move them:"
-  echo "  sudo mv /root/.bittensor /home/${SERVICE_USER}/"
-  echo "  sudo chown -R ${SERVICE_USER}:${SERVICE_USER} /home/${SERVICE_USER}/.bittensor"
-fi

@@ -4,15 +4,58 @@ Production services for orchestrator and workers.
 
 All commands run from the **repo root** as a normal user (on AWS EC2: `ubuntu`). Use `sudo` only for `install-systemd.sh`; service units run as that user, not root.
 
+---
+
+## Install matrix (2 host types × 2 roles)
+
+| | **Orchestrator** | **Worker** |
+| --- | --- | --- |
+| **EC2** (`ubuntu`) | `setup-ec2.sh` *(optional)* → `setup-orch-host.sh` | `setup-ec2.sh` *(optional)* → `setup-worker-host.sh` |
+| **Normal** Ubuntu VPS | same scripts | same scripts |
+
+Host type does **not** change the commands — only the public IP / security group. Role scripts work on both.
+
+| Script | What it does |
+| --- | --- |
+| `scripts/setup-ec2.sh` | Host bootstrap only: apt + `.venv` + `pip install -e .` (EC2 **or** normal) |
+| `scripts/setup-orch-host.sh` | Orch role: deps + wallet + `config/orchestrators/*.env` + systemd |
+| `scripts/setup-worker-host.sh` | Worker role: deps + wallet + `config/workers/*.env` + systemd |
+| `scripts/install-systemd.sh` | Install/enable unit files (called by role scripts with `--install-systemd`) |
+
+### Orchestrator host (EC2 or normal)
+
 ```bash
-# EC2 first-time host setup
-./scripts/setup-ec2.sh
-sudo ./scripts/install-systemd.sh --enable
+./scripts/setup-orch-host.sh \
+  --create-wallet --wallet-name orchestrator --wallet-hotkey orch1 \
+  --api-port 9005 \
+  --gateway-url http://YOUR_PUBLIC_IP:9005 \
+  --gateway-secret wgs \
+  --write-env --install-systemd
+
+./scripts/register-orchestrator.sh orch1 --write-env
+./scripts/run-orchestrator.sh orch1
+# Open TCP YOUR_PUBLIC_IP:9005 to workers
 ```
+
+### Worker host (EC2 or normal)
+
+```bash
+./scripts/setup-worker-host.sh \
+  --create-wallet --wallet-name sn105_w --wallet-hotkey sn105_w1 \
+  --gateway-url ws://ORCH_PUBLIC_IP:9005 \
+  --gateway-secret wgs \
+  --write-env --install-systemd
+
+./scripts/run-worker.sh worker1
+```
+
+`WORKER_GATEWAY_URL` / secret must match the orch `ORCHESTRATOR_WORKER_GATEWAY_URL` / `WORKER_GATEWAY_SECRET`.
+
+Do **not** run setup/pip as root (breaks `.venv` / `beam.egg-info` ownership).
 
 ---
 
-## One-time setup
+## One-time setup (manual)
 
 ```bash
 # Install unit templates

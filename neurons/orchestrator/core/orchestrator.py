@@ -46,13 +46,16 @@ Key differences from Connection model:
 
 import asyncio
 import logging
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, TypeVar
 
 import bittensor as bt
+
+_T = TypeVar("_T")
 
 from .config import OrchestratorSettings, get_settings
 from .epoch_manager import EpochManager
@@ -378,9 +381,21 @@ class Orchestrator:
         self._background_tasks: List[asyncio.Task] = []
         self._routing_paused: bool = False
         self._pool_derived_ready: Optional[bool] = None
+        # Serialize sync subtensor/metagraph RPCs (not safe for concurrent use) and
+        # keep them off the asyncio loop so worker WebSocket pings stay alive.
+        self._chain_rpc_lock = threading.Lock()
 
         # Orchestrator manager for incentive mechanism
         self.orch_manager: Optional[Any] = None
+
+    async def _run_chain_rpc(self, fn: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
+        """Run blocking chain RPC in a worker thread under ``_chain_rpc_lock``."""
+
+        def _locked() -> _T:
+            with self._chain_rpc_lock:
+                return fn(*args, **kwargs)
+
+        return await asyncio.to_thread(_locked)
 
     # --- Reward-share tracking properties (delegated to RewardManager) ---
     @property
@@ -974,33 +989,41 @@ class Orchestrator:
     # =========================================================================
 
     async def _metagraph_sync_loop(self) -> None:
-        """Background loop for syncing metagraph."""
+        """Background loop for syncing metagraph.
+
+        Chain RPCs run in a worker thread so the asyncio loop (worker WS
+        ping/pong) is not blocked — otherwise workers disconnect every ~5m.
+        """
         sync_interval = 300  # Sync every 5 minutes (validators/stake change infrequently)
 
         while self._running:
             try:
                 await asyncio.sleep(sync_interval)
-                if self.metagraph and self.subtensor:
-                    self.metagraph = self._fetch_metagraph()
-
-                # Always re-check UID after sync — hotkey may have moved to a
-                # different UID slot after re-registration (stale UID causes
-                # PoB proofs to be filtered by BeamCore).
-                old_uid = self.our_uid
-                self._find_our_uid()
-                if self.our_uid != old_uid and self.subnet_core_client is not None:
-                    logger.info(
-                        f"UID changed {old_uid} → {self.our_uid}, updating SubnetCoreClient"
-                    )
-                    self.subnet_core_client.orchestrator_uid = self.our_uid
-
-                self.distribute_rewards_to_workers()
+                await self._run_chain_rpc(self._sync_metagraph_once)
                 # Note: Validator discovery removed - BeamCore handles PoB centrally
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Error syncing metagraph: {e}")
+
+    def _sync_metagraph_once(self) -> None:
+        """Blocking metagraph + emission sync (call via ``_run_chain_rpc``)."""
+        if self.metagraph and self.subtensor:
+            self.metagraph = self._fetch_metagraph()
+
+        # Always re-check UID after sync — hotkey may have moved to a
+        # different UID slot after re-registration (stale UID causes
+        # PoB proofs to be filtered by BeamCore).
+        old_uid = self.our_uid
+        self._find_our_uid()
+        if self.our_uid != old_uid and self.subnet_core_client is not None:
+            logger.info(
+                f"UID changed {old_uid} → {self.our_uid}, updating SubnetCoreClient"
+            )
+            self.subnet_core_client.orchestrator_uid = self.our_uid
+
+        self.distribute_rewards_to_workers()
 
     def _sync_epoch_from_chain(self) -> None:
         """Set current_epoch from the chain block number to match validator epoch numbering."""
@@ -1042,7 +1065,7 @@ class Orchestrator:
                 # Re-sync epoch from chain periodically (every 10 min) to correct drift
                 now = time.time()
                 if now - last_chain_sync >= chain_sync_interval:
-                    self._sync_epoch_from_chain()
+                    await self._run_chain_rpc(self._sync_epoch_from_chain)
                     last_chain_sync = now
 
                 # Check if epoch should change (time-based fallback)
@@ -1066,7 +1089,8 @@ class Orchestrator:
             logger.error(f"Error building epoch summary: {e}")
 
         try:
-            self.distribute_rewards_at_epoch_end()
+            # May hit subtensor for alpha→TAO price; keep off the event loop.
+            await self._run_chain_rpc(self.distribute_rewards_at_epoch_end)
         except Exception as e:
             logger.error(f"Error distributing epoch rewards: {e}")
 
@@ -1074,7 +1098,12 @@ class Orchestrator:
             worker.bytes_relayed_epoch = 0
             worker.rewards_earned_epoch = 0
 
-        self._reward_mgr.epoch_start_emission = self.get_our_emission()
+        try:
+            self._reward_mgr.epoch_start_emission = await self._run_chain_rpc(
+                self.get_our_emission
+            )
+        except Exception as e:
+            logger.error(f"Error reading emission at epoch advance: {e}")
 
         # Always advance — never let a sub-step failure block epoch progression
         self.current_epoch += 1

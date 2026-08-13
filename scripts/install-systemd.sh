@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
-# Install BEAM systemd units (orchestrator@, worker@, global-gateway).
+# Install BEAM systemd units (orchestrator@, worker@, global-gateway, control-server).
 #
-# AWS EC2 (Ubuntu): run as ubuntu, use sudo for install:
-#   ./scripts/setup-ec2.sh
+# Prefer role scripts (they call this):
+#   ./scripts/setup-orch-host.sh   … --install-systemd
+#   ./scripts/setup-worker-host.sh … --install-systemd
+#
+# Manual (EC2 or normal Ubuntu — run as ubuntu/normal user, sudo only here):
 #   sudo ./scripts/install-systemd.sh --enable
-#   sudo ./scripts/install-systemd.sh --enable-global-gateway
+#   sudo ./scripts/install-systemd.sh --enable-orchestrators
+#   sudo ./scripts/install-systemd.sh --enable-workers
 #
 # Usage:
 #   ./scripts/install-systemd.sh --enable
 #   ./scripts/install-systemd.sh --enable-orchestrators
 #   ./scripts/install-systemd.sh --enable-workers
 #   ./scripts/install-systemd.sh --enable-global-gateway
+#   ./scripts/install-systemd.sh --enable-control-server
 #   ./scripts/install-systemd.sh --enable-workers --instances worker1,worker2
 set -euo pipefail
 
