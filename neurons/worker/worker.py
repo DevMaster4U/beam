@@ -331,8 +331,8 @@ MAX_IN_FLIGHT_BYTES = max(
 )
 FETCH_TIMEOUT = 30  # seconds
 SEND_TIMEOUT = 120  # seconds — cover large uploads on slow links
-MAX_RETRIES = 3
-RETRY_BACKOFF = 1.0  # Base backoff in seconds
+MAX_RETRIES = 10
+RETRY_BACKOFF = 0.0  # Immediate retry on upload/transfer errors
 FETCH_STREAM_CHUNK_SIZE = int(
     os.environ.get("WORKER_FETCH_STREAM_CHUNK_SIZE", str(512 * 1024))
 )
@@ -2171,7 +2171,9 @@ async def stream_cache_upload_to_dest(
                     f"chunk=0 attempt={attempt + 1}/{MAX_RETRIES} "
                     f"error={exception_detail(exc)}{http_status_detail(exc)}"
                 )
-                await asyncio.sleep(RETRY_BACKOFF * (2**attempt))
+                delay = RETRY_BACKOFF * (2**attempt)
+                if delay > 0:
+                    await asyncio.sleep(delay)
         return False, 0.0, None, exception_detail(last_error or Exception("upload_failed"))
     except Exception as exc:
         return False, 0.0, None, exception_detail(exc)
@@ -3885,7 +3887,9 @@ async def fetch_and_send_chunk(
                 f"chunk={chunk_index} attempt={attempt + 1}/{MAX_RETRIES} "
                 f"error={exception_detail(e)}{http_status_detail(e)}"
             )
-            await asyncio.sleep(RETRY_BACKOFF * (2**attempt))
+            delay = RETRY_BACKOFF * (2**attempt)
+            if delay > 0:
+                await asyncio.sleep(delay)
 
     raise Exception("Max retries exceeded")
 
