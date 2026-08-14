@@ -4848,7 +4848,7 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
             f"error={CACHE_MISS_NOT_ACCEPTED}"
         )
         return False
- 
+    await asyncio.sleep(0.2)
     log_task_start(
         "[Worker] [WS]",
         task_id,
