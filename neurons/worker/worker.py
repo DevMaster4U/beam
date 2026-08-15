@@ -1740,7 +1740,10 @@ _worker_range_store_consolidated = False
 
 
 def get_worker_range_store():
-    """Lazy worker-local continuous byte-range store."""
+    """Lazy worker-local continuous byte-range store.
+
+    Folder layout: ``predefined_etag_range_data/<file_name.bin>/segments.json + *.bin``
+    """
     global _worker_range_store, _worker_range_store_consolidated
     if _worker_range_store is None:
         from neurons.common.byte_range_store import ByteRangeStore
@@ -1751,16 +1754,22 @@ def get_worker_range_store():
     if not _worker_range_store_consolidated:
         _worker_range_store_consolidated = True
         try:
-            result = _worker_range_store.consolidate_signed_url_orphans()
-            if result.get("merged_dirs") or result.get("ingested_segments"):
+            # Merges legacy hash-named dirs into <file_name.bin>/ folders.
+            _worker_range_store._ensure_consolidated()
+            root = _predefined_etag_range_data_dir()
+            dirs = sorted(
+                p.name
+                for p in root.iterdir()
+                if p.is_dir() and not p.name.startswith(".")
+            )
+            if dirs:
                 print(
-                    f"[Worker] Range store orphan merge: "
-                    f"merged_dirs={result.get('merged_dirs')} "
-                    f"ingested_segments={result.get('ingested_segments')} "
-                    f"removed={result.get('removed_dirs')}"
+                    f"[Worker] Range store ready root={root} "
+                    f"objects={len(dirs)} folders={dirs[:8]}"
+                    f"{'...' if len(dirs) > 8 else ''}"
                 )
         except Exception as exc:
-            print(f"[Worker] Range store orphan merge failed: {exc}")
+            print(f"[Worker] Range store init/merge failed: {exc}")
     return _worker_range_store
 
 
@@ -1788,9 +1797,23 @@ def _transfer_byte_range(transfer_context: dict) -> tuple[str, int, int]:
     return source, range_start, range_end
 
 
+def transfer_source_file_name(transfer_context: dict) -> str:
+    """Object ``.bin`` name from the task source_url (range_data folder name)."""
+    from neurons.common.byte_range_store import source_object_name
+
+    return source_object_name(str(transfer_context.get("source_url") or ""))
+
+
 def has_predefined_etag_chunk_data(transfer_context: dict) -> bool:
+    """True when local ``range_data/<file_name>/`` covers this task byte range.
+
+    On task receive: extract ``file_name`` from source_url → look up folder
+    ``logs/workers/predefined_etag_range_data/<file_name>/`` → hit if segments
+    cover [range_start, range_end].
+    """
     source, start, end = _transfer_byte_range(transfer_context)
-    if source and get_worker_range_store().covers(source, start, end):
+    file_name = transfer_source_file_name(transfer_context)
+    if file_name and source and get_worker_range_store().covers(source, start, end):
         return True
     # Legacy fallback during migration.
     path = predefined_etag_chunk_data_path(transfer_context)
@@ -2995,12 +3018,14 @@ def log_task_start(
         range_label = "-"
     chunk_id = chunk_id_from_transfer_context(transfer_context)
     path = resolve_task_path(transfer_context)
+    file_name = transfer_source_file_name(transfer_context) or "-"
     cache_hit = has_predefined_etag_chunk_data(transfer_context)
     fields = [
         f"{log_prefix} task_start task={task_label(task_id)}",
         f"offer={task_label(offer_id)}",
         f"chunk_id={chunk_id if chunk_id is not None else '?'}",
         f"range={range_label}",
+        f"file_name={file_name}",
         f"path={path}",
         f"cache_hit={str(cache_hit).lower()}",
     ]
@@ -4821,13 +4846,15 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
         return False
     reserved_capacity = True
 
-    # Cache-only workers: fast-reject misses so orch can re-offer to
-    # WORKER_NON_CACHED_FILE=true workers instead of burning uplink on a miss.
+    # Cache-only workers: extract file_name from source_url, check
+    # range_data/<file_name>/ coverage; fast-reject misses so orch can re-offer
+    # to WORKER_NON_CACHED_FILE=true workers instead of burning uplink on a miss.
     if (
         not WORKER_NON_CACHED_FILE
         and predefined_etag_transfer_eligible(transfer_context)
         and not has_predefined_etag_chunk_data(transfer_context)
     ):
+        file_name = transfer_source_file_name(transfer_context) or "-"
         await finalize_ws_task_result(
             websocket,
             state,
@@ -4845,7 +4872,7 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
         print(
             f"[Worker] [WS] Rejected miss (WORKER_NON_CACHED_FILE=false): "
             f"task={task_label(task_id)} offer={task_label(offer_id)} "
-            f"error={CACHE_MISS_NOT_ACCEPTED}"
+            f"file_name={file_name} error={CACHE_MISS_NOT_ACCEPTED}"
         )
         return False
     log_task_start(

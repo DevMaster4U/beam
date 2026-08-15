@@ -2,13 +2,13 @@
 
 Layout under ``root``::
 
-    <sha256(object_filename)[:32]>/
+    <object_filename.bin>/
       segments.json
       <start>_<end>.bin
 
-The store key is the object **filename** (final path segment), not the full URL.
-Same object under different buckets/prefixes (e.g. ``source-eu/…bin`` vs
-``source-apac/…bin``) share one directory when content is the same object name.
+The store key is the object **filename** (final path segment), not a URL hash
+and not the full URL. Same object under different buckets/prefixes
+(e.g. ``source-eu/foo.bin`` vs ``source-apac/foo.bin``) share one directory.
 
 Task flow:
   - If contiguous segments cover [start, end] → seek+read slice (upload from cache).
@@ -132,13 +132,24 @@ def shard_bounds(
     return shards
 
 
-def source_digest(source_url: str) -> str:
-    """Directory digest for range_data: sha256(object filename)[:32].
+def source_cache_dir_name(source_url: str) -> str:
+    """range_data subdirectory name: object ``.bin`` filename (not a hash).
 
-    Falls back to the normalized full URL only when the path has no filename.
+    Falls back to sha256 of the normalized URL when the path has no filename.
     """
-    key = source_object_name(source_url) or normalize_source_url(source_url)
+    name = source_object_name(source_url)
+    if name:
+        # Keep a single path segment even if a caller passes a weird value.
+        return name.replace("\\", "_").replace("/", "_")
+    key = normalize_source_url(source_url)
+    if not key:
+        return ""
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+
+
+def source_digest(source_url: str) -> str:
+    """Directory key for range_data (object filename). Alias of ``source_cache_dir_name``."""
+    return source_cache_dir_name(source_url)
 
 
 def _segment_filename(start: int, end: int) -> str:
@@ -159,6 +170,7 @@ class ByteRangeStore:
         self.max_segment_bytes = max(1, int(max_segment_bytes))
         self._locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
+        self._consolidated = False
 
     def _source_lock(self, digest: str) -> threading.Lock:
         with self._locks_guard:
@@ -169,7 +181,70 @@ class ByteRangeStore:
             return lock
 
     def source_dir(self, source_url: str) -> Path:
-        return self.root / source_digest(source_url)
+        name = source_cache_dir_name(source_url)
+        if not name:
+            raise ValueError("empty cache dir name; refusing to write at store root")
+        return self.root / name
+
+    def _ensure_consolidated(self) -> None:
+        """Merge legacy hash-named dirs into object-filename dirs (once per store)."""
+        if self._consolidated:
+            return
+        with self._locks_guard:
+            if self._consolidated:
+                return
+            # Mark first, then release locks_guard before long I/O so ingest
+            # can take per-source locks without deadlocking.
+            self._consolidated = True
+        self._migrate_root_level_segments()
+        self.consolidate_signed_url_orphans()
+
+    def _migrate_root_level_segments(self) -> None:
+        """Move legacy segments.json + *.bin written at store root into object dirs."""
+        index = self.root / "segments.json"
+        if not index.is_file():
+            return
+        try:
+            data = json.loads(index.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        raw_src = str(data.get("source_url") or "").strip()
+        canonical = normalize_source_url(raw_src)
+        if not canonical:
+            return
+        items = data.get("segments") if isinstance(data, dict) else []
+        if not isinstance(items, list):
+            items = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                start = int(item["start"])
+                end = int(item["end"])
+                file_name = str(item.get("file") or _segment_filename(start, end))
+            except (KeyError, TypeError, ValueError):
+                continue
+            src_path = self.root / file_name
+            if not src_path.is_file():
+                continue
+            if self._covers_canonical(canonical, start, end):
+                try:
+                    src_path.unlink()
+                except OSError:
+                    pass
+                continue
+            try:
+                self.ingest_from_file(canonical, start, end, src_path, merge=True)
+            except Exception:
+                continue
+            try:
+                src_path.unlink()
+            except OSError:
+                pass
+        try:
+            index.unlink()
+        except OSError:
+            pass
 
     def _index_path(self, source_url: str) -> Path:
         return self.source_dir(source_url) / "segments.json"
@@ -216,6 +291,7 @@ class ByteRangeStore:
         os.replace(tmp, path)
 
     def list_segments(self, source_url: str) -> list[Segment]:
+        self._ensure_consolidated()
         source_url = normalize_source_url(source_url)
         digest = source_digest(source_url)
         with self._source_lock(digest):
@@ -223,12 +299,14 @@ class ByteRangeStore:
 
     def list_sources(self) -> list[str]:
         """Return canonical source_url values discovered from segments.json under root."""
+        self._ensure_consolidated()
         sources: list[str] = []
         seen: set[str] = set()
+        seen_objects: set[str] = set()
         if not self.root.is_dir():
             return sources
         for child in sorted(self.root.iterdir()):
-            if not child.is_dir():
+            if not child.is_dir() or child.name.startswith("."):
                 continue
             index = child / "segments.json"
             if not index.is_file():
@@ -238,19 +316,28 @@ class ByteRangeStore:
             except (OSError, json.JSONDecodeError):
                 continue
             src = normalize_source_url(str(data.get("source_url") or "").strip())
-            if not src or src in seen:
+            if not src:
                 continue
-            # Prefer directories whose name matches the canonical digest.
+            obj = source_object_name(src)
+            # Prefer directories whose name matches the canonical filename digest.
             if child.name != source_digest(src):
                 continue
+            if src in seen or (obj and obj in seen_objects):
+                continue
             seen.add(src)
+            if obj:
+                seen_objects.add(obj)
             sources.append(src)
         return sources
+
+    def _covers_canonical(self, source_url: str, start: int, end: int) -> bool:
+        return bool(self.find_covering_segments(source_url, start, end))
 
     def covers(self, source_url: str, start: int, end: int) -> bool:
         if end < start:
             return False
-        return bool(self.find_covering_segments(source_url, start, end))
+        self._ensure_consolidated()
+        return self._covers_canonical(source_url, start, end)
 
     def find_covering_segment(
         self, source_url: str, start: int, end: int
@@ -370,6 +457,7 @@ class ByteRangeStore:
         if len(data) != expected:
             raise ValueError(f"data length {len(data)} != range size {expected}")
 
+        self._ensure_consolidated()
         digest = source_digest(source_url)
         with self._source_lock(digest):
             if merge:
@@ -754,10 +842,10 @@ class ByteRangeStore:
             }
 
     def consolidate_signed_url_orphans(self) -> dict[str, Any]:
-        """Merge legacy digest dirs into the canonical filename-based digest dir.
+        """Merge legacy hash-named dirs into the object-filename directory.
 
-        Older code hashed the full URL (signed query, or full bucket/path). Those
-        orphans are ingested into ``sha256(filename)[:32]`` then deleted.
+        Older code used sha256(full URL) or sha256(filename) as the folder name.
+        Those orphans are ingested into ``<object_filename.bin>/`` then deleted.
         """
         if not self.root.is_dir():
             return {"merged_dirs": 0, "ingested_segments": 0, "removed_dirs": []}
@@ -777,16 +865,39 @@ class ByteRangeStore:
             except (OSError, json.JSONDecodeError):
                 continue
             raw_src = str(data.get("source_url") or "").strip()
+            obj_meta = str(data.get("object_name") or "").strip()
             canonical = normalize_source_url(raw_src)
+            if not canonical and obj_meta:
+                # Index only has object_name — still enough for the dir key.
+                canonical = obj_meta
             if not canonical:
                 continue
-            canonical_digest = source_digest(canonical)
-            if child.name == canonical_digest:
-                # Rewrite index if it still stores a signed URL.
-                if raw_src != canonical:
+            canonical_dir = source_cache_dir_name(canonical)
+            if not canonical_dir:
+                continue
+            if child.name == canonical_dir:
+                # Rewrite index if it still stores a signed URL / missing object_name.
+                if raw_src and raw_src != normalize_source_url(raw_src):
+                    segs = self._load_segments(canonical)
+                    self._save_segments(canonical, segs)
+                elif not data.get("object_name"):
                     segs = self._load_segments(canonical)
                     self._save_segments(canonical, segs)
                 continue
+
+            target = self.root / canonical_dir
+            if not target.exists():
+                # Fast path: rename hash dir → object filename (no byte copy).
+                try:
+                    child.rename(target)
+                    removed.append(child.name)
+                    merged_dirs += 1
+                    # Refresh index under the new name.
+                    segs = self._load_segments(canonical)
+                    self._save_segments(canonical, segs)
+                    continue
+                except OSError:
+                    pass
 
             items = data.get("segments") if isinstance(data, dict) else []
             if not isinstance(items, list):
@@ -803,7 +914,7 @@ class ByteRangeStore:
                 src_path = child / file_name
                 if not src_path.is_file():
                     continue
-                if self.covers(canonical, start, end):
+                if self._covers_canonical(canonical, start, end):
                     continue
                 self.ingest_from_file(canonical, start, end, src_path, merge=True)
                 ingested += 1
@@ -857,6 +968,7 @@ class ByteRangeStore:
         if size != expected:
             raise ValueError(f"file size {size} != range size {expected}")
 
+        self._ensure_consolidated()
         source_url = normalize_source_url(source_url)
         digest = source_digest(source_url)
         with self._source_lock(digest):
