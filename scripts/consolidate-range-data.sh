@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Merge signed-URL orphan range_data dirs into the canonical (query-stripped) digest.
+# Merge legacy range_data digest dirs into the canonical filename-based digest.
 #
 # Usage:
 #   ./scripts/consolidate-range-data.sh

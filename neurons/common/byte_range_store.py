@@ -2,9 +2,13 @@
 
 Layout under ``root``::
 
-    <sha256(source_url)[:32]>/
+    <sha256(object_filename)[:32]>/
       segments.json
       <start>_<end>.bin
+
+The store key is the object **filename** (final path segment), not the full URL.
+Same object under different buckets/prefixes (e.g. ``source-eu/…bin`` vs
+``source-apac/…bin``) share one directory when content is the same object name.
 
 Task flow:
   - If contiguous segments cover [start, end] → seek+read slice (upload from cache).
@@ -61,11 +65,11 @@ class Segment:
 
 
 def normalize_source_url(source_url: str) -> str:
-    """Canonical object URL for range_data digests: scheme/host/path only (no query/fragment).
+    """Canonical object URL: scheme/host/path only (no query/fragment).
 
-    Presigned R2/S3 URLs change signature query params every request; hashing the
-    full URL would create a new directory per task. Strip those so the same object
-    always maps to one store root.
+    Presigned R2/S3 URLs change signature query params every request; strip those
+    so metadata and lookups refer to a stable object URL. Digests use
+    ``source_object_name`` (filename only), not this full URL.
     """
     raw = str(source_url or "").strip()
     if not raw:
@@ -75,6 +79,17 @@ def normalize_source_url(source_url: str) -> str:
         # Already path-like / non-URL — keep as-is minus trailing slash.
         return raw.rstrip("/")
     return urlunsplit((parts.scheme, parts.netloc, parts.path, "", "")).rstrip("/")
+
+
+def source_object_name(source_url: str) -> str:
+    """Object filename used as the range_data cache key (final path segment)."""
+    canonical = normalize_source_url(source_url)
+    if not canonical:
+        return ""
+    parts = urlsplit(canonical)
+    path = parts.path if parts.scheme and parts.netloc else canonical
+    name = path.rstrip("/").rsplit("/", 1)[-1].strip()
+    return name
 
 
 def merge_intervals(ranges: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -118,7 +133,12 @@ def shard_bounds(
 
 
 def source_digest(source_url: str) -> str:
-    return hashlib.sha256(normalize_source_url(source_url).encode("utf-8")).hexdigest()[:32]
+    """Directory digest for range_data: sha256(object filename)[:32].
+
+    Falls back to the normalized full URL only when the path has no filename.
+    """
+    key = source_object_name(source_url) or normalize_source_url(source_url)
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
 
 
 def _segment_filename(start: int, end: int) -> str:
@@ -186,6 +206,7 @@ class ByteRangeStore:
         directory.mkdir(parents=True, exist_ok=True)
         payload = {
             "source_url": source_url,
+            "object_name": source_object_name(source_url),
             "max_segment_bytes": self.max_segment_bytes,
             "segments": [s.to_dict() for s in sorted(segments, key=lambda x: x.start)],
         }
@@ -733,11 +754,10 @@ class ByteRangeStore:
             }
 
     def consolidate_signed_url_orphans(self) -> dict[str, Any]:
-        """Merge directories created from presigned URLs into the canonical digest dir.
+        """Merge legacy digest dirs into the canonical filename-based digest dir.
 
-        Older code hashed the full signed URL (query params included), so each
-        task could create a new directory for the same object. After
-        ``normalize_source_url``, those orphans are merged then deleted.
+        Older code hashed the full URL (signed query, or full bucket/path). Those
+        orphans are ingested into ``sha256(filename)[:32]`` then deleted.
         """
         if not self.root.is_dir():
             return {"merged_dirs": 0, "ingested_segments": 0, "removed_dirs": []}
@@ -747,7 +767,7 @@ class ByteRangeStore:
         removed: list[str] = []
 
         for child in sorted(self.root.iterdir()):
-            if not child.is_dir():
+            if not child.is_dir() or child.name.startswith("."):
                 continue
             index = child / "segments.json"
             if not index.is_file():

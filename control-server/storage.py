@@ -25,6 +25,7 @@ from neurons.common.byte_range_store import (  # noqa: E402
     ByteRangeStore,
     parse_cache_key_range,
     source_digest,
+    source_object_name,
 )
 
 _cache_lock = threading.Lock()
@@ -318,14 +319,16 @@ def range_coverage_snapshot(*, src_url: Optional[str] = None) -> dict[str, Any]:
     """Build sync payload from range_data/*/segments.json only (no hash/etag JSON)."""
     store = get_range_store()
     filter_url = str(src_url or "").strip()
+    filter_digest = source_digest(filter_url) if filter_url else ""
     sources_out: list[dict[str, Any]] = []
     for source_url in store.list_sources():
-        if filter_url and source_url != filter_url:
+        if filter_digest and source_digest(source_url) != filter_digest:
             continue
         segs = store.list_segments(source_url)
         sources_out.append(
             {
                 "source_url": source_url,
+                "object_name": source_object_name(source_url),
                 "digest": source_digest(source_url),
                 "segments": [{"start": s.start, "end": s.end} for s in segs],
                 "covered_bytes": sum(s.size for s in segs),
@@ -343,9 +346,10 @@ def range_store_status(*, src_url: Optional[str] = None) -> dict[str, Any]:
     """Report continuous range-store coverage per source (from segments.json)."""
     store = get_range_store()
     filter_url = str(src_url or "").strip()
+    filter_digest = source_digest(filter_url) if filter_url else ""
     sources: dict[str, Any] = {}
     for source_url in store.list_sources():
-        if filter_url and source_url != filter_url:
+        if filter_digest and source_digest(source_url) != filter_digest:
             continue
         segs = store.list_segments(source_url)
         if not segs and filter_url:
@@ -364,7 +368,12 @@ def range_store_status(*, src_url: Optional[str] = None) -> dict[str, Any]:
     }
     if filter_url:
         result["src_url"] = filter_url
-        result["coverage"] = sources.get(filter_url)
+        # Match by object-name digest so eu/apac/xfer aliases resolve.
+        matched = next(
+            (v for k, v in sources.items() if source_digest(k) == filter_digest),
+            None,
+        )
+        result["coverage"] = matched
     return result
 
 

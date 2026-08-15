@@ -14,7 +14,11 @@ import os
 import threading
 from typing import Any, Optional
 
-from neurons.common.byte_range_store import merge_intervals, normalize_source_url
+from neurons.common.byte_range_store import (
+    merge_intervals,
+    normalize_source_url,
+    source_object_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +36,16 @@ COVERAGE_ROUTING = _env_bool("ORCH_COVERAGE_ROUTING", True)
 ORCH_DOWNLOAD_RANGE_DATA = _env_bool("ORCH_DOWNLOAD_RANGE_DATA", False)
 
 
+def _coverage_key(source_url: str) -> str:
+    """Index by object filename so eu/apac/xfer aliases share coverage."""
+    name = source_object_name(source_url)
+    if name:
+        return name
+    return normalize_source_url(source_url)
+
+
 class RangeCoverageIndex:
-    """Thread-safe coverage map: normalized source_url → merged [start, end] segments."""
+    """Thread-safe coverage map: object filename → merged [start, end] segments."""
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -59,8 +71,11 @@ class RangeCoverageIndex:
         for item in sources or []:
             if not isinstance(item, dict):
                 continue
-            source_url = normalize_source_url(str(item.get("source_url") or ""))
-            if not source_url:
+            source_url = str(item.get("source_url") or "")
+            key = _coverage_key(source_url) or source_object_name(
+                str(item.get("object_name") or "")
+            )
+            if not key:
                 continue
             ranges: list[tuple[int, int]] = []
             for seg in item.get("segments") or []:
@@ -74,41 +89,44 @@ class RangeCoverageIndex:
                 if end >= start:
                     ranges.append((start, end))
             merged = merge_intervals(ranges)
-            next_map[source_url] = merged
+            # Same object name from multiple URLs → union coverage.
+            if key in next_map:
+                merged = merge_intervals(next_map[key] + merged)
+            next_map[key] = merged
             seg_total += len(merged)
         with self._lock:
             self._segments = next_map
             self._ready = True
             self._source_count = len(next_map)
-            self._segment_count = seg_total
+            self._segment_count = sum(len(v) for v in next_map.values())
         logger.info(
             "Orch range coverage snapshot sources=%d segments=%d routing=%s",
             len(next_map),
-            seg_total,
+            self._segment_count,
             COVERAGE_ROUTING,
         )
 
     def add_range(self, source_url: str, start: int, end: int) -> None:
         """Merge a range_broadcast into the index."""
-        source_url = normalize_source_url(source_url)
-        if not source_url or end < start:
+        key = _coverage_key(source_url)
+        if not key or end < start:
             return
         with self._lock:
-            existing = list(self._segments.get(source_url) or [])
+            existing = list(self._segments.get(key) or [])
             existing.append((int(start), int(end)))
             merged = merge_intervals(existing)
-            self._segments[source_url] = merged
+            self._segments[key] = merged
             self._ready = True
             self._source_count = len(self._segments)
             self._segment_count = sum(len(v) for v in self._segments.values())
 
     def covers(self, source_url: str, start: int, end: int) -> bool:
         """True if merged segments fully cover inclusive [start, end]."""
-        source_url = normalize_source_url(source_url)
-        if not source_url or end < start:
+        key = _coverage_key(source_url)
+        if not key or end < start:
             return False
         with self._lock:
-            segments = self._segments.get(source_url) or []
+            segments = self._segments.get(key) or []
         cursor = int(start)
         target = int(end)
         for seg_start, seg_end in segments:
@@ -122,11 +140,11 @@ class RangeCoverageIndex:
         return False
 
     def has_source(self, source_url: str) -> bool:
-        source_url = normalize_source_url(source_url)
-        if not source_url:
+        key = _coverage_key(source_url)
+        if not key:
             return False
         with self._lock:
-            return source_url in self._segments
+            return key in self._segments
 
 
 coverage_index = RangeCoverageIndex()
