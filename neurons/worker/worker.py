@@ -1762,12 +1762,11 @@ def get_worker_range_store():
                 for p in root.iterdir()
                 if p.is_dir() and not p.name.startswith(".")
             )
-            if dirs:
-                print(
-                    f"[Worker] Range store ready root={root} "
-                    f"objects={len(dirs)} folders={dirs[:8]}"
-                    f"{'...' if len(dirs) > 8 else ''}"
-                )
+            print(
+                f"[Worker] Range cache: folder_key=file_name "
+                f"root={root} objects={len(dirs)}"
+                + (f" folders={dirs[:8]}{'...' if len(dirs) > 8 else ''}" if dirs else "")
+            )
         except Exception as exc:
             print(f"[Worker] Range store init/merge failed: {exc}")
     return _worker_range_store
@@ -1776,6 +1775,19 @@ def get_worker_range_store():
 def setup_worker_range_store() -> None:
     """Initialize local range_data and merge signed-URL orphan directories."""
     get_worker_range_store()
+
+
+def log_worker_range_cache_mode() -> None:
+    """Print cache folder naming so operators can confirm new code on startup."""
+    from neurons.common.byte_range_store import source_cache_dir_name
+
+    example = "rnd_20_gb_100gb_20x5_r2_20260804T030000Z.bin"
+    folder = source_cache_dir_name(f"https://example.invalid/bucket/source/{example}")
+    root = _predefined_etag_range_data_dir()
+    print(
+        f"[Worker] Range cache mode: folder_name=file_name "
+        f"(example {example} → {root / folder})"
+    )
 
 
 def predefined_etag_chunk_data_path_for_key(cache_key: str) -> Path:
@@ -5186,6 +5198,7 @@ async def run_worker(state: WorkerState):
             f"NON_CACHED_FILE={WORKER_NON_CACHED_FILE} "
             f"CACHE_SYNC_DELAY_SEC={CONTROL_SERVER_CACHE_SYNC_DELAY_SEC:.0f}"
         )
+        log_worker_range_cache_mode()
         await websocket_loop(state)
 
     except asyncio.CancelledError:
